@@ -1,0 +1,255 @@
+# =============================================================================
+# policy.yaml — the KuWarden role graph
+#
+# Specified by docs/adr/0003-role-graph-and-traceability.md
+#
+# This file describes the PLATFORM DEPLOYMENT: which identities exist and what
+# they may do. It is distinct from kuwarden.yaml, which lives in an application
+# repository and describes that application's flow.
+#
+#   An application cannot grant itself capabilities.
+#   kuwarden.yaml may only SELECT FROM what this file already permits.
+#
+# This file is slow-changing, version-controlled and change-reviewed. Editing it
+# is a governance event. Every flow run pins this file's commit SHA at start.
+# =============================================================================
+
+version: 1
+
+# -----------------------------------------------------------------------------
+# 1. IDENTITIES — who exists
+#
+# A non-human identity is a VERIFIABLE WORKLOAD IDENTITY, not a name. The target
+# system authenticates it independently; a name in a log is only an assertion.
+# -----------------------------------------------------------------------------
+identities:
+  # --- human roles, federated from the enterprise IdP ---------------------
+  - id: human.engineer
+    kind: human
+    source: oidc
+    claim: { group: "eng-all" }
+
+  - id: human.tech-lead
+    kind: human
+    source: oidc
+    claim: { group: "eng-leads" }
+
+  - id: human.release-manager
+    kind: human
+    source: oidc
+    claim: { group: "release-managers" }
+
+  # --- agent nodes: these run an LLM, and are therefore least-privileged ---
+  - id: node.planner
+    kind: agent-node          # `agent-node` means "contains an LLM" — see constraints
+    workload_identity: spiffe://kuwarden.acme.internal/ns/kuwarden-system/sa/node-planner
+
+  - id: node.coder
+    kind: agent-node
+    workload_identity: spiffe://kuwarden.acme.internal/ns/kuwarden-system/sa/node-coder
+
+  - id: node.verifier
+    kind: agent-node
+    workload_identity: spiffe://kuwarden.acme.internal/ns/kuwarden-system/sa/node-verifier
+
+  # --- the control plane: deterministic, and therefore privileged ---------
+  - id: engine.flow
+    kind: control-plane
+    workload_identity: spiffe://kuwarden.acme.internal/ns/kuwarden-system/sa/flow-engine
+
+  - id: engine.credential-broker
+    kind: control-plane
+    workload_identity: spiffe://kuwarden.acme.internal/ns/kuwarden-system/sa/credential-broker
+
+# -----------------------------------------------------------------------------
+# 2. CAPABILITIES — what can be done. Declared once, referenced by roles.
+# -----------------------------------------------------------------------------
+capabilities:
+  - { id: scm.repo.read,          description: "Clone and read a registered repository" }
+  - { id: scm.branch.write.own,   description: "Push to a branch created by this run only" }
+  - { id: scm.pr.create,          description: "Open a pull request" }
+  - { id: scm.pr.merge,           description: "Merge a pull request" }
+
+  - { id: sandbox.exec,           description: "Execute build/test inside the run sandbox" }
+
+  - { id: cicd.pipeline.trigger,  description: "Trigger a CI pipeline and read its result" }
+  - { id: sast.run,               description: "Run static analysis" }
+
+  - { id: deploy.k8s.test,        description: "Deploy to a test namespace" }
+  - { id: deploy.k8s.uat,         description: "Deploy to a UAT namespace" }
+  - { id: deploy.k8s.prod,        description: "Deploy to a production namespace" }
+  - { id: deploy.rollback,        description: "Roll back a deployment" }
+
+  - { id: ticket.read,            description: "Read a work item" }
+  - { id: ticket.comment,         description: "Comment on a work item" }
+  - { id: ticket.transition,      description: "Change work item status" }
+
+  - { id: llm.invoke,             description: "Call a configured LLM backend" }
+
+# -----------------------------------------------------------------------------
+# 3. ROLES — bundles of capabilities.
+#
+# `deny` is explicit and always wins. It documents intent: these are not merely
+# ungranted, they must never be granted, and constraints enforce that.
+# -----------------------------------------------------------------------------
+roles:
+  - id: role.planner
+    grants: [scm.repo.read, ticket.read, llm.invoke]
+    deny:   ["deploy.*", "scm.pr.merge", "scm.branch.write.*"]
+
+  - id: role.coder
+    grants: [scm.repo.read, scm.branch.write.own, sandbox.exec, llm.invoke]
+    deny:   ["deploy.*", "scm.pr.merge", "cicd.pipeline.trigger", "ticket.transition"]
+
+  - id: role.verifier
+    grants: [scm.repo.read, sast.run, llm.invoke]
+    deny:   ["deploy.*", "scm.pr.merge", "scm.branch.write.*"]
+
+  # The control plane holds everything the agents must not.
+  - id: role.flow-engine
+    grants:
+      - cicd.pipeline.trigger
+      - scm.pr.create
+      - scm.pr.merge
+      - ticket.comment
+      - ticket.transition
+      - deploy.rollback
+    deny: [llm.invoke]        # the Flow Engine contains no LLM — ADR 0001
+
+  - id: role.deployer
+    grants: [deploy.k8s.test, deploy.k8s.uat, deploy.k8s.prod, deploy.rollback]
+    deny:   [llm.invoke]
+
+# -----------------------------------------------------------------------------
+# 4. PROTECTED PATHS — paths no agent identity may write, in any repository.
+#
+# This is a DENY, not a risk-tier escalation.
+#
+# The Coder holds write access to its own feature branch, and CI definitions live
+# inside that branch. A workflow file is executable on push or PR, so an agent that
+# can write code could otherwise write a workflow — a direct path from "agent
+# produces a diff" to "arbitrary code runs with CI credentials", bypassing every
+# gate. Reachable by prompt injection through ticket content. See ADR 0004.
+#
+# A ticket that genuinely requires a CI change routes to a human. If an operator
+# enables agent authorship for these paths on a given app, that change is forced to
+# `high` tier and may never be auto-merged.
+# -----------------------------------------------------------------------------
+protected_paths:
+  - ".github/workflows/**"
+  - ".github/actions/**"
+  - ".gitlab-ci.yml"
+  - "azure-pipelines.yml"
+  - "Jenkinsfile"
+  - "charts/**"             # deploy manifests
+  - "terraform/**"
+  - "**/*.tfvars"
+  - "**/kuwarden.yaml"        # else an app can rewrite its own flow config
+  - "policy.yaml"            # and this file must not be self-amending
+
+# -----------------------------------------------------------------------------
+# 5. BINDINGS — who holds which role, and where.
+#
+# Scoped so that ONBOARDING A NEW APPLICATION DOES NOT REQUIRE A POLICY CHANGE.
+# Otherwise the role graph becomes a bottleneck and teams route around it.
+# -----------------------------------------------------------------------------
+bindings:
+  - { identity: node.planner,  role: role.planner,  scope: { apps: ["*"] } }
+  - { identity: node.coder,    role: role.coder,    scope: { apps: ["*"] } }
+  - { identity: node.verifier, role: role.verifier, scope: { apps: ["*"] } }
+  - { identity: engine.flow,   role: role.flow-engine, scope: { apps: ["*"] } }
+
+  # Deployment authority is narrowed by environment, not granted wholesale.
+  - identity: engine.credential-broker
+    role: role.deployer
+    scope:
+      apps: ["*"]
+      environments: ["test", "uat"]
+
+  - identity: engine.credential-broker
+    role: role.deployer
+    scope:
+      apps: ["payments-service", "ledger-service"]
+      environments: ["prod"]
+      requires_approval_tier: high
+
+# -----------------------------------------------------------------------------
+# 6. APPROVAL AUTHORITY — who may approve what.
+# -----------------------------------------------------------------------------
+approval_authority:
+  - tier: low
+    min_approvers: 0            # automated; the evidence bundle is still recorded
+
+  - tier: medium
+    min_approvers: 1
+    principals: [human.engineer, human.tech-lead, human.release-manager]
+    exclude_change_author: true # you may not approve a change you requested
+
+  - tier: high
+    min_approvers: 2
+    principals: [human.tech-lead, human.release-manager]
+    exclude_change_author: true
+    require_distinct_teams: true
+
+# -----------------------------------------------------------------------------
+# 7. BUDGETS — enforced by the Flow Engine, inherited by child runs.
+# -----------------------------------------------------------------------------
+budgets:
+  default:
+    tokens_cents_per_run: 2000        # USD 20.00
+    max_coder_retries: 4
+    max_concurrent_runs_per_app: 3
+    gate_timeout_hours: 72
+  overrides:
+    - { apps: ["payments-service"], tokens_cents_per_run: 5000 }
+
+# -----------------------------------------------------------------------------
+# 8. CONSTRAINTS — invariants over this file, evaluated in CI.
+#
+# A violation fails the build. Governance that exists only in prose is
+# governance that gets violated without anyone noticing.
+# -----------------------------------------------------------------------------
+constraints:
+  - id: no-llm-holds-deploy
+    description: >
+      No identity that runs an LLM may hold any deploy capability.
+      This is the machine-checkable form of ADR 0001: whatever must be
+      privileged does not get to be a model.
+    assert: |
+      identities.where(kind == 'agent-node')
+                .effective_capabilities()
+                .none(matches('deploy.*'))
+
+  - id: no-llm-merges
+    description: No agent node may merge a pull request.
+    assert: |
+      identities.where(kind == 'agent-node')
+                .effective_capabilities()
+                .none(id == 'scm.pr.merge')
+
+  - id: control-plane-has-no-llm
+    description: The Flow Engine must not be able to invoke a model.
+    assert: |
+      identities.where(kind == 'control-plane')
+                .effective_capabilities()
+                .none(id == 'llm.invoke')
+
+  - id: prod-requires-two-humans
+    assert: approval_authority.where(tier == 'high').min_approvers >= 2
+
+  - id: no-agent-self-approval
+    description: An agent identity may never satisfy an approval requirement.
+    assert: approval_authority.all(principals.all(kind == 'human'))
+
+  - id: every-identity-is-verifiable
+    description: Every non-human identity must carry a workload identity.
+    assert: identities.where(kind != 'human').all(workload_identity != null)
+
+  - id: no-agent-writes-cicd-definitions
+    description: >
+      protected_paths must cover every CI/CD definition format the registered
+      applications use. Closes the workflow-file escalation path — an agent that
+      can write a workflow can run arbitrary code with CI credentials. See ADR 0004.
+    assert: |
+      required_protected_globs()
+        .all(g => protected_paths.any(p => covers(p, g)))

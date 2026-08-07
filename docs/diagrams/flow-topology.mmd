@@ -1,0 +1,48 @@
+%% KuWarden — Flow Topology (MVP, 8 nodes)
+%% Source of truth: docs/adr/0002-flow-topology.md
+flowchart TD
+    T[Jira / Azure DevOps ticket]:::ext --> R
+
+    R{{"① Triage &amp; Risk Router — <i>provisional</i> tier<br/>rules-first · LLM may raise, never lower<br/><i>the diff does not exist yet — final tier is set after ④</i>"}}:::det
+    R -- "unclear / out of scope" --> X[Reject to human<br/>comment on ticket]:::human
+    R -- "risk_tier assigned" --> P
+
+    P["② Planner<br/><i>LLM</i>"]:::llm --> C
+    C["③ Coder — bounded inner loop<br/><i>LLM · in sandbox</i>"]:::llm --> B
+
+    B["④ Build &amp; Test<br/><b>NO LLM</b> · CI exit code"]:::anchor
+    B -- "fail · retry &lt; N" --> C
+    B -- "fail · budget spent" --> A
+    B -- pass --> VER
+
+    subgraph VER ["⑤ Verifiers — fresh context · fan-out · adversarial"]
+        direction LR
+        V1["correctness"]:::llm
+        V2["security<br/>SAST + LLM"]:::llm
+        V3["test evidence"]:::llm
+        V4["regression risk"]:::llm
+    end
+    VER --> G
+    VER -- "blocked · retry" --> C
+
+    G{{"⑥ Approval Gate — depth set by <i>final</i> risk_tier<br/><b>final tier computed from the actual diff</b><br/><i>Temporal suspends the run — may wait days</i>"}}:::gate
+    G -- "low · no human" --> D
+    G -- "medium · 1 approver" --> D
+    G -- "high · 2 approvers" --> D
+    G -- "reject / timeout" --> A
+
+    D["⑦ Release — the control point<br/><b>mechanism set by integration_model (A/B/C)</b><br/><i>the Coder holds none of these permissions</i>"]:::det --> H
+    H["Health check<br/><b>NO LLM</b> · readiness + error rate"]:::anchor
+    H -- healthy --> Rep
+    H -- unhealthy --> A
+
+    A["⑧ Abort / Rollback / Cleanup<br/><i>compensation · reachable from any node</i>"]:::fail --> Rep
+    Rep["Reporter → ticket<br/>PR · CI · coverage · SAST · approvers"]:::det
+
+    classDef llm    fill:#EEF2FF,stroke:#4F46E5,stroke-width:2px,color:#1E1B4B
+    classDef det    fill:#ECFDF5,stroke:#059669,stroke-width:2px,color:#064E3B
+    classDef anchor fill:#FEF3C7,stroke:#D97706,stroke-width:2px,color:#78350F
+    classDef gate   fill:#FCE7F3,stroke:#DB2777,stroke-width:2px,color:#831843
+    classDef fail   fill:#FEE2E2,stroke:#DC2626,stroke-width:2px,color:#7F1D1D
+    classDef human  fill:#F1F5F9,stroke:#64748B,stroke-width:2px,color:#0F172A
+    classDef ext    fill:#FFFFFF,stroke:#94A3B8,stroke-width:2px,color:#0F172A
