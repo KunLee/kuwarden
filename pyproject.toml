@@ -9,6 +9,8 @@ requires-python = ">=3.12"
 #   asyncpg     the audit projection and run tree (ADR 0002, ADR 0003)
 #   httpx       every adapter -- async, and its MockTransport lets adapters be tested
 #               against recorded platform responses without reaching a network
+#   pyyaml      kuwarden.yaml and policy.yaml. Loaded with safe_load only -- these
+#               files are read from application repositories
 # This ships into air-gapped environments; every addition is someone's security
 # review. Migrations are plain SQL applied by engine/db/migrate.py rather than a
 # migration framework, for the same reason.
@@ -16,6 +18,7 @@ dependencies = [
     "temporalio>=1.9",
     "asyncpg>=0.30",
     "httpx>=0.28",
+    "pyyaml>=6.0",
 ]
 
 [dependency-groups]
@@ -24,6 +27,7 @@ dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.25",
     "ruff>=0.9",
+    "types-pyyaml>=6.0.12.20260724",
 ]
 
 [build-system]

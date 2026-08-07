@@ -14,10 +14,51 @@ from collections.abc import Awaitable, Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from engine.state import FlowState, NodeClass
 
+if TYPE_CHECKING:  # pragma: no cover - import cycle: adapters import state, nodes import both
+    import httpx
+
+    from engine.adapters.credentials import CredentialBroker
+    from engine.config import AppConfig
+
 type NodeFn = Callable[[FlowState], Awaitable[FlowState]]
+
+
+@dataclass(frozen=True)
+class NodeContext:
+    """What a node needs that is not part of the state flowing along the edges.
+
+    Kept out of `FlowState` on purpose. The node signature is fixed at
+    `(FlowState) -> FlowState` (ADR 0002) so that any node can later become a child flow, and
+    `FlowState` is serialised into the audit record -- neither a credential broker nor an
+    HTTP transport belongs in either.
+    """
+
+    config: AppConfig
+    broker: CredentialBroker
+    transport: httpx.AsyncBaseTransport | None = None
+
+
+_context: ContextVar[NodeContext | None] = ContextVar("node_context", default=None)
+
+
+def context() -> NodeContext:
+    ctx = _context.get()
+    if ctx is None:
+        raise RuntimeError("no NodeContext bound; nodes run inside the run_node activity")
+    return ctx
+
+
+@contextmanager
+def bound(ctx: NodeContext):  # type: ignore[no-untyped-def]
+    token = _context.set(ctx)
+    try:
+        yield
+    finally:
+        _context.reset(token)
 
 
 @dataclass(frozen=True)
