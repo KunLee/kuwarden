@@ -115,6 +115,21 @@ podman compose down
 
 State survives that. To discard it, `podman compose down -v`.
 
+### The engine
+
+```bash
+uv sync && uv run python -m engine.db migrate && uv run python -m engine.worker
+```
+
+Then run the suite — the walking-skeleton tests need the stack up, and skip themselves when
+Temporal is unreachable:
+
+```bash
+uv run pytest
+```
+
+Workflow histories are visible at [localhost:8233](http://localhost:8233) while runs execute.
+
 ---
 
 ## Where things stand
@@ -127,7 +142,7 @@ the uniform node contract, and the sandbox contract.
 
 | Item | Note |
 |---|---|
-| Any code | Local infrastructure runs ([compose.yaml](compose.yaml)); the engine itself is next |
+| Nodes that do anything | The walking skeleton runs eight empty nodes end to end. Models go in after the control plane is proven, not before |
 | `THREAT_MODEL.md` | Primary threats identified: prompt injection via ticket content, workflow-definition write escalation |
 | `EVALUATION.md` | Blocks any claim that the verifier design works |
 | `policy.yaml` schema + constraint evaluator | Until it exists, the constraints in [policy.example.yaml](docs/reference/policy.example.yaml) are decorative |
