@@ -7,12 +7,15 @@ requires-python = ">=3.12"
 # Two runtime dependencies, both load-bearing:
 #   temporalio  the Flow Engine itself (ADR 0001)
 #   asyncpg     the audit projection and run tree (ADR 0002, ADR 0003)
+#   httpx       every adapter -- async, and its MockTransport lets adapters be tested
+#               against recorded platform responses without reaching a network
 # This ships into air-gapped environments; every addition is someone's security
 # review. Migrations are plain SQL applied by engine/db/migrate.py rather than a
 # migration framework, for the same reason.
 dependencies = [
     "temporalio>=1.9",
     "asyncpg>=0.30",
+    "httpx>=0.28",
 ]
 
 [dependency-groups]
