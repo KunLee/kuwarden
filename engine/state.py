@@ -82,6 +82,20 @@ class FileChange:
 
 
 @dataclass(frozen=True)
+class ProposedEdit:
+    """A file the Coder wants written.
+
+    Carried on the state because the sandbox produces a diff and never pushes it -- the Flow
+    Engine pushes, under a separate identity (ADR 0005 §3, property 5). Release therefore
+    needs the content, and needs it to be exactly what Build & Test inspected rather than
+    something regenerated a step later.
+    """
+
+    path: str
+    content: str
+
+
+@dataclass(frozen=True)
 class Diff:
     files: list[FileChange] = field(default_factory=list)
 
@@ -167,6 +181,7 @@ class FlowState:
     plan: ChangePlan | None = None
     branch: str | None = None
     diff: Diff | None = None
+    proposed_edits: list[ProposedEdit] = field(default_factory=list)
 
     ci_result: CIResult | None = None
     sast_result: SASTResult | None = None

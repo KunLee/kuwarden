@@ -273,7 +273,19 @@ class DeliveryFlow:
             run_node,
             NodeInput(node_id=node_id, state=state),
             start_to_close_timeout=NODE_TIMEOUT,
-            retry_policy=RetryPolicy(maximum_attempts=3),
+            retry_policy=RetryPolicy(
+                maximum_attempts=3,
+                # Retrying a refusal is not resilience. A ticket outside the declared scope
+                # will still be outside it three attempts later, and each attempt is another
+                # round of calls to someone else's platform.
+                non_retryable_error_types=[
+                    "PolicyDenied",
+                    "ProtectedPathWritten",
+                    "RiskTierLowered",
+                    "InvariantViolation",
+                    "ConfigError",
+                ],
+            ),
         )
         if record:
             await self._emit("node_completed", node_id=node_id)

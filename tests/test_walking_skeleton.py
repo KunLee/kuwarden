@@ -11,11 +11,13 @@ Requires `podman compose up -d --wait`. Skipped when Temporal is not reachable.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import uuid
 
 import pytest
-from temporalio.client import Client
+from temporalio.client import Client, WorkflowFailureError
+from temporalio.exceptions import ActivityError
 from temporalio.worker import Worker
 
 from engine.activities import ALL as ACTIVITIES
@@ -23,6 +25,7 @@ from engine.db import connect, migrate
 from engine.flows.delivery import ApprovalSignal, DeliveryFlow, FlowInput
 from engine.state import Ticket
 from engine.worker import namespace, target
+from tests.conftest import FakePlatform
 
 pytestmark = pytest.mark.asyncio
 
@@ -84,7 +87,7 @@ async def _run(client: Client, params: FlowInput, approvals: list[ApprovalSignal
         return await handle.result()
 
 
-async def test_low_tier_runs_without_a_human() -> None:
+async def test_low_tier_runs_without_a_human(platform: FakePlatform) -> None:
     """Tiering is what keeps gates from becoming the bottleneck: `low` needs nobody."""
     client = await _client()
     run_id = uuid.uuid4()
@@ -104,7 +107,7 @@ async def test_low_tier_runs_without_a_human() -> None:
     assert result.risk_tier == "low"
 
 
-async def test_high_tier_suspends_until_two_humans_approve() -> None:
+async def test_high_tier_suspends_until_two_humans_approve(platform: FakePlatform) -> None:
     """A run may sit at a gate without holding a resource open, and resumes on a signal."""
     client = await _client()
     run_id = uuid.uuid4()
@@ -129,7 +132,7 @@ async def test_high_tier_suspends_until_two_humans_approve() -> None:
     assert result.risk_tier == "high"
 
 
-async def test_one_rejection_aborts_the_run() -> None:
+async def test_one_rejection_aborts_the_run(platform: FakePlatform) -> None:
     client = await _client()
     run_id = uuid.uuid4()
     result = await _run(
@@ -154,7 +157,7 @@ async def test_one_rejection_aborts_the_run() -> None:
     assert result.status == "rejected"
 
 
-async def test_the_audit_tree_lands_in_postgres() -> None:
+async def test_the_audit_tree_lands_in_postgres(platform: FakePlatform) -> None:
     client = await _client()
     run_id = uuid.uuid4()
     await _run(
@@ -188,7 +191,7 @@ async def test_the_audit_tree_lands_in_postgres() -> None:
         assert all(e["control_mode"] is None for e in events if e["kind"] != "external_effect")
 
 
-async def test_the_audit_trail_is_append_only() -> None:
+async def test_the_audit_trail_is_append_only(platform: FakePlatform) -> None:
     """Invariant 9, enforced by the database rather than by everyone remembering."""
     client = await _client()
     run_id = uuid.uuid4()
@@ -212,7 +215,7 @@ async def test_the_audit_trail_is_append_only() -> None:
             await conn.execute("DELETE FROM flow_events WHERE run_id = $1", run_id)
 
 
-async def test_the_policy_pin_is_immutable() -> None:
+async def test_the_policy_pin_is_immutable(platform: FakePlatform) -> None:
     """ADR 0003: written once, at run start, never updated."""
     client = await _client()
     run_id = uuid.uuid4()
@@ -239,7 +242,7 @@ async def test_the_policy_pin_is_immutable() -> None:
 @pytest.mark.skipif(
     os.environ.get("KUWARDEN_SKIP_CRASH_TEST") == "1", reason="crash test disabled"
 )
-async def test_a_run_survives_the_worker_dying() -> None:
+async def test_a_run_survives_the_worker_dying(platform: FakePlatform) -> None:
     """The claim the whole control-plane argument rests on.
 
     Checkpointing state preserves data; it does not preserve execution. The run is started,
@@ -282,3 +285,70 @@ async def test_a_run_survives_the_worker_dying() -> None:
         result = await handle.result()
 
     assert result.status == "succeeded"
+
+
+async def test_ticket_to_pull_request_end_to_end(platform: FakePlatform) -> None:
+    """The MVP slice, with only the far side of the HTTP boundary faked.
+
+    Real Temporal, real PostgreSQL, real nodes, real adapters, real credential resolution,
+    real protected-path enforcement. What is not real is the model: the Coder writes a marker
+    file rather than code, because the Planner and Coder are the only nodes here that need
+    one and no backend has been chosen.
+    """
+    client = await _client()
+    run_id = uuid.uuid4()
+    result = await _run(
+        client,
+        FlowInput(
+            run_id=run_id,
+            app_id=await _register_app(),
+            ticket=_ticket(),
+            policy_commit="7" * 40,
+            policy_bundle={"pinned": True},
+            provisional_risk_tier="low",
+        ),
+        approvals=[],
+    )
+    assert result.status == "succeeded"
+
+    assert len(platform.pull_requests) == 1, "exactly one pull request, not one per attempt"
+    pr = platform.pull_requests[0]
+    assert str(pr["head"]).startswith("kuwarden/pay-1234-")
+    assert pr["base"] == "main"
+    assert "PAY-1234" in str(pr["title"])
+
+    commit = json.loads(
+        next(r for r in platform.requests if r.url.path.endswith("/git/commits")).content
+    )
+    # ADR 0003 §7: backward resolution must not depend on correlating timestamps.
+    assert f"kuwarden-run-id: {run_id}" in commit["message"]
+    assert f"kuwarden-policy-commit: {'7' * 40}" in commit["message"]
+
+    assert platform.comments, "the ticket was told what happened"
+    assert str(run_id) in platform.comments[0]
+
+
+async def test_a_ticket_outside_declared_scope_is_refused(platform: FakePlatform) -> None:
+    """Admission control at intake, not discovery three nodes later."""
+    platform.labels = ["backend"]  # missing the kuwarden-auto label the app requires
+    client = await _client()
+    run_id = uuid.uuid4()
+
+    with pytest.raises(WorkflowFailureError) as failure:
+        await _run(
+            client,
+            FlowInput(
+                run_id=run_id,
+                app_id=await _register_app(),
+                ticket=_ticket(),
+                policy_commit="8" * 40,
+                policy_bundle={},
+                provisional_risk_tier="low",
+            ),
+            approvals=[],
+        )
+    # WorkflowFailureError -> ActivityError -> ApplicationError, which carries the message.
+    activity_error = failure.value.cause
+    assert isinstance(activity_error, ActivityError)
+    assert "does not carry" in str(activity_error.cause)
+    assert not platform.pull_requests, "nothing was pushed for a refused ticket"
