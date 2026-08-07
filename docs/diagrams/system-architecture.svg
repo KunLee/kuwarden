@@ -1,0 +1,152 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1120" width="1600" height="1120" font-family="Segoe UI, Inter, system-ui, -apple-system, Helvetica Neue, Arial, sans-serif">
+  <defs>
+    <marker id="s" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#475569"/>
+    </marker>
+  </defs>
+  <rect width="1600" height="1120" fill="#FFFFFF"/>
+
+  <!-- Title -->
+  <text x="80" y="66" font-size="42" font-weight="700" fill="#0F172A">KuWarden — system architecture</text>
+  <text x="80" y="104" font-size="19" fill="#64748B">Ticket to production, governed and auditable, entirely inside the enterprise perimeter.</text>
+
+  <!-- ===== Trigger layer ===== -->
+  <text x="80" y="140" font-size="14" font-weight="700" fill="#475569" letter-spacing="1.6">TRIGGER LAYER</text>
+  <g>
+    <rect x="80" y="152" width="340" height="64" rx="12" fill="#FFFFFF" stroke="#94A3B8" stroke-width="2"/>
+    <text x="250" y="191" font-size="20" fill="#0F172A" text-anchor="middle">Jira</text>
+    <rect x="440" y="152" width="340" height="64" rx="12" fill="#FFFFFF" stroke="#94A3B8" stroke-width="2"/>
+    <text x="610" y="191" font-size="20" fill="#0F172A" text-anchor="middle">Azure DevOps</text>
+    <rect x="800" y="152" width="340" height="64" rx="12" fill="#FFFFFF" stroke="#94A3B8" stroke-width="2"/>
+    <text x="970" y="191" font-size="20" fill="#0F172A" text-anchor="middle">GitHub Issues</text>
+    <rect x="1160" y="152" width="340" height="64" rx="12" fill="#FFFFFF" stroke="#94A3B8" stroke-width="2"/>
+    <text x="1330" y="191" font-size="20" fill="#0F172A" text-anchor="middle">Manual / REST API</text>
+  </g>
+  <path d="M790 216 V250" stroke="#475569" stroke-width="2.5" fill="none" marker-end="url(#s)"/>
+
+  <!-- ===== Enterprise perimeter ===== -->
+  <rect x="80" y="252" width="1440" height="546" rx="20" fill="#F8FAFC" stroke="#0F172A" stroke-width="3.5" stroke-dasharray="12 7"/>
+
+  <!-- padlock -->
+  <g transform="translate(112,272)">
+    <path d="M6 10 V7 a7 7 0 0 1 14 0 V10" fill="none" stroke="#0F172A" stroke-width="3"/>
+    <rect x="1" y="10" width="24" height="18" rx="4" fill="#0F172A"/>
+  </g>
+  <text x="150" y="296" font-size="21" font-weight="700" fill="#0F172A">ENTERPRISE PERIMETER</text>
+  <text x="424" y="296" font-size="17" fill="#475569">— self-hosted · no egress by default · code, tickets, weights and audit trail never leave</text>
+
+  <!-- Flow Engine band -->
+  <rect x="110" y="316" width="1380" height="176" rx="16" fill="#ECFDF5" stroke="#059669" stroke-width="3"/>
+  <text x="134" y="348" font-size="22" font-weight="700" fill="#064E3B">KUWARDEN FLOW ENGINE</text>
+  <rect x="404" y="330" width="196" height="26" rx="13" fill="#064E3B"/>
+  <text x="502" y="349" font-size="14" font-weight="700" fill="#A7F3D0" text-anchor="middle">CONTAINS NO LLM</text>
+  <g font-size="17" text-anchor="middle">
+    <rect x="134" y="368" width="316" height="104" rx="12" fill="#FFFFFF" stroke="#059669" stroke-width="2"/>
+    <text x="292" y="402" font-size="19" font-weight="700" fill="#064E3B">Triage &amp; Risk Router</text>
+    <text x="292" y="428" fill="#047857">rules-first tiering</text>
+    <text x="292" y="452" fill="#047857">low · medium · high</text>
+
+    <rect x="470" y="368" width="316" height="104" rx="12" fill="#FFFFFF" stroke="#059669" stroke-width="2"/>
+    <text x="628" y="402" font-size="19" font-weight="700" fill="#064E3B">Flow State</text>
+    <text x="628" y="428" fill="#047857">Temporal — durable</text>
+    <text x="628" y="452" fill="#047857">survives process death</text>
+
+    <rect x="806" y="368" width="316" height="104" rx="12" fill="#FFFFFF" stroke="#059669" stroke-width="2"/>
+    <text x="964" y="402" font-size="19" font-weight="700" fill="#064E3B">Approval Gates</text>
+    <text x="964" y="428" fill="#047857">depth by risk_tier</text>
+    <text x="964" y="452" fill="#047857">may suspend for days</text>
+
+    <rect x="1142" y="368" width="324" height="104" rx="12" fill="#FFFFFF" stroke="#059669" stroke-width="2.5"/>
+    <text x="1304" y="402" font-size="19" font-weight="700" fill="#064E3B">Credential Broker</text>
+    <text x="1304" y="428" fill="#047857">CI · PR merge · deploy</text>
+    <text x="1304" y="452" font-weight="700" fill="#047857">resolved only after gates</text>
+  </g>
+
+  <path d="M790 492 V516" stroke="#475569" stroke-width="2.5" fill="none" marker-end="url(#s)"/>
+
+  <!-- Agent nodes band -->
+  <rect x="110" y="518" width="912" height="152" rx="16" fill="#EEF2FF" stroke="#4F46E5" stroke-width="3"/>
+  <text x="134" y="550" font-size="22" font-weight="700" fill="#1E1B4B">AGENT NODES</text>
+  <rect x="352" y="532" width="232" height="26" rx="13" fill="#312E81"/>
+  <text x="468" y="551" font-size="14" font-weight="700" fill="#C7D2FE" text-anchor="middle">LEAST PRIVILEGE · LLM</text>
+  <g font-size="16" text-anchor="middle">
+    <rect x="134" y="570" width="278" height="84" rx="12" fill="#FFFFFF" stroke="#4F46E5" stroke-width="2"/>
+    <text x="273" y="602" font-size="19" font-weight="700" fill="#1E1B4B">Planner</text>
+    <text x="273" y="628" fill="#4338CA">ticket → ChangePlan</text>
+
+    <rect x="428" y="570" width="278" height="84" rx="12" fill="#FFFFFF" stroke="#4F46E5" stroke-width="2"/>
+    <text x="567" y="602" font-size="19" font-weight="700" fill="#1E1B4B">Coder ⇄ Build &amp; Test</text>
+    <text x="567" y="628" fill="#4338CA">bounded inner loop</text>
+
+    <rect x="722" y="570" width="284" height="84" rx="12" fill="#FFFFFF" stroke="#4F46E5" stroke-width="2"/>
+    <text x="864" y="602" font-size="19" font-weight="700" fill="#1E1B4B">Verifiers ×4</text>
+    <text x="864" y="628" fill="#4338CA">fresh context · adversarial</text>
+  </g>
+
+  <!-- Sandbox -->
+  <rect x="1042" y="518" width="448" height="152" rx="16" fill="#FEE2E2" stroke="#DC2626" stroke-width="3"/>
+  <text x="1266" y="552" font-size="21" font-weight="700" fill="#7F1D1D" text-anchor="middle">kuwarden-sandbox</text>
+  <text x="1266" y="584" font-size="17" fill="#991B1B" text-anchor="middle">ephemeral · per run</text>
+  <text x="1266" y="610" font-size="17" fill="#991B1B" text-anchor="middle">network-restricted · no egress</text>
+  <text x="1266" y="640" font-size="17" font-weight="700" fill="#991B1B" text-anchor="middle">no credentials, ever</text>
+
+  <!-- LLM adapter + tool bus -->
+  <rect x="110" y="690" width="680" height="88" rx="14" fill="#FFFFFF" stroke="#64748B" stroke-width="2.5"/>
+  <text x="450" y="722" font-size="19" font-weight="700" fill="#0F172A" text-anchor="middle">LLM Adapter — pluggable</text>
+  <text x="450" y="750" font-size="16" fill="#475569" text-anchor="middle">vLLM self-hosted · Bedrock VPC · Azure OpenAI PE · Watsonx</text>
+
+  <rect x="810" y="690" width="680" height="88" rx="14" fill="#FFFFFF" stroke="#64748B" stroke-width="2.5"/>
+  <text x="1150" y="722" font-size="19" font-weight="700" fill="#0F172A" text-anchor="middle">Tool Bus (MCP)</text>
+  <text x="1150" y="750" font-size="16" fill="#475569" text-anchor="middle">integrations only — the inner loop stays in-process</text>
+
+  <!-- ===== Bottom row ===== -->
+  <path d="M420 798 V836" stroke="#475569" stroke-width="2.5" fill="none" marker-end="url(#s)"/>
+  <path d="M1180 798 V836" stroke="#475569" stroke-width="2.5" fill="none" marker-end="url(#s)"/>
+
+  <rect x="80" y="838" width="700" height="200" rx="16" fill="#F8FAFC" stroke="#64748B" stroke-width="2.5"/>
+  <text x="104" y="872" font-size="20" font-weight="700" fill="#0F172A">ADAPTERS</text>
+  <g font-size="16" text-anchor="middle">
+    <rect x="104" y="890" width="216" height="126" rx="12" fill="#FFFFFF" stroke="#94A3B8" stroke-width="2"/>
+    <text x="212" y="920" font-size="18" font-weight="700" fill="#0F172A">SCM</text>
+    <text x="212" y="948" fill="#475569">Azure Repos</text>
+    <text x="212" y="972" fill="#475569">GitLab · Bitbucket DC</text>
+    <text x="212" y="996" fill="#475569">GitHub</text>
+
+    <rect x="336" y="890" width="196" height="126" rx="12" fill="#FFFFFF" stroke="#94A3B8" stroke-width="2"/>
+    <text x="434" y="920" font-size="18" font-weight="700" fill="#0F172A">CI/CD</text>
+    <text x="434" y="948" fill="#475569">Jenkins</text>
+    <text x="434" y="972" fill="#475569">Azure Pipelines</text>
+    <text x="434" y="996" fill="#475569">GH Actions</text>
+
+    <rect x="548" y="890" width="208" height="126" rx="12" fill="#FFFFFF" stroke="#94A3B8" stroke-width="2"/>
+    <text x="652" y="920" font-size="18" font-weight="700" fill="#0F172A">DEPLOY</text>
+    <text x="652" y="948" fill="#475569">Kubernetes · Helm</text>
+    <text x="652" y="972" fill="#475569">ArgoCD</text>
+    <text x="652" y="996" fill="#475569">Terraform</text>
+  </g>
+
+  <rect x="820" y="838" width="700" height="200" rx="16" fill="#FEF3C7" stroke="#D97706" stroke-width="2.5"/>
+  <text x="844" y="872" font-size="20" font-weight="700" fill="#78350F">MONITORING &amp; EVIDENCE</text>
+  <g font-size="16" text-anchor="middle">
+    <rect x="844" y="890" width="208" height="126" rx="12" fill="#FFFFFF" stroke="#D97706" stroke-width="2"/>
+    <text x="948" y="920" font-size="18" font-weight="700" fill="#78350F">Operations</text>
+    <text x="948" y="948" fill="#92400E">run list · live log</text>
+    <text x="948" y="972" fill="#92400E">approval queue</text>
+    <text x="948" y="996" fill="#92400E">diff + evidence view</text>
+
+    <rect x="1068" y="890" width="216" height="126" rx="12" fill="#FFFFFF" stroke="#D97706" stroke-width="2.5"/>
+    <text x="1176" y="920" font-size="18" font-weight="700" fill="#78350F">Audit trail</text>
+    <text x="1176" y="948" fill="#92400E">append-only</text>
+    <text x="1176" y="972" font-weight="700" fill="#92400E">tree-structured</text>
+    <text x="1176" y="996" fill="#92400E">root / parent run</text>
+
+    <rect x="1300" y="890" width="196" height="126" rx="12" fill="#FFFFFF" stroke="#D97706" stroke-width="2"/>
+    <text x="1398" y="920" font-size="18" font-weight="700" fill="#78350F">Role graph</text>
+    <text x="1398" y="948" fill="#92400E">policy.yaml</text>
+    <text x="1398" y="972" fill="#92400E">version-controlled</text>
+    <text x="1398" y="996" fill="#92400E">slow · reviewed</text>
+  </g>
+
+  <text x="80" y="1082" font-size="17" fill="#64748B">Everything past the pull request — deploy, promote, verify, roll back, evidence — is the part existing agent tooling does not do.</text>
+  <text x="1520" y="1082" font-size="14" fill="#94A3B8" text-anchor="end">KuWarden · ARCHITECTURE.md</text>
+</svg>
