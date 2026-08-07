@@ -1,14 +1,14 @@
-# KuFlow — LLM Strategy & Data Sovereignty
+# KuWarden — LLM Strategy & Data Sovereignty
 
-> This document defines how KuFlow handles LLM backend selection, enterprise data sovereignty, and the pluggable model adapter architecture.
+> This document defines how KuWarden handles LLM backend selection, enterprise data sovereignty, and the pluggable model adapter architecture.
 
 ---
 
 ## 1. Design Principle: Bring Your Own LLM
 
-KuFlow treats the LLM as a **swappable backend**, not a product dependency.
+KuWarden treats the LLM as a **swappable backend**, not a product dependency.
 
-The flow engine and all agents communicate with models through a single internal `LLMProvider` interface. Operators configure which adapter and model to use — per agent, per environment — in the application's `kuflow.yaml`. No model is hard-coded anywhere in the platform.
+The flow engine and all agents communicate with models through a single internal `LLMProvider` interface. Operators configure which adapter and model to use — per agent, per environment — in the application's `kuwarden.yaml`. No model is hard-coded anywhere in the platform.
 
 This means:
 - Enterprises can use whatever model best fits their compliance posture.
@@ -32,7 +32,7 @@ Best for: highly regulated industries (banking, defence, healthcare) where **zer
 | **Ollama** (dev/small teams) | Qwen2.5-Coder-32B (Q4_K_M) | 1× RTX 4090 / A10G | Apache 2.0 |
 | **AWS SageMaker** | Any Hugging Face model | Managed (ml.g5.48xlarge) | Varies |
 
-vLLM and Ollama both expose an **OpenAI-compatible REST API** (`/v1/chat/completions`). KuFlow's `OpenAICompatibleAdapter` connects to either with zero additional configuration.
+vLLM and Ollama both expose an **OpenAI-compatible REST API** (`/v1/chat/completions`). KuWarden's `OpenAICompatibleAdapter` connects to either with zero additional configuration.
 
 **Why Qwen2.5-Coder-32B as the default coding model?**
 - Best-in-class score on HumanEval, SWE-bench, and BigCodeBench among open-weight models.
@@ -50,11 +50,11 @@ Best for: enterprises already on AWS who want **strong data sovereignty without 
 - **AWS contractually guarantees** your data is never used for model training.
 - Access via **VPC Interface Endpoint (PrivateLink)** — traffic never traverses the public internet.
 - Compliance certifications: GDPR, HIPAA, SOC 2 Type II, PCI-DSS, ISO 27001.
-- KuFlow uses the **Bedrock Converse API** via boto3 — unified interface across all Bedrock models.
+- KuWarden uses the **Bedrock Converse API** via boto3 — unified interface across all Bedrock models.
 
 **VPC PrivateLink setup:**
 ```
-KuFlow Engine Pod
+KuWarden Engine Pod
       │
       │ (private network — no internet gateway)
       ▼
@@ -75,7 +75,7 @@ Best for: enterprises already on Azure with existing Microsoft agreements.
 - Models: GPT-4.1, GPT-4o, GPT-4o-mini
 - Accessed via **Azure Private Endpoint** (within your Azure Virtual Network).
 - Your data is not used to train Microsoft's models (Azure OpenAI data processing addendum).
-- Exposes OpenAI-compatible API — KuFlow's `OpenAICompatibleAdapter` connects directly.
+- Exposes OpenAI-compatible API — KuWarden's `OpenAICompatibleAdapter` connects directly.
 - Compliance: GDPR, HIPAA, SOC 2, ISO 27001.
 
 ---
@@ -87,16 +87,16 @@ Best for: IBM-aligned enterprises using IBM Cloud or on-premise IBM infrastructu
 - Models: Granite Code 34B, Llama 3.3 70B, Mistral Large on Watsonx
 - Available as **IBM Cloud dedicated** (single-tenant, data stays in IBM's isolated environment) or **on-premise** via IBM Cloud Pak for Data.
 - IBM provides enterprise data processing agreements and indemnification.
-- KuFlow connects via Watsonx.ai REST API with a dedicated adapter.
+- KuWarden connects via Watsonx.ai REST API with a dedicated adapter.
 
 ---
 
 ## 3. Recommended Default Configuration
 
-For most enterprises starting with KuFlow, the recommended starting configuration balances quality, cost, and sovereignty:
+For most enterprises starting with KuWarden, the recommended starting configuration balances quality, cost, and sovereignty:
 
 ```yaml
-# kuflow.yaml — recommended default LLM configuration
+# kuwarden.yaml — recommended default LLM configuration
 
 llm:
   # Planning and reasoning: Claude 3.5 via Bedrock VPC
@@ -111,20 +111,20 @@ llm:
   # Best OSS coding model. Air-gapped. No data leaves your cluster.
   coder:
     adapter: openai_compatible
-    base_url: http://vllm.kuflow-system.svc.cluster.local:8000/v1
+    base_url: http://vllm.kuwarden-system.svc.cluster.local:8000/v1
     model: Qwen2.5-Coder-32B-Instruct
     max_tokens: 8192
 
   # Code review: same self-hosted model for consistency
   reviewer:
     adapter: openai_compatible
-    base_url: http://vllm.kuflow-system.svc.cluster.local:8000/v1
+    base_url: http://vllm.kuwarden-system.svc.cluster.local:8000/v1
     model: Qwen2.5-Coder-32B-Instruct
 
   # Test generation: self-hosted
   tester:
     adapter: openai_compatible
-    base_url: http://vllm.kuflow-system.svc.cluster.local:8000/v1
+    base_url: http://vllm.kuwarden-system.svc.cluster.local:8000/v1
     model: Qwen2.5-Coder-32B-Instruct
 
   # Reporting: smaller, faster model for simple text generation
