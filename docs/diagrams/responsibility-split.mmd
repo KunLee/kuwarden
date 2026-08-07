@@ -1,0 +1,32 @@
+%% KuWarden — Responsibility split: what is allowed to be a model
+%% Source of truth: docs/adr/0001-flow-engine-control-plane.md
+flowchart LR
+    subgraph AGENT ["AGENT NODES — non-deterministic"]
+        direction TB
+        A1["Planner · Coder · Verifiers"]:::llm
+        A2["May fail — routinely"]:::llmsoft
+        A3["Read code<br/>Write to own branch<br/><b>Nothing else</b>"]:::llmsoft
+        A4["<b>Never</b> decides success"]:::llmsoft
+        A1 --- A2 --- A3 --- A4
+    end
+
+    subgraph ENGINE ["FLOW ENGINE — deterministic · contains no LLM"]
+        direction TB
+        E1["Router · State · Gates<br/>Deploy · Compensation"]:::det
+        E2["Must not fail —<br/>durable execution"]:::detsoft
+        E3["CI trigger · PR merge<br/><b>deployment credentials</b>"]:::detsoft
+        E4["Decides success by reading<br/><b>external systems of record</b>"]:::detsoft
+        E1 --- E2 --- E3 --- E4
+    end
+
+    AGENT -- "diff + evidence" --> ENGINE
+    ENGINE -- "task + bounded context" --> AGENT
+
+    ANCHOR["★ REALITY ANCHORS<br/>compiler exit code · CI result · coverage<br/>SAST findings · pod readiness · error rate"]:::anchor
+    ENGINE --> ANCHOR
+
+    classDef llm     fill:#E0E7FF,stroke:#4F46E5,stroke-width:3px,color:#1E1B4B
+    classDef llmsoft fill:#EEF2FF,stroke:#818CF8,stroke-width:2px,color:#312E81
+    classDef det     fill:#D1FAE5,stroke:#059669,stroke-width:3px,color:#064E3B
+    classDef detsoft fill:#ECFDF5,stroke:#34D399,stroke-width:2px,color:#065F46
+    classDef anchor  fill:#FEF3C7,stroke:#D97706,stroke-width:3px,color:#78350F

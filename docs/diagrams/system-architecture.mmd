@@ -1,0 +1,63 @@
+%% KuWarden — System architecture with the sovereignty boundary
+%% Source of truth: ARCHITECTURE.md
+flowchart TB
+    subgraph TRIG ["TRIGGER LAYER"]
+        direction LR
+        J[Jira]:::ext
+        AD[Azure DevOps]:::ext
+        GH[GitHub Issues]:::ext
+        MAN[Manual / API]:::ext
+    end
+
+    subgraph PERIM ["🔒 ENTERPRISE PERIMETER — self-hosted, no egress by default"]
+        direction TB
+
+        subgraph ENGINE ["KUWARDEN FLOW ENGINE — deterministic, contains no LLM"]
+            direction LR
+            RT["Triage &amp;<br/>Risk Router"]:::det
+            ST["Flow State<br/><i>Temporal — durable</i>"]:::det
+            GT["Approval Gates<br/><i>depth by risk_tier</i>"]:::det
+            CR["Credential Broker<br/><i>CI · merge · deploy</i>"]:::det
+        end
+
+        subgraph NODES ["AGENT NODES — non-deterministic, least privilege"]
+            direction LR
+            PL[Planner]:::llm
+            CO["Coder<br/><i>⇄ Build &amp; Test</i>"]:::llm
+            VF["Verifiers ×4<br/><i>fresh context</i>"]:::llm
+        end
+
+        SBX["kuwarden-sandbox — ephemeral · network-restricted · no credentials"]:::sbx
+        LLMA["LLM Adapter — vLLM · Bedrock VPC · Azure OpenAI · Watsonx"]:::adp
+        BUS["Tool Bus (MCP) — integrations only, not the inner loop"]:::adp
+
+        ENGINE --> NODES
+        NODES --> SBX
+        NODES --> LLMA
+        NODES --> BUS
+    end
+
+    subgraph ADAPT ["ADAPTERS"]
+        direction LR
+        SCM["SCM<br/>Azure Repos · GitLab<br/>Bitbucket DC · GitHub"]:::adp
+        CICD["CI/CD<br/>Jenkins · Azure Pipelines<br/>GH Actions"]:::adp
+        DEP["Deploy<br/>K8s · Helm · ArgoCD<br/>Terraform"]:::adp
+    end
+
+    subgraph OBS ["MONITORING &amp; EVIDENCE"]
+        direction LR
+        UI["Run list · Live log<br/>Approval queue"]:::obs
+        AUD["Audit trail — append-only<br/><b>tree-structured</b> (root/parent run)"]:::obs
+        ROLE["Role graph — policy.yaml<br/><i>version-controlled, auditable</i>"]:::obs
+    end
+
+    TRIG --> PERIM
+    PERIM --> ADAPT
+    PERIM --> OBS
+
+    classDef det  fill:#ECFDF5,stroke:#059669,stroke-width:2px,color:#064E3B
+    classDef llm  fill:#EEF2FF,stroke:#4F46E5,stroke-width:2px,color:#1E1B4B
+    classDef adp  fill:#F8FAFC,stroke:#64748B,stroke-width:2px,color:#0F172A
+    classDef obs  fill:#FEF3C7,stroke:#D97706,stroke-width:2px,color:#78350F
+    classDef sbx  fill:#FEE2E2,stroke:#DC2626,stroke-width:2px,color:#7F1D1D
+    classDef ext  fill:#FFFFFF,stroke:#94A3B8,stroke-width:2px,color:#0F172A

@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1000" width="1600" height="1000" font-family="Segoe UI, Inter, system-ui, -apple-system, Helvetica Neue, Arial, sans-serif">
+  <rect width="1600" height="1000" fill="#FFFFFF"/>
+
+  <!-- ===== Title ===== -->
+  <text x="80" y="76" font-size="46" font-weight="700" fill="#0F172A">What is allowed to be a model</text>
+  <text x="80" y="116" font-size="20" fill="#64748B">KuWarden separates the component that produces a change from the component that certifies and releases it.</text>
+
+  <!-- ===== Divider: the line that must not be crossed ===== -->
+  <line x1="800" y1="176" x2="800" y2="780" stroke="#CBD5E1" stroke-width="2" stroke-dasharray="7 9"/>
+
+  <!-- ===== LEFT PANEL: Agent nodes ===== -->
+  <rect x="80" y="176" width="608" height="604" rx="18" fill="#FFFFFF" stroke="#4F46E5" stroke-width="2.5"/>
+  <path d="M80 194 A18 18 0 0 1 98 176 H670 A18 18 0 0 1 688 194 V252 H80 Z" fill="#4F46E5"/>
+  <text x="112" y="222" font-size="27" font-weight="700" fill="#FFFFFF">AGENT NODES</text>
+  <rect x="556" y="200" width="104" height="32" rx="16" fill="#312E81"/>
+  <text x="608" y="222" font-size="16" font-weight="700" fill="#C7D2FE" text-anchor="middle">LLM</text>
+
+  <line x1="80" y1="340" x2="688" y2="340" stroke="#E2E8F0" stroke-width="1.5"/>
+  <line x1="80" y1="428" x2="688" y2="428" stroke="#E2E8F0" stroke-width="1.5"/>
+  <line x1="80" y1="516" x2="688" y2="516" stroke="#E2E8F0" stroke-width="1.5"/>
+  <line x1="80" y1="604" x2="688" y2="604" stroke="#E2E8F0" stroke-width="1.5"/>
+  <line x1="80" y1="692" x2="688" y2="692" stroke="#E2E8F0" stroke-width="1.5"/>
+
+  <text x="112" y="304" font-size="21" fill="#1E1B4B">LLM — non-deterministic</text>
+  <text x="112" y="392" font-size="21" fill="#1E1B4B">Yes. Routinely, and by design.</text>
+  <text x="112" y="466" font-size="21" fill="#1E1B4B">Read code. Write to its own</text>
+  <text x="112" y="494" font-size="21" fill="#1E1B4B">feature branch. <tspan font-weight="700">Nothing else.</tspan></text>
+  <text x="112" y="568" font-size="21" font-weight="700" fill="#1E1B4B">Never.</text>
+  <text x="112" y="642" font-size="21" fill="#1E1B4B">A transcript.</text>
+  <text x="112" y="670" font-size="21" fill="#1E1B4B">Not evidence.</text>
+  <text x="112" y="744" font-size="21" fill="#1E1B4B">Every run</text>
+
+  <!-- ===== RIGHT PANEL: Flow Engine ===== -->
+  <rect x="912" y="176" width="608" height="604" rx="18" fill="#FFFFFF" stroke="#059669" stroke-width="2.5"/>
+  <path d="M912 194 A18 18 0 0 1 930 176 H1502 A18 18 0 0 1 1520 194 V252 H912 Z" fill="#059669"/>
+  <text x="944" y="222" font-size="27" font-weight="700" fill="#FFFFFF">FLOW ENGINE</text>
+  <rect x="1364" y="200" width="128" height="32" rx="16" fill="#064E3B"/>
+  <text x="1428" y="222" font-size="16" font-weight="700" fill="#A7F3D0" text-anchor="middle">NO LLM</text>
+
+  <line x1="912" y1="340" x2="1520" y2="340" stroke="#E2E8F0" stroke-width="1.5"/>
+  <line x1="912" y1="428" x2="1520" y2="428" stroke="#E2E8F0" stroke-width="1.5"/>
+  <line x1="912" y1="516" x2="1520" y2="516" stroke="#E2E8F0" stroke-width="1.5"/>
+  <line x1="912" y1="604" x2="1520" y2="604" stroke="#E2E8F0" stroke-width="1.5"/>
+  <line x1="912" y1="692" x2="1520" y2="692" stroke="#E2E8F0" stroke-width="1.5"/>
+
+  <text x="944" y="304" font-size="21" fill="#064E3B">State machine — deterministic</text>
+  <text x="944" y="380" font-size="21" font-weight="700" fill="#064E3B">No.</text>
+  <text x="944" y="408" font-size="21" fill="#064E3B">Durable execution.</text>
+  <text x="944" y="466" font-size="21" fill="#064E3B">CI trigger · PR merge ·</text>
+  <text x="944" y="494" font-size="21" font-weight="700" fill="#064E3B">deployment credentials</text>
+  <text x="944" y="554" font-size="21" fill="#064E3B">Yes — by reading external</text>
+  <text x="944" y="582" font-size="21" fill="#064E3B">systems of record</text>
+  <text x="944" y="642" font-size="21" fill="#064E3B">Append-only state transitions.</text>
+  <text x="944" y="670" font-size="21" font-weight="700" fill="#064E3B">Is evidence.</text>
+  <text x="944" y="744" font-size="21" fill="#064E3B">Slow · versioned · reviewed</text>
+
+  <!-- ===== Gutter labels (drawn last, with halo) ===== -->
+  <g text-anchor="middle" font-size="14" font-weight="700" fill="#475569" letter-spacing="1.6">
+    <rect x="712" y="284" width="176" height="26" fill="#FFFFFF"/><text x="800" y="302">NATURE</text>
+    <rect x="712" y="372" width="176" height="26" fill="#FFFFFF"/><text x="800" y="390">MAY FAIL</text>
+    <rect x="712" y="460" width="176" height="26" fill="#FFFFFF"/><text x="800" y="478">PRIVILEGES</text>
+    <rect x="712" y="548" width="176" height="26" fill="#FFFFFF"/><text x="800" y="566">DECIDES SUCCESS</text>
+    <rect x="712" y="636" width="176" height="26" fill="#FFFFFF"/><text x="800" y="654">AUDIT VALUE</text>
+    <rect x="712" y="724" width="176" height="26" fill="#FFFFFF"/><text x="800" y="742">CHANGE RATE</text>
+  </g>
+
+  <!-- ===== Reality anchors strip ===== -->
+  <rect x="80" y="810" width="1440" height="56" rx="12" fill="#FEF3C7" stroke="#D97706" stroke-width="2"/>
+  <text x="112" y="846" font-size="18" font-weight="700" fill="#78350F">★ REALITY ANCHORS</text>
+  <text x="318" y="846" font-size="18" fill="#78350F">compiler exit code · CI result · coverage · SAST findings · pod readiness · error rate over soak window</text>
+
+  <!-- ===== The rule ===== -->
+  <rect x="80" y="886" width="1440" height="82" rx="14" fill="#0F172A"/>
+  <text x="800" y="924" font-size="28" font-weight="700" fill="#FFFFFF" text-anchor="middle">The agent guesses.  The Flow Engine verifies.</text>
+  <text x="800" y="952" font-size="18" fill="#94A3B8" text-anchor="middle">Whatever must be deterministic, auditable, or privileged does not get to be a model.</text>
+
+  <text x="1520" y="146" font-size="14" fill="#94A3B8" text-anchor="end">KuWarden · ADR 0001</text>
+</svg>

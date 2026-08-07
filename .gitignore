@@ -1,0 +1,23 @@
+# Raw session transcripts, mirrored by the Stop hook in .claude/settings.json.
+#
+# Deliberately NOT committed. Transcripts capture everything discussed, including
+# material never intended as project documentation. The curated session entries in
+# log/*.md are the versioned record; log/raw/ is a local safety net.
+#
+# See log/README.md.
+log/raw/
+
+# Personal Claude Code overrides
+.claude/settings.local.json
+
+# Diagram rendering (docs/diagrams/render.mjs needs `npm i sharp`)
+node_modules/
+package-lock.json
+docs/diagrams/package.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/

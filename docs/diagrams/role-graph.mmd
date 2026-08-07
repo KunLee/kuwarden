@@ -1,0 +1,41 @@
+%% KuWarden — The role graph (policy.yaml)
+%% Source of truth: docs/adr/0003-role-graph-and-traceability.md
+flowchart LR
+    subgraph ID ["IDENTITIES — who exists"]
+        direction TB
+        H["HUMAN — from enterprise IdP<br/>engineer · tech-lead · release-manager"]:::human
+        AN["AGENT NODES — <b>contain an LLM</b><br/>node.planner · node.coder · node.verifier<br/><i>identity = SPIFFE SVID, not a name</i>"]:::llm
+        CP["CONTROL PLANE — <b>no LLM</b><br/>engine.flow · engine.credential-broker<br/><i>deny: llm.invoke</i>"]:::det
+    end
+
+    subgraph RO ["ROLES — bundles"]
+        direction TB
+        AA["approval_authority<br/>low→0 · medium→1 · high→2<br/>exclude_change_author<br/><b>principals must all be human</b>"]:::gate
+        RA["role.planner · role.coder · role.verifier<br/><b>deny: deploy.* · scm.pr.merge</b><br/><i>explicit — not merely ungranted</i>"]:::llm
+        RC["role.flow-engine · role.deployer<br/><i>bindings scope by app + environment</i>"]:::det
+    end
+
+    subgraph CA ["CAPABILITIES — what can be done"]
+        direction TB
+        C1["READ &amp; BUILD<br/>scm.repo.read · scm.branch.write.own<br/>sandbox.exec · sast.run · llm.invoke"]:::cap
+        C2["ORCHESTRATION<br/>cicd.pipeline.trigger · scm.pr.create<br/>scm.pr.merge · ticket.transition"]:::cap
+        C3["DEPLOY<br/>deploy.k8s.test · uat · prod · rollback<br/><b>unreachable from any LLM-bearing identity</b>"]:::deny
+    end
+
+    H  --> AA
+    AN --> RA --> C1
+    CP --> RC
+    RC --> C2
+    RC --> C3
+    RA -. "✕ denied by construction<br/>CI: no-llm-holds-deploy" .-> C3
+
+    K["CONSTRAINTS — evaluated in CI on every change to policy.yaml; a violation fails the build<br/>no-llm-holds-deploy · no-llm-merges · control-plane-has-no-llm<br/>prod-requires-two-humans · no-agent-self-approval · every-identity-is-verifiable"]:::note
+    CA --> K
+
+    classDef llm   fill:#EEF2FF,stroke:#4F46E5,stroke-width:2px,color:#1E1B4B
+    classDef det   fill:#ECFDF5,stroke:#059669,stroke-width:2px,color:#064E3B
+    classDef gate  fill:#FCE7F3,stroke:#DB2777,stroke-width:2px,color:#831843
+    classDef deny  fill:#FEE2E2,stroke:#DC2626,stroke-width:3px,color:#7F1D1D
+    classDef cap   fill:#F8FAFC,stroke:#64748B,stroke-width:2px,color:#0F172A
+    classDef human fill:#F1F5F9,stroke:#64748B,stroke-width:2px,color:#0F172A
+    classDef note  fill:#0F172A,stroke:#0F172A,stroke-width:2px,color:#FBBF24

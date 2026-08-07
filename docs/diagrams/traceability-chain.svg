@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1200" width="1600" height="1200" font-family="Segoe UI, Inter, system-ui, -apple-system, Helvetica Neue, Arial, sans-serif">
+  <defs>
+    <marker id="t" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#0F172A"/>
+    </marker>
+  </defs>
+  <rect width="1600" height="1200" fill="#FFFFFF"/>
+
+  <text x="80" y="66" font-size="42" font-weight="700" fill="#0F172A">The delegation chain</text>
+  <text x="80" y="104" font-size="19" fill="#64748B">Every privileged action resolves to a person, a policy version, and the evidence that was actually on screen.</text>
+  <text x="1520" y="66" font-size="14" fill="#94A3B8" text-anchor="end">KuWarden · ADR 0003</text>
+
+  <!-- The question -->
+  <rect x="80" y="128" width="1440" height="62" rx="12" fill="#0F172A"/>
+  <text x="106" y="167" font-size="21" fill="#FFFFFF"><tspan font-weight="700" fill="#FBBF24">AUDIT:</tspan><tspan xml:space="preserve">  </tspan>“This revision running in production — who authorised it, under which policy, and what did they see?”</text>
+
+  <!-- Column headers -->
+  <text x="140" y="222" font-size="14" font-weight="700" fill="#475569" letter-spacing="1.6">HOP</text>
+  <text x="630" y="222" font-size="14" font-weight="700" fill="#475569" letter-spacing="1.6">RECORDED EVIDENCE — immutable, self-describing</text>
+
+  <!-- Spine -->
+  <line x1="104" y1="240" x2="104" y2="936" stroke="#CBD5E1" stroke-width="3"/>
+
+  <!-- Row 1 -->
+  <circle cx="104" cy="284" r="9" fill="#0F172A"/>
+  <rect x="140" y="238" width="460" height="92" rx="12" fill="#F1F5F9" stroke="#0F172A" stroke-width="2.5"/>
+  <text x="164" y="272" font-size="20" font-weight="700" fill="#0F172A">Human requester</text>
+  <text x="164" y="300" font-size="16" fill="#475569">authenticated by the enterprise IdP</text>
+  <rect x="630" y="238" width="890" height="92" rx="12" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="2"/>
+  <text x="654" y="272" font-size="17" fill="#0F172A">OIDC <tspan font-family="Consolas, monospace">sub</tspan> · group claims · IdP issuer · timestamp</text>
+  <text x="654" y="300" font-size="16" fill="#64748B">the chain starts at a person, never at a service account</text>
+
+  <!-- Row 2 -->
+  <circle cx="104" cy="404" r="9" fill="#0F172A"/>
+  <rect x="140" y="358" width="460" height="92" rx="12" fill="#F1F5F9" stroke="#0F172A" stroke-width="2.5"/>
+  <text x="164" y="392" font-size="20" font-weight="700" fill="#0F172A">Ticket</text>
+  <text x="164" y="420" font-size="16" fill="#475569">system of record</text>
+  <rect x="630" y="358" width="890" height="92" rx="12" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="2"/>
+  <text x="654" y="392" font-size="17" fill="#0F172A">JIRA <tspan font-family="Consolas, monospace">PAY-1234</tspan> · requester · acceptance-criteria digest</text>
+  <text x="654" y="420" font-size="16" fill="#64748B">criteria are hashed so a later edit cannot rewrite what was agreed</text>
+
+  <!-- Row 3 — the pin -->
+  <circle cx="104" cy="524" r="11" fill="#D97706"/>
+  <rect x="140" y="478" width="460" height="92" rx="12" fill="#FEF3C7" stroke="#D97706" stroke-width="3"/>
+  <text x="164" y="512" font-size="20" font-weight="700" fill="#78350F">★ Flow run</text>
+  <text x="164" y="540" font-size="16" fill="#92400E">the join between policy and reality</text>
+  <rect x="630" y="478" width="890" height="92" rx="12" fill="#FEF3C7" stroke="#D97706" stroke-width="3"/>
+  <text x="654" y="508" font-size="17" font-weight="700" fill="#78350F"><tspan font-family="Consolas, monospace">root_run_id</tspan> · <tspan font-family="Consolas, monospace">parent_run_id</tspan> · <tspan font-family="Consolas, monospace">policy_commit</tspan> · <tspan font-family="Consolas, monospace">policy_bundle</tspan></text>
+  <text x="654" y="532" font-size="16" fill="#92400E">pinned model versions · risk_tier · budget allowed and spent</text>
+  <text x="654" y="556" font-size="16" font-weight="700" fill="#92400E">Without the pin, a later policy edit silently rewrites every historical record.</text>
+
+  <!-- Row 4 -->
+  <circle cx="104" cy="644" r="9" fill="#4F46E5"/>
+  <rect x="140" y="598" width="460" height="92" rx="12" fill="#EEF2FF" stroke="#4F46E5" stroke-width="2.5"/>
+  <text x="164" y="632" font-size="20" font-weight="700" fill="#1E1B4B">Node execution</text>
+  <text x="164" y="660" font-size="16" fill="#4338CA">an LLM ran here</text>
+  <rect x="630" y="598" width="890" height="92" rx="12" fill="#FFFFFF" stroke="#4F46E5" stroke-width="2"/>
+  <text x="654" y="632" font-size="17" fill="#1E1B4B">workload identity (SVID) · node class · context digest · token spend</text>
+  <text x="654" y="660" font-size="16" fill="#4338CA">a name in a log is an assertion; an SVID is a fact the receiver verified</text>
+
+  <!-- Row 5 -->
+  <circle cx="104" cy="764" r="9" fill="#059669"/>
+  <rect x="140" y="718" width="460" height="92" rx="12" fill="#ECFDF5" stroke="#059669" stroke-width="2.5"/>
+  <text x="164" y="752" font-size="20" font-weight="700" fill="#064E3B">Tool call</text>
+  <text x="164" y="780" font-size="16" fill="#047857">via the Tool Bus — never a direct API call</text>
+  <rect x="630" y="718" width="890" height="92" rx="12" fill="#FFFFFF" stroke="#059669" stroke-width="2"/>
+  <text x="654" y="752" font-size="17" fill="#064E3B">tool name · arguments digest · result digest · authorising capability</text>
+  <text x="654" y="780" font-size="16" fill="#047857">checked against pinned <tspan font-style="italic">and</tspan> current policy — the stricter answer wins</text>
+
+  <!-- Row 6 -->
+  <circle cx="104" cy="884" r="9" fill="#059669"/>
+  <rect x="140" y="838" width="460" height="92" rx="12" fill="#ECFDF5" stroke="#059669" stroke-width="2.5"/>
+  <text x="164" y="872" font-size="20" font-weight="700" fill="#064E3B">Target effect</text>
+  <text x="164" y="900" font-size="16" fill="#047857">the change that actually exists</text>
+  <rect x="630" y="838" width="890" height="92" rx="12" fill="#FFFFFF" stroke="#059669" stroke-width="2.5"/>
+  <text x="654" y="872" font-size="17" fill="#064E3B">commit SHA · PR number · deploy revision · namespace</text>
+  <text x="654" y="900" font-size="16" font-weight="700" fill="#047857">artefacts carry <tspan font-family="Consolas, monospace">kuwarden-run-id</tspan> and <tspan font-family="Consolas, monospace">kuwarden-policy-commit</tspan> as labels/trailers</text>
+
+  <!-- Approvals band -->
+  <rect x="80" y="954" width="1440" height="94" rx="12" fill="#FCE7F3" stroke="#DB2777" stroke-width="3"/>
+  <text x="106" y="990" font-size="20" font-weight="700" fill="#831843">⟂ Approvals — attached to the run, not to a hop</text>
+  <text x="106" y="1018" font-size="17" fill="#9D174D">who · when · risk tier · approvers distinct from the change author</text>
+  <text x="106" y="1040" font-size="17" font-weight="700" fill="#9D174D">…and the evidence bundle they were shown. An approval detached from what was on screen is not evidence of review.</text>
+
+  <!-- Both directions -->
+  <rect x="80" y="1072" width="706" height="100" rx="12" fill="#F8FAFC" stroke="#64748B" stroke-width="2"/>
+  <path d="M106 1104 H320" stroke="#0F172A" stroke-width="2.5" marker-end="url(#t)"/>
+  <text x="340" y="1110" font-size="19" font-weight="700" fill="#0F172A">FORWARD</text>
+  <text x="106" y="1140" font-size="16" fill="#475569">“This ticket — what did it change, where, approved by whom?”</text>
+  <text x="106" y="1162" font-size="15" font-style="italic" fill="#64748B">asked by audit and compliance</text>
+
+  <rect x="814" y="1072" width="706" height="100" rx="12" fill="#F8FAFC" stroke="#64748B" stroke-width="2"/>
+  <path d="M1494 1104 H1280" stroke="#0F172A" stroke-width="2.5" marker-end="url(#t)"/>
+  <text x="1120" y="1110" font-size="19" font-weight="700" fill="#0F172A" text-anchor="end">BACKWARD</text>
+  <text x="840" y="1140" font-size="16" fill="#475569">“This revision in production — where did it come from, under which policy?”</text>
+  <text x="840" y="1162" font-size="15" font-style="italic" fill="#64748B">asked by incident response — the harder direction, and why artefacts carry run identity</text>
+</svg>

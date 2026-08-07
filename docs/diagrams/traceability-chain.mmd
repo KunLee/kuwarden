@@ -1,0 +1,34 @@
+%% KuWarden — The delegation chain (end-to-end traceability)
+%% Source of truth: docs/adr/0003-role-graph-and-traceability.md
+flowchart TD
+    Q["<b>AUDIT:</b> “This revision running in production — who authorised it,<br/>under which policy, and what did they see?”"]:::q
+
+    Q --> H
+    H["<b>Human requester</b><br/>OIDC sub · group claims · IdP issuer · timestamp<br/><i>the chain starts at a person, never at a service account</i>"]:::plain
+    H --> T
+    T["<b>Ticket</b> — system of record<br/>JIRA PAY-1234 · requester · acceptance-criteria digest<br/><i>criteria are hashed so a later edit cannot rewrite what was agreed</i>"]:::plain
+    T --> F
+    F["<b>★ Flow run — the join between policy and reality</b><br/>root_run_id · parent_run_id · <b>policy_commit</b> · <b>policy_bundle</b><br/>pinned model versions · risk_tier · budget allowed and spent<br/><b>Without the pin, a later policy edit silently rewrites every historical record.</b>"]:::anchor
+    F --> N
+    N["<b>Node execution</b> — an LLM ran here<br/>workload identity (SVID) · node class · context digest · token spend<br/><i>a name in a log is an assertion; an SVID is a fact the receiver verified</i>"]:::llm
+    N --> C
+    C["<b>Tool call</b> — via the Tool Bus, never a direct API call<br/>tool name · arguments digest · result digest · authorising capability<br/><i>checked against pinned AND current policy — the stricter answer wins</i>"]:::det
+    C --> E
+    E["<b>Target effect</b> — the change that actually exists<br/>commit SHA · PR number · deploy revision · namespace<br/><b>artefacts carry kuwarden-run-id and kuwarden-policy-commit as labels/trailers</b>"]:::det
+
+    A["<b>⟂ Approvals</b> — attached to the run, not to a hop<br/>who · when · risk tier · approvers distinct from the change author<br/><b>…and the evidence bundle they were shown.</b><br/><i>An approval detached from what was on screen is not evidence of review.</i>"]:::gate
+    F -.-> A
+    A -.-> E
+
+    FWD["<b>FORWARD →</b> “This ticket — what did it change, where, approved by whom?”<br/><i>asked by audit and compliance</i>"]:::note
+    BWD["<b>← BACKWARD</b> “This revision in production — where did it come from, under which policy?”<br/><i>asked by incident response — the harder direction, and why artefacts carry run identity</i>"]:::note
+    E --> FWD
+    E --> BWD
+
+    classDef q      fill:#0F172A,stroke:#0F172A,stroke-width:2px,color:#FFFFFF
+    classDef plain  fill:#F1F5F9,stroke:#0F172A,stroke-width:2px,color:#0F172A
+    classDef anchor fill:#FEF3C7,stroke:#D97706,stroke-width:3px,color:#78350F
+    classDef llm    fill:#EEF2FF,stroke:#4F46E5,stroke-width:2px,color:#1E1B4B
+    classDef det    fill:#ECFDF5,stroke:#059669,stroke-width:2px,color:#064E3B
+    classDef gate   fill:#FCE7F3,stroke:#DB2777,stroke-width:3px,color:#831843
+    classDef note   fill:#F8FAFC,stroke:#64748B,stroke-width:2px,color:#0F172A
