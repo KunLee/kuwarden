@@ -6,9 +6,11 @@ import asyncio
 import sys
 
 from engine.db import connect, dsn, migrate
+from engine.devenv import load_dotenv
 
 
 async def main() -> int:
+    load_dotenv()
     if len(sys.argv) < 2 or sys.argv[1] != "migrate":
         print("usage: python -m engine.db migrate", file=sys.stderr)
         return 2

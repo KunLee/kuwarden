@@ -10,18 +10,38 @@ import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import quote
 
 import asyncpg
+
+from engine.errors import PolicyDenied
 
 MIGRATIONS = Path(__file__).parent / "migrations"
 
 
 def dsn() -> str:
-    """Twelve-factor: one variable, no host paths, same string in every environment."""
-    return os.environ.get(
-        "KUWARDEN_DATABASE_URL",
-        "postgresql://kuwarden:dev@127.0.0.1:5432/kuwarden",
-    )
+    """Twelve-factor: one variable, no host paths, same string in every environment.
+
+    No embedded default password. `EnvCredentialBroker` denies a missing credential rather
+    than defaulting one, and a database password is not a lesser credential than a PAT — a
+    development default that works out of the box is a development default that reaches
+    somewhere it shouldn't, because nobody changes what already works.
+    """
+    url = os.environ.get("KUWARDEN_DATABASE_URL")
+    if url:
+        return url
+
+    password = os.environ.get("KUWARDEN_POSTGRES_PASSWORD")
+    if not password:
+        raise PolicyDenied(
+            "no database password available: set KUWARDEN_POSTGRES_PASSWORD (see .env.example) "
+            "or KUWARDEN_DATABASE_URL"
+        )
+    user = os.environ.get("KUWARDEN_POSTGRES_USER", "kuwarden")
+    database = os.environ.get("KUWARDEN_POSTGRES_DB", "kuwarden")
+    host = os.environ.get("KUWARDEN_POSTGRES_HOST", "127.0.0.1")
+    port = os.environ.get("KUWARDEN_POSTGRES_PORT", "5432")
+    return f"postgresql://{user}:{quote(password, safe='')}@{host}:{port}/{database}"
 
 
 @asynccontextmanager
