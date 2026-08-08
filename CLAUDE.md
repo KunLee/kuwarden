@@ -123,9 +123,42 @@ and docs. Terminology drift in this project has already caused one real design e
 - No `any`. No fetch calls outside the API client layer.
 
 **General**
-- Comment *why*, never *what*. If a line needs a comment to say what it does, rename things.
 - New behaviour ships with a test. A bug fix ships with the test that would have caught it.
 - Match surrounding style over personal preference.
+
+**Documentation in code — required**
+
+Three things always carry an explanation. This is not optional and it is not "when it seems
+useful":
+
+| What | Carries |
+|---|---|
+| **Every class** | A docstring: what it is for, and any constraint a caller must respect |
+| **Every method and function** | A docstring: what it does. Non-obvious parameters and return values get named |
+| **Every piece of critical logic** | A comment giving the **reason** — a security control, an ordering requirement, a platform quirk, a rejected alternative |
+
+"Critical" means: if someone deleted this line during a refactor, would something break in a
+way the tests might not catch? Security controls, idempotency keys, ordering constraints,
+determinism requirements, and anything derived from an ADR all qualify.
+
+This does **not** license narrating the code. The two rules together:
+
+> **Docstrings say what. Inline comments say why. Neither restates the line below it.**
+
+```python
+# Bad — restates the code
+# increment the sequence number
+self._seq += 1
+
+# Good — says why, and would be lost if deleted
+# Sequence is assigned in workflow code, not in the activity, so a replay produces the
+# same numbering. Assigning it activity-side would renumber every event on recovery.
+self._seq += 1
+```
+
+If a line needs a comment to say *what* it does, rename things instead. If it needs one to
+say *why* it is that way, write it — that reason is not recoverable from the code, and the
+next person to touch it will not have been in the conversation where it was decided.
 
 ---
 

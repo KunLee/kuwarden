@@ -16,6 +16,7 @@ from temporalio.worker import Worker
 
 from engine.activities.audit import record_event, record_run_ended, record_run_started
 from engine.activities.nodes import run_node
+from engine.devenv import load_dotenv
 from engine.flows.delivery import DeliveryFlow
 
 TASK_QUEUE = "kuwarden-delivery"
@@ -30,6 +31,7 @@ def namespace() -> str:
 
 
 async def main() -> None:
+    load_dotenv()
     logging.basicConfig(level=os.environ.get("KUWARDEN_LOG_LEVEL", "INFO"))
     client = await Client.connect(target(), namespace=namespace())
     worker = Worker(
