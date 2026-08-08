@@ -6,8 +6,8 @@
 # managed service (Temporal -> Temporal Cloud, PostgreSQL -> RDS). When that
 # happens this file is deleted, not rewritten.
 #
-# Ports bind to 127.0.0.1: the credentials below are development defaults and
-# have no business being reachable from the network.
+# Ports bind to 127.0.0.1. That is defence in depth, not the control: the database
+# password is required from the environment and has no default here.
 
 name: kuwarden
 
@@ -48,7 +48,10 @@ services:
     image: docker.io/library/postgres:17.9-alpine
     environment:
       POSTGRES_USER: ${KUWARDEN_POSTGRES_USER:-kuwarden}
-      POSTGRES_PASSWORD: ${KUWARDEN_POSTGRES_PASSWORD:-dev}
+      # Required, with no default. A literal default here is a committed credential --
+      # which is what it looked like to secret scanning, correctly. `:?` fails the
+      # `compose up` with this message rather than silently starting on a known password.
+      POSTGRES_PASSWORD: ${KUWARDEN_POSTGRES_PASSWORD:?set KUWARDEN_POSTGRES_PASSWORD in .env — see .env.example}
       POSTGRES_DB: ${KUWARDEN_POSTGRES_DB:-kuwarden}
     ports:
       - "127.0.0.1:${KUWARDEN_POSTGRES_PORT:-5432}:5432"

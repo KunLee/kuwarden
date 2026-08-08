@@ -90,6 +90,13 @@ Read in this order.
 
 Requires a container runtime with Compose support (Podman or Docker).
 
+Set a database password first — there is no default, and `compose up` refuses to start
+without one:
+
+```bash
+cp .env.example .env && python -c "import secrets; print('KUWARDEN_POSTGRES_PASSWORD=' + secrets.token_urlsafe(32))" >> .env
+```
+
 ```bash
 podman compose up -d --wait
 ```
@@ -99,15 +106,16 @@ Two containers, no application:
 | | |
 |---|---|
 | **Temporal** | `localhost:7233` · Web UI at [localhost:8233](http://localhost:8233) — the dev server, embedded SQLite, no external database needed |
-| **PostgreSQL** | `localhost:5432` · database `kuwarden`, user `kuwarden`, password `dev` |
+| **PostgreSQL** | `localhost:5432` · database `kuwarden`, user `kuwarden`, password from `.env` |
 
 The engine is **not** a service in [compose.yaml](compose.yaml). It runs on the host under
 `uv run`, so editing code does not mean rebuilding an image — and so that everything in that
 file is precisely the part a cloud deployment replaces with a managed service. Migrating means
 deleting the file, not rewriting it.
 
-Defaults are overridable via `.env` — see [.env.example](.env.example). Ports bind to
-`127.0.0.1` only; the credentials above are development values.
+Other settings are overridable via `.env` — see [.env.example](.env.example). Ports bind to
+`127.0.0.1` only, which is defence in depth rather than the control: no credential in this
+repository has a working default.
 
 ```bash
 podman compose down
@@ -117,9 +125,28 @@ State survives that. To discard it, `podman compose down -v`.
 
 ### The engine
 
+A master key is needed before any credential can be stored — see
+[ADR 0006](docs/adr/0006-credential-storage.md). Generate one, append it to `.env`, and
+**back it up somewhere other than your database backup**: losing it means every stored
+credential has to be re-entered.
+
+```bash
+uv run python -m engine.adapters.secrets keygen >> .env
+```
+
 ```bash
 uv sync && uv run python -m engine.db migrate && uv run python -m engine.worker
 ```
+
+### The Workbench
+
+```bash
+uv run uvicorn engine.api.main:app --reload --port 8080
+```
+
+[localhost:8080](http://localhost:8080) — register an application, store its credentials,
+probe what the platform can actually do. Credentials are **write-only**: they are encrypted
+before reaching PostgreSQL and no endpoint returns one, only whether it exists.
 
 Then run the suite — the walking-skeleton tests need the stack up, and skip themselves when
 Temporal is unreachable:

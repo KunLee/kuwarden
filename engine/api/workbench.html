@@ -1,0 +1,146 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>KuWarden Workbench</title>
+<style>
+  :root { color-scheme: light dark; --line: #8884; --bad: #c0392b; --good: #1e8449; }
+  body { font: 15px/1.5 ui-sans-serif, system-ui, sans-serif; max-width: 62rem;
+         margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.4rem; margin-bottom: .2rem; }
+  .sub { opacity: .7; margin-top: 0; }
+  fieldset { border: 1px solid var(--line); border-radius: 6px; margin: 1.5rem 0; padding: 1rem; }
+  legend { font-weight: 600; padding: 0 .4rem; }
+  label { display: block; margin: .6rem 0 .2rem; font-size: .85rem; opacity: .85; }
+  input, select { width: 100%; padding: .45rem; border: 1px solid var(--line);
+                  border-radius: 4px; background: transparent; color: inherit; font: inherit; }
+  button { padding: .5rem 1rem; border: 1px solid var(--line); border-radius: 4px;
+           background: transparent; color: inherit; font: inherit; cursor: pointer; }
+  button:hover { border-color: currentColor; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: .8rem; }
+  table { width: 100%; border-collapse: collapse; margin-top: .6rem; font-size: .9rem; }
+  th, td { text-align: left; padding: .35rem .5rem; border-bottom: 1px solid var(--line); }
+  code { font-size: .85em; opacity: .8; }
+  .note { font-size: .82rem; opacity: .7; margin-top: .6rem; }
+  .bad { color: var(--bad); } .good { color: var(--good); }
+  #out { white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: .82rem;
+         border: 1px solid var(--line); border-radius: 4px; padding: .6rem; margin-top: 1rem;
+         min-height: 3rem; }
+</style>
+
+<h1>KuWarden Workbench</h1>
+<p class="sub">Register an application, store its credentials, probe what the platform can
+actually do.</p>
+
+<fieldset>
+  <legend>1 · Register an application</legend>
+  <div class="row">
+    <div><label>Name</label><input id="name" placeholder="payments-service"></div>
+    <div><label>SCM</label>
+      <select id="scm"><option value="github">GitHub</option>
+                       <option value="azure_repos">Azure Repos</option></select></div>
+    <div><label>Org</label><input id="org" placeholder="acme"></div>
+    <div><label>Repo</label><input id="repo" placeholder="payments-service"></div>
+    <div><label>Project <span class="note">(Azure Repos only)</span></label>
+      <input id="project" placeholder="Payments"></div>
+    <div><label>Integration model</label>
+      <select id="model">
+        <option value="gated_deployment">gated_deployment — platform asks us (default)</option>
+        <option value="gated_merge">gated_merge — we gate the merge</option>
+        <option value="kuwarden_deploys">kuwarden_deploys — we deploy</option>
+      </select></div>
+  </div>
+  <p class="note">Declared, never inferred — ADR 0004. The probe below may refuse it; it
+    cannot choose it for you.</p>
+  <p><button onclick="register()">Register</button></p>
+</fieldset>
+
+<fieldset>
+  <legend>2 · Credentials</legend>
+  <label>Application</label>
+  <select id="app" onchange="loadCreds()"></select>
+  <div class="row">
+    <div><label>Kind</label><select id="kind"></select></div>
+    <div><label>Value</label><input id="secret" type="password"
+          placeholder="paste the token — it is never shown again"></div>
+  </div>
+  <p><button onclick="storeCred()">Store</button></p>
+  <p class="note"><strong>Write-only.</strong> Encrypted with the master key from
+    <code>.env</code> before it reaches PostgreSQL. There is no endpoint that returns a
+    stored value — only whether one exists.</p>
+  <table><thead><tr><th>Kind</th><th>Stored</th><th></th></tr></thead>
+         <tbody id="creds"></tbody></table>
+</fieldset>
+
+<fieldset>
+  <legend>3 · Probe the platform</legend>
+  <p>Runs against the stored SCM credential, so it also answers whether that token works.</p>
+  <p><button onclick="probe()">Probe</button></p>
+</fieldset>
+
+<div id="out">Ready.</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const say = (msg, cls) => { $('out').innerHTML =
+  `<span class="${cls || ''}">${typeof msg === 'string' ? msg : JSON.stringify(msg, null, 2)}</span>`; };
+
+async function api(path, opts) {
+  const r = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...opts });
+  if (r.status === 204) return null;
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(body.detail || `${r.status}`);
+  return body;
+}
+
+async function register() {
+  try {
+    const created = await api('/api/applications', { method: 'POST', body: JSON.stringify({
+      name: $('name').value, scm_provider: $('scm').value, org: $('org').value,
+      repo: $('repo').value, project: $('project').value || null,
+      integration_model: $('model').value })});
+    say(`Registered ${created.name} — ${created.id}`, 'good');
+    await loadApps();
+  } catch (e) { say(e.message, 'bad'); }
+}
+
+async function loadApps() {
+  const apps = await api('/api/applications');
+  $('app').innerHTML = apps.map(a =>
+    `<option value="${a.id}">${a.name} — ${a.integration_model}</option>`).join('');
+  if (apps.length) await loadCreds();
+}
+
+async function loadCreds() {
+  const id = $('app').value; if (!id) return;
+  const c = await api(`/api/applications/${id}/credentials`);
+  $('kind').innerHTML = c.supported.map(k => `<option value="${k}">${k}</option>`).join('');
+  $('creds').innerHTML = c.supported.map(k => {
+    const set = c.present.includes(k);
+    return `<tr><td><code>${k}</code></td>
+      <td class="${set ? 'good' : ''}">${set ? 'stored' : '—'}</td>
+      <td>${set ? `<button onclick="forget('${k}')">Delete</button>` : ''}</td></tr>`;
+  }).join('');
+}
+
+async function storeCred() {
+  const id = $('app').value;
+  try {
+    await api(`/api/applications/${id}/credentials/${$('kind').value}`,
+      { method: 'PUT', body: JSON.stringify({ value: $('secret').value }) });
+    $('secret').value = '';
+    say('Stored, encrypted. It cannot be read back.', 'good');
+    await loadCreds();
+  } catch (e) { say(e.message, 'bad'); }
+}
+
+async function forget(kind) {
+  await api(`/api/applications/${$('app').value}/credentials/${kind}`, { method: 'DELETE' });
+  await loadCreds(); say(`Deleted ${kind}.`);
+}
+
+async function probe() {
+  try { say(await api(`/api/applications/${$('app').value}/probe`, { method: 'POST' })); }
+  catch (e) { say(e.message, 'bad'); }
+}
+
+loadApps().catch(e => say(e.message, 'bad'));
+</script>
