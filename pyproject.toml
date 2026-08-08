@@ -11,6 +11,10 @@ requires-python = ">=3.12"
 #               against recorded platform responses without reaching a network
 #   pyyaml      kuwarden.yaml and policy.yaml. Loaded with safe_load only -- these
 #               files are read from application repositories
+#   cryptography  AES-256-GCM for tenant credentials at rest (ADR 0006). The one
+#               primitive nobody should hand-roll.
+#   fastapi     the Workbench API
+#   uvicorn     serving it
 #   anthropic   the Anthropic LLM adapter. Optional at runtime -- imported inside
 #               the adapter so an air-gapped deployment using a self-hosted
 #               OpenAI-compatible endpoint never needs it installed
@@ -22,6 +26,9 @@ dependencies = [
     "asyncpg>=0.30",
     "httpx>=0.28",
     "pyyaml>=6.0",
+    "cryptography>=44",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
     "anthropic>=0.69",
 ]
 

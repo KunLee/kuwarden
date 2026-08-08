@@ -125,9 +125,28 @@ State survives that. To discard it, `podman compose down -v`.
 
 ### The engine
 
+A master key is needed before any credential can be stored — see
+[ADR 0006](docs/adr/0006-credential-storage.md). Generate one, append it to `.env`, and
+**back it up somewhere other than your database backup**: losing it means every stored
+credential has to be re-entered.
+
+```bash
+uv run python -m engine.adapters.secrets keygen >> .env
+```
+
 ```bash
 uv sync && uv run python -m engine.db migrate && uv run python -m engine.worker
 ```
+
+### The Workbench
+
+```bash
+uv run uvicorn engine.api.main:app --reload --port 8080
+```
+
+[localhost:8080](http://localhost:8080) — register an application, store its credentials,
+probe what the platform can actually do. Credentials are **write-only**: they are encrypted
+before reaching PostgreSQL and no endpoint returns one, only whether it exists.
 
 Then run the suite — the walking-skeleton tests need the stack up, and skip themselves when
 Temporal is unreachable:
