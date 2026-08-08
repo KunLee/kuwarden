@@ -60,6 +60,7 @@ class CredentialKind(StrEnum):
     SCM_MERGE = "scm.merge"
     CI_TRIGGER = "ci.trigger"
     DEPLOY = "deploy"
+    LLM_API_KEY = "llm.api_key"
 
 
 @dataclass(frozen=True)
@@ -94,6 +95,7 @@ class EnvCredentialBroker:
         CredentialKind.SCM_MERGE: "KUWARDEN_SCM_MERGE_TOKEN",
         CredentialKind.CI_TRIGGER: "KUWARDEN_CI_TOKEN",
         CredentialKind.DEPLOY: "KUWARDEN_DEPLOY_TOKEN",
+        CredentialKind.LLM_API_KEY: "KUWARDEN_LLM_API_KEY",
     }
 
     def __init__(self, environ: dict[str, str] | None = None) -> None:

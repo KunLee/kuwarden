@@ -11,6 +11,9 @@ requires-python = ">=3.12"
 #               against recorded platform responses without reaching a network
 #   pyyaml      kuwarden.yaml and policy.yaml. Loaded with safe_load only -- these
 #               files are read from application repositories
+#   anthropic   the Anthropic LLM adapter. Optional at runtime -- imported inside
+#               the adapter so an air-gapped deployment using a self-hosted
+#               OpenAI-compatible endpoint never needs it installed
 # This ships into air-gapped environments; every addition is someone's security
 # review. Migrations are plain SQL applied by engine/db/migrate.py rather than a
 # migration framework, for the same reason.
@@ -19,6 +22,7 @@ dependencies = [
     "asyncpg>=0.30",
     "httpx>=0.28",
     "pyyaml>=6.0",
+    "anthropic>=0.69",
 ]
 
 [dependency-groups]

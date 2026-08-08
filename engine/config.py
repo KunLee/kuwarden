@@ -17,6 +17,7 @@ from typing import Any
 
 import yaml
 
+from engine.adapters.llm import Provider
 from engine.adapters.protocols import IntegrationModel, RepoRef, TicketRef
 from engine.errors import KuWardenError
 from engine.state import RiskTier
@@ -67,6 +68,34 @@ class RiskConfig:
 
 
 @dataclass(frozen=True)
+class NodeModel:
+    model: str
+    effort: str = "high"
+    max_tokens: int = 8192
+
+
+@dataclass(frozen=True)
+class LLMConfig:
+    """Which model each node uses. Never a default in engine code.
+
+    The API key is deliberately absent: it is resolved by the credential broker, so a
+    kuwarden.yaml committed to an application repository never carries one.
+    """
+
+    provider: Provider
+    per_node: dict[str, NodeModel] = field(default_factory=dict)
+    base_url: str | None = None
+
+    def for_node(self, node_id: str) -> NodeModel:
+        if node_id in self.per_node:
+            return self.per_node[node_id]
+        # Verifiers share a setting unless one is named individually.
+        if node_id.startswith("verifier.") and "verifiers" in self.per_node:
+            return self.per_node["verifiers"]
+        raise ConfigError(f"llm has no model configured for node {node_id!r}")
+
+
+@dataclass(frozen=True)
 class AppConfig:
     name: str
     repos: list[RepoConfig]
@@ -74,6 +103,7 @@ class AppConfig:
     integration_model: IntegrationModel
     toolchain_id: str = "none"
     risk: RiskConfig = field(default_factory=RiskConfig)
+    llm: LLMConfig | None = None
     budget_cents_per_run: int = 0
     max_coder_retries: int = 3
     default_risk_tier: RiskTier = "low"
@@ -134,6 +164,7 @@ def parse(text: str) -> AppConfig:
 
     risk_raw = raw.get("risk") or {}
     budgets = raw.get("budgets") or {}
+    llm = _llm(raw.get("llm"))
 
     return AppConfig(
         name=name,
@@ -141,6 +172,7 @@ def parse(text: str) -> AppConfig:
         triggers=triggers,
         integration_model=integration_model,
         toolchain_id=str(raw.get("toolchain", {}).get("id", "none")),
+        llm=llm,
         risk=RiskConfig(
             high_paths=[str(p) for p in risk_raw.get("high_paths", [])],
             medium_paths=[str(p) for p in risk_raw.get("medium_paths", [])],
@@ -214,4 +246,50 @@ def _trigger(entry: Any, index: int) -> TriggerConfig:
         story_points_field=(
             str(entry["story_points_field"]) if entry.get("story_points_field") else None
         ),
+    )
+
+
+def _llm(raw: Any) -> LLMConfig | None:
+    """Absent is legal: the walking skeleton runs with every node empty, by design."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ConfigError("llm must be a mapping")
+
+    declared = raw.get("provider")
+    if declared is None:
+        raise ConfigError(
+            "llm.provider must be declared explicitly "
+            f"(one of {', '.join(p.value for p in Provider)})"
+        )
+    try:
+        provider = Provider(declared)
+    except ValueError:
+        raise ConfigError(f"unknown llm.provider {declared!r}") from None
+
+    for forbidden in ("api_key", "key", "token", "secret"):
+        if forbidden in raw:
+            # Fail loudly rather than ignoring it. A key written here is a key in the
+            # application's git history, and this file is world-readable to that repo.
+            raise ConfigError(
+                f"llm.{forbidden} must not appear in kuwarden.yaml; credentials are resolved "
+                "by the broker from the environment or the secret store"
+            )
+
+    per_node: dict[str, NodeModel] = {}
+    for node_id, entry in raw.items():
+        if node_id in {"provider", "base_url"}:
+            continue
+        if not isinstance(entry, dict) or not entry.get("model"):
+            raise ConfigError(f"llm.{node_id} needs a model")
+        per_node[node_id] = NodeModel(
+            model=str(entry["model"]),
+            effort=str(entry.get("effort", "high")),
+            max_tokens=int(entry.get("max_tokens", 8192)),
+        )
+
+    return LLMConfig(
+        provider=provider,
+        per_node=per_node,
+        base_url=str(raw["base_url"]) if raw.get("base_url") else None,
     )

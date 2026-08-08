@@ -8,6 +8,8 @@ are real; only the far side of the HTTP boundary is not.
 
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 
@@ -42,6 +44,12 @@ delivery:
 toolchain:
   id: python3.12
 
+llm:
+  provider: anthropic
+  planner: { model: claude-opus-5, effort: high }
+  coder: { model: claude-opus-5, effort: xhigh }
+  verifiers: { model: claude-opus-5, effort: high }
+
 risk:
   high_labels: [security, payments]
 
@@ -59,15 +67,19 @@ class FakePlatform:
         self.comments: list[str] = []
         self.labels: list[str] = ["kuwarden-auto"]
         self.story_points: int | None = 3
+        #: Set to a category string to make the model decline the next completion.
+        self.refuse_with: str | None = None
+        self.messages_requests: list[dict[str, object]] = []
 
     def transport(self) -> httpx.MockTransport:
         return httpx.MockTransport(self._handle)
 
     def _handle(self, request: httpx.Request) -> httpx.Response:
-        import json
-
         self.requests.append(request)
         path = request.url.path
+
+        if path.endswith("/v1/messages"):
+            return self._messages(json.loads(request.content))
 
         if path.endswith("/comment"):
             self.comments.append(json.loads(request.content)["body"]["content"][0]["content"][0]["text"])
@@ -117,6 +129,34 @@ class FakePlatform:
             )
         return httpx.Response(404, text=f"fake platform has no route for {path}")
 
+    def _messages(self, body: dict[str, object]) -> httpx.Response:
+        """The Anthropic Messages API, close enough to catch shape errors.
+
+        A refusal is a 200 with an empty content array — the case that breaks naive code.
+        """
+        self.messages_requests.append(body)
+        usage = {"input_tokens": 120, "output_tokens": 40}
+
+        if self.refuse_with is not None:
+            return httpx.Response(200, json={
+                "id": "msg_refused", "type": "message", "role": "assistant",
+                "model": body.get("model"), "content": [],
+                "stop_reason": "refusal",
+                "stop_details": {"type": "refusal", "category": self.refuse_with,
+                                 "explanation": "declined"},
+                "usage": usage,
+            })
+
+        plan = json.dumps({"summary": "Add a /health endpoint", "steps": ["write handler",
+                                                                          "add test"]})
+        return httpx.Response(200, json={
+            "id": "msg_ok", "type": "message", "role": "assistant",
+            "model": body.get("model"),
+            "content": [{"type": "text", "text": plan}],
+            "stop_reason": "end_turn",
+            "usage": usage,
+        })
+
 
 @pytest.fixture
 def app_config() -> AppConfig:
@@ -130,7 +170,11 @@ def platform(app_config: AppConfig) -> FakePlatform:
     RUNTIME.configure(
         app_config,
         broker=EnvCredentialBroker(
-            {"KUWARDEN_TICKET_TOKEN": "jira-t", "KUWARDEN_SCM_TOKEN": "gh-t"}
+            {
+                "KUWARDEN_TICKET_TOKEN": "jira-t",
+                "KUWARDEN_SCM_TOKEN": "gh-t",
+                "KUWARDEN_LLM_API_KEY": "sk-ant-fake",
+            }
         ),
         transport=fake.transport(),
     )
