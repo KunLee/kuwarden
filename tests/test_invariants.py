@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from engine.adapters.llm import assert_may_call_llm, complete
+from engine.adapters.llm import assert_may_call_llm
 from engine.errors import InvariantViolation, RiskTierLowered
 from engine.nodes import NODES, REGISTRY
 from engine.nodes.base import executing
@@ -45,12 +45,6 @@ def test_deterministic_nodes_may_not_call_a_model(node_id: str) -> None:
 def test_generative_and_verifier_nodes_pass_the_guard(node_id: str) -> None:
     with executing(REGISTRY[node_id]):
         assert_may_call_llm()
-
-
-async def test_no_llm_adapter_exists_yet() -> None:
-    """Empty nodes are deliberate: the control plane is proven before a model is added."""
-    with executing(REGISTRY["planner"]), pytest.raises(NotImplementedError):
-        await complete("anything")
 
 
 # --- invariant 4: verifiers get a fresh context -------------------------------------------
