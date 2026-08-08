@@ -86,6 +86,52 @@ Read in this order.
 
 ---
 
+## Running it locally
+
+Requires a container runtime with Compose support (Podman or Docker).
+
+```bash
+podman compose up -d --wait
+```
+
+Two containers, no application:
+
+| | |
+|---|---|
+| **Temporal** | `localhost:7233` · Web UI at [localhost:8233](http://localhost:8233) — the dev server, embedded SQLite, no external database needed |
+| **PostgreSQL** | `localhost:5432` · database `kuwarden`, user `kuwarden`, password `dev` |
+
+The engine is **not** a service in [compose.yaml](compose.yaml). It runs on the host under
+`uv run`, so editing code does not mean rebuilding an image — and so that everything in that
+file is precisely the part a cloud deployment replaces with a managed service. Migrating means
+deleting the file, not rewriting it.
+
+Defaults are overridable via `.env` — see [.env.example](.env.example). Ports bind to
+`127.0.0.1` only; the credentials above are development values.
+
+```bash
+podman compose down
+```
+
+State survives that. To discard it, `podman compose down -v`.
+
+### The engine
+
+```bash
+uv sync && uv run python -m engine.db migrate && uv run python -m engine.worker
+```
+
+Then run the suite — the walking-skeleton tests need the stack up, and skip themselves when
+Temporal is unreachable:
+
+```bash
+uv run pytest
+```
+
+Workflow histories are visible at [localhost:8233](http://localhost:8233) while runs execute.
+
+---
+
 ## Where things stand
 
 **Decided and recorded.** Notably the choices that are expensive to retrofit: durable
@@ -96,7 +142,7 @@ the uniform node contract, and the sandbox contract.
 
 | Item | Note |
 |---|---|
-| Any code | Scaffolding is next |
+| Nodes that do anything | The walking skeleton runs eight empty nodes end to end. Models go in after the control plane is proven, not before |
 | `THREAT_MODEL.md` | Primary threats identified: prompt injection via ticket content, workflow-definition write escalation |
 | `EVALUATION.md` | Blocks any claim that the verifier design works |
 | `policy.yaml` schema + constraint evaluator | Until it exists, the constraints in [policy.example.yaml](docs/reference/policy.example.yaml) are decorative |
