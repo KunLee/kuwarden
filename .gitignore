@@ -10,6 +10,18 @@ log/raw/
 # Personal Claude Code overrides
 .claude/settings.local.json
 
+# Local compose overrides. .env.example is the committed template.
+.env
+
+# Python. uv.lock IS committed — this ships into air-gapped environments, where a
+# non-reproducible resolve is not an inconvenience but a blocker.
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
 # Diagram rendering (docs/diagrams/render.mjs needs `npm i sharp`)
 node_modules/
 package-lock.json

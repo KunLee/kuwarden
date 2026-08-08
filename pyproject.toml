@@ -1,0 +1,66 @@
+[project]
+name = "kuwarden"
+version = "0.0.0"
+description = "Governed, auditable change delivery — from ticket to production"
+requires-python = ">=3.12"
+
+# Two runtime dependencies, both load-bearing:
+#   temporalio  the Flow Engine itself (ADR 0001)
+#   asyncpg     the audit projection and run tree (ADR 0002, ADR 0003)
+#   httpx       every adapter -- async, and its MockTransport lets adapters be tested
+#               against recorded platform responses without reaching a network
+#   pyyaml      kuwarden.yaml and policy.yaml. Loaded with safe_load only -- these
+#               files are read from application repositories
+#   anthropic   the Anthropic LLM adapter. Optional at runtime -- imported inside
+#               the adapter so an air-gapped deployment using a self-hosted
+#               OpenAI-compatible endpoint never needs it installed
+# This ships into air-gapped environments; every addition is someone's security
+# review. Migrations are plain SQL applied by engine/db/migrate.py rather than a
+# migration framework, for the same reason.
+dependencies = [
+    "temporalio>=1.9",
+    "asyncpg>=0.30",
+    "httpx>=0.28",
+    "pyyaml>=6.0",
+    "anthropic>=0.69",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.14",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.25",
+    "ruff>=0.9",
+    "types-pyyaml>=6.0.12.20260724",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["engine"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "A", "C4", "PT", "SIM", "TID"]
+# N818 wants every exception suffixed `Error`. Ours are named for what happened --
+# `ProtectedPathWritten`, `RiskTierLowered` -- which reads better at a raise site and in a
+# traceback than the suffix does. The rest of pep8-naming is kept.
+ignore = ["N818"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+
+[[tool.mypy.overrides]]
+module = "asyncpg.*"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
