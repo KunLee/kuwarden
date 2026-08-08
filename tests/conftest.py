@@ -16,6 +16,10 @@ import pytest
 from engine.activities.nodes import RUNTIME
 from engine.adapters.credentials import EnvCredentialBroker
 from engine.config import AppConfig, parse
+from engine.devenv import load_dotenv
+
+# The walking-skeleton tests talk to the real stack, which needs the .env compose read.
+load_dotenv()
 
 KUWARDEN_YAML = """
 version: 1
