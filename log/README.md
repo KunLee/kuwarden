@@ -26,6 +26,16 @@ The third bullet is the one that earns the directory. A project's ADRs make it l
 decision was reached cleanly on the first attempt. They never were, and the corrections are
 usually more instructive than the conclusions.
 
+## Reading this later
+
+The append-only rule means an entry that turned out to be wrong **stays wrong on the page**.
+That is correct for a journal and unhelpful for onboarding, so the corrections are resolved in
+[docs/KNOWLEDGE_BASE.md](../docs/KNOWLEDGE_BASE.md) — a reconciled view of what is true now,
+rewritten as things change.
+
+Read that first. Come here when you want to know *how* something came to be, or what was
+tried and dropped.
+
 ## Format
 
 One file per working session: `YYYY-MM-DD-NN-topic.md`.

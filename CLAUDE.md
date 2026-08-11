@@ -29,24 +29,44 @@ sovereignty, post-PR delivery, or evidence, question whether it belongs here.
 Treat this as a checklist. If a diff touches any of these areas, verify the invariant still
 holds before finishing.
 
-| # | Invariant | Source |
-|---|---|---|
-| 1 | **The Flow Engine contains no LLM.** Workflow code never calls a model. | [ADR 0001](docs/adr/0001-flow-engine-control-plane.md) |
-| 2 | **Agent nodes never hold CI, merge, or deploy credentials.** Read code, write their own branch, nothing else. | [ADR 0001](docs/adr/0001-flow-engine-control-plane.md) |
-| 3 | **Gate verdicts read external systems of record** — CI exit code, SAST report, coverage, health endpoint. Never an agent's claim that it succeeded. | [ADR 0001](docs/adr/0001-flow-engine-control-plane.md) |
-| 4 | **Verifier nodes get a fresh context.** They never see the Coder's reasoning, self-assessment, or prior attempts. | [ADR 0002](docs/adr/0002-flow-topology.md) |
-| 5 | **`risk_tier` may only be raised, never lowered** — by anything, at either tiering stage. | [ADR 0002](docs/adr/0002-flow-topology.md) |
-| 6 | **Default to a single agent.** Fan out only when sub-units share no contract. | [ADR 0002](docs/adr/0002-flow-topology.md) |
-| 7 | **Every run pins `policy_commit` + `policy_bundle` at start.** Child runs inherit them. | [ADR 0003](docs/adr/0003-role-graph-and-traceability.md) |
-| 8 | **Privileged actions check pinned *and* current policy. Deny wins.** | [ADR 0003](docs/adr/0003-role-graph-and-traceability.md) |
-| 9 | **The audit trail is a tree and append-only.** Never `UPDATE` an audit row. | [ADR 0003](docs/adr/0003-role-graph-and-traceability.md) |
-| 10 | **Agents never write `protected_paths`** — CI definitions, deploy manifests, IaC, `kuwarden.yaml`, `policy.yaml`. Hard deny at the tool boundary. | [ADR 0004](docs/adr/0004-delivery-integration-models.md) |
-| 11 | **`control_mode` is never inferred or defaulted.** `authorized` means KuWarden gated it; `observed` means we watched it happen. | [ADR 0004](docs/adr/0004-delivery-integration-models.md) |
-| 12 | **The sandbox holds no credentials, has no egress, is ephemeral, is limited, and produces a diff — it never pushes.** | [ADR 0005](docs/adr/0005-sandbox-contract.md) |
+**Every row states how it is enforced, and the cell is never blank.** An invariant whose only
+enforcement is "someone will notice in review" is a claim, not a control — and this project
+exists to argue that the difference matters. Writing that down is the same discipline
+invariant 11 applies to `control_mode`, turned on ourselves: a rule we do not mechanically
+check is not a rule we get to describe as held.
+
+Enforcement vocabulary: **machine** — a runtime guard, database constraint or test fails the
+build; **partial** — some clauses are checked and some are not; **review** — nothing checks
+it, a human must; **none** — not implemented at all.
+
+| # | Invariant | Enforced by | Source |
+|---|---|---|---|
+| 1 | **The Flow Engine contains no LLM.** Workflow code never calls a model. | **machine** — `assert_may_call_llm()` guard; `test_invariants.py::test_flow_engine_may_not_call_a_model` and the per-node parametrised cases | [ADR 0001](docs/adr/0001-flow-engine-control-plane.md) |
+| 2 | **Agent nodes never hold CI, merge, or deploy credentials.** Read code, write their own branch, nothing else. | **machine** — `assert_may_hold()` fires when `CredentialRequest` is constructed, keyed on the same `may_call_llm` predicate as invariant 1; 26 cases across every model-bearing node × every privileged kind, plus the cases that must still be *allowed* | [ADR 0001](docs/adr/0001-flow-engine-control-plane.md) |
+| 3 | **Gate verdicts read external systems of record** — CI exit code, SAST report, coverage, health endpoint. Never an agent's claim that it succeeded. | **partial.** *CI exit code:* **machine** when the application declares `ci:` — GitHub Actions is read back for the pushed commit, runs for any other commit are discarded, and absence never becomes a pass (`test_ci_adapter.py`, and end to end in `test_walking_skeleton.py`). *With no `ci:` section, or no pipeline, or one still running at the deadline:* the sandbox verdict stands and is labelled, never promoted — `CIResult.source` is required, `ci_detail` says why, both ride `build_test_verdict`, and the approval caveat names the reason. *SAST, coverage, health endpoint:* **none** | [ADR 0001](docs/adr/0001-flow-engine-control-plane.md), [ADR 0007](docs/adr/0007-push-before-verification.md) |
+| 4 | **Verifier nodes get a fresh context.** They never see the Coder's reasoning, self-assessment, or prior attempts. | **machine** — `_verifier_brief` hands each verifier a `FlowState` with everything outside `VERIFIER_MAY_SEE` cleared: `plan`, `retry_count` and the other verdicts are gone before the node runs. An allow-list, so a field added later is invisible until named. `test_a_verifier_never_sees_the_coders_reasoning` asserts the redaction, and a second test asserts the list cannot name the forbidden fields | [ADR 0002](docs/adr/0002-flow-topology.md) |
+| 5 | **`risk_tier` may only be raised, never lowered** — by anything, at either tiering stage. | **machine** — `raise_to` / `assert_not_lowered`; three tests in `test_invariants.py` | [ADR 0002](docs/adr/0002-flow-topology.md) |
+| 6 | **Default to a single agent.** Fan out only when sub-units share no contract. | **review** — a design judgment; no mechanism is possible, and that is fine as long as it is stated | [ADR 0002](docs/adr/0002-flow-topology.md) |
+| 7 | **Every run pins `policy_commit` + `policy_bundle` at start.** Child runs inherit them. | **partial** — `NOT NULL` plus the `flow_runs_pin_immutable` trigger, with `test_the_policy_pin_is_immutable`. Inheritance is untested because no child run exists yet | [ADR 0003](docs/adr/0003-role-graph-and-traceability.md) |
+| 8 | **Privileged actions check pinned *and* current policy. Deny wins.** | **none** — there is no `policy.yaml` loader, so there is nothing to check against. Runs pin the literal `unpinned:no-policy-loader` | [ADR 0003](docs/adr/0003-role-graph-and-traceability.md) |
+| 9 | **The audit trail is a tree and append-only.** Never `UPDATE` an audit row. | **machine** — the `flow_events_no_update` database trigger; `test_the_audit_trail_is_append_only` | [ADR 0003](docs/adr/0003-role-graph-and-traceability.md) |
+| 10 | **Agents never write `protected_paths`** — CI definitions, deploy manifests, IaC, `kuwarden.yaml`, `policy.yaml`. | **machine, but later than this wording implies** — the deny is on the diff in `push`, *before anything reaches origin*, and again in `build_test` before execution; both call one `assert_not_protected`. Still after the Coder has written the file into its own sandbox. 17 cases incl. drift against `policy.example.yaml`, plus the Push case | [ADR 0004](docs/adr/0004-delivery-integration-models.md), [ADR 0007](docs/adr/0007-push-before-verification.md) |
+| 11 | **`control_mode` is never inferred or defaulted.** `authorized` means KuWarden gated it; `observed` means we watched it happen. | **machine** — the `control_mode_exactly_on_effects` CHECK constraint, asserted in `test_walking_skeleton.py`. Note the ADR 0004 deviation: nullable + CHECK rather than `NOT NULL` | [ADR 0004](docs/adr/0004-delivery-integration-models.md) |
+| 12 | **The sandbox holds no credentials, has no egress, is ephemeral, is limited, and produces a diff — it never pushes.** | **partial** — egress, limits, ephemerality and the git-computed diff are each tested in `test_sandbox.py`. *"Holds no credentials" is implemented (podman forwards no host environment) and untested*, so an added `--env` would break it silently | [ADR 0005](docs/adr/0005-sandbox-contract.md) |
 
 **Invariant 11 is the one with the worst failure mode.** Overstating what we authorised is
 manufacturing evidence. For a product whose value is evidence, that is worse than any missing
 feature.
+
+**One row above is an honest admission rather than a control** — 8. Do not cite it as a
+guarantee in a document, a demo, or a README. Moving a row from **review** to **machine** is
+worth more than most features.
+
+**Row 3 is the one that moved, and it moved to `partial`, not to `machine`.** The mechanism
+exists and is tested; whether it *applies* to a given run depends on that application having a
+pipeline. So "invariant 3 holds" is a claim about a deployment, never about the codebase, and
+the caveat on the approval page is what tells the two apart. Do not write "KuWarden verifies
+against CI" without the conditional.
 
 ---
 
@@ -112,7 +132,8 @@ and docs. Terminology drift in this project has already caused one real design e
 ## Code conventions
 
 **Python** (engine, nodes, adapters)
-- 3.12+, full type annotations, `ruff` + `mypy --strict` in CI
+- 3.12+, full type annotations, `ruff` + `mypy --strict` — **run these yourself; there is
+  no CI in this repository yet.** See the note under *Security posture* below
 - `async` by default; the engine is I/O-bound throughout
 - Dataclasses or Pydantic for anything crossing a boundary; no bare dicts in signatures
 - Errors: raise typed exceptions from `engine.errors`; never `except Exception: pass`
@@ -183,7 +204,10 @@ The last one is the only figure that shows KuWarden saved anyone any work.
 
 ## Security posture while developing
 
-- **Never commit a secret.** Gitleaks runs in CI; do not work around it.
+- **Never commit a secret.** There is **no `.github/` directory and no pre-commit hook** — this
+  repository has no automated secret scanning of its own, and the only thing that has ever
+  caught a secret here was GitHub's own push protection, after the commit existed. Until that
+  is fixed, "never commit a secret" is a rule you enforce, not one the toolchain does.
 - Treat all ticket content as **hostile input**. It reaches a model, and anyone who can file a
   ticket can write it.
 - When adding a tool an agent can call, the default answer to "should this be allowed to

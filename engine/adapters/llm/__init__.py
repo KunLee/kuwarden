@@ -24,6 +24,24 @@ class LLMError(KuWardenError):
     """A model backend failed, or declined."""
 
 
+class LLMAuthError(LLMError):
+    """The provider rejected the credential.
+
+    Separated from the rest of `LLMError` because it is the one kind that a retry cannot fix.
+    A bad key is still bad three attempts later, and retrying it spends the run's wall clock
+    and puts three rejected requests on someone's account instead of one.
+    """
+
+
+class LLMOutputTruncated(LLMError):
+    """The response was cut off at `max_tokens`.
+
+    Non-retryable for the same reason as `LLMAuthError`: the same prompt under the same cap
+    truncates at the same place. The fix is configuration, not another attempt — and each
+    attempt is minutes of wall clock and a full charge for output nobody can use.
+    """
+
+
 class ModelRefusal(LLMError):
     """The provider's safety classifiers declined the request.
 
@@ -84,6 +102,16 @@ class LLMAdapter(Protocol):
 
     @property
     def provider(self) -> Provider: ...
+
+    async def ping(self) -> str:
+        """Prove the credential is accepted, without generating anything.
+
+        Cheap enough to run from a button and free of model output, so an operator can find
+        out the key is wrong in a second rather than three nodes into a run. The SCM and
+        ticket credentials already have this; leaving the model key uncovered meant two green
+        checks and a failure on the third.
+        """
+        ...
 
     async def complete(self, request: LLMRequest) -> Completion: ...
 

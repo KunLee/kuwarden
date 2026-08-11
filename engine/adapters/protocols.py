@@ -36,6 +36,18 @@ class TicketAdapter(Protocol):
     architectural, not textual.
     """
 
+    async def ping(self, ref: TicketRef) -> str:
+        """Prove the credential reaches this project, and return what it found.
+
+        Deliberately scoped to the *project* rather than to the account. An "am I
+        authenticated" check passes with a perfectly good token pointed at a project that does
+        not exist, which is the mistake operators actually make — a typo in the project name,
+        or the wrong organisation. `ref.id` is unused; a ping needs no ticket.
+
+        Read-only, and cheap enough to run from a button.
+        """
+        ...
+
     async def fetch(self, ref: TicketRef) -> Ticket: ...
 
     async def comment(self, ref: TicketRef, body: str) -> None: ...
@@ -57,6 +69,50 @@ class RepoRef:
     @property
     def realm(self) -> str:
         return f"{self.host}:{self.org}"
+
+
+@dataclass(frozen=True)
+class TreeLimits:
+    """Bounds on how much of a repository is pulled into a sandbox workspace.
+
+    These exist to be **refused**, not silently applied. A Coder editing against a tree that
+    was quietly truncated writes code against a repository that does not exist — it deletes
+    a call site it cannot see, and the failure surfaces at CI or, worse, in review as a
+    change nobody can explain. Every bound here raises rather than trims.
+    """
+
+    max_files: int = 4000
+    max_file_bytes: int = 1_000_000
+    max_total_bytes: int = 64_000_000
+    #: Paths never pulled. Compiled artefacts and vendored dependencies are large, are not
+    #: what anyone asked the agent to change, and would dominate the model's context.
+    exclude: tuple[str, ...] = (
+        ".git/**",
+        "**/node_modules/**",
+        "**/.venv/**",
+        "**/venv/**",
+        "**/__pycache__/**",
+        "**/dist/**",
+        "**/build/**",
+        "**/target/**",
+        "**/*.lock",
+    )
+
+
+@dataclass(frozen=True)
+class RepoTree:
+    """A repository's contents at one commit.
+
+    Bytes rather than text: a repository contains binaries, and decoding everything as UTF-8
+    is how a PNG becomes a UnicodeDecodeError three nodes later.
+    """
+
+    commit: str
+    files: dict[str, bytes]
+
+    @property
+    def total_bytes(self) -> int:
+        return sum(len(content) for content in self.files.values())
 
 
 @dataclass(frozen=True)
@@ -155,6 +211,30 @@ class ScmAdapter(Protocol):
 
     async def default_branch(self, ref: RepoRef) -> BranchRef: ...
 
+    async def write_access(self, ref: RepoRef) -> tuple[bool | None, str]:
+        """Whether the credential may write a branch, without writing one.
+
+        `None` means the platform offers no cheap way to ask. That is a third answer, not a
+        polite `True`: reporting "writable" on a token nobody checked is the overstatement
+        this codebase keeps refusing to make.
+
+        Worth its own call because of when the alternative fails. Read access is enough for
+        every node up to and including the Coder, so a token missing only the write grant
+        produces a full model run — real tokens, real cost — and then a 403 at Push.
+        """
+        ...
+
+    async def read_tree(
+        self, ref: RepoRef, commit: str, limits: TreeLimits | None = None
+    ) -> RepoTree:
+        """Every file in the repository at `commit`.
+
+        Read by the Flow Engine, which holds the token, and written into a sandbox workspace
+        that holds none. The sandbox is handed a directory and never learns where it came
+        from.
+        """
+        ...
+
     async def push_change(
         self,
         ref: RepoRef,
@@ -162,7 +242,41 @@ class ScmAdapter(Protocol):
         branch: str,
         message: str,
         edits: list[FileEdit],
-    ) -> BranchRef: ...
+        parent: str | None = None,
+    ) -> BranchRef:
+        """Create or fast-forward `branch` with `edits` applied to `base`'s tree.
+
+        `base` is the pinned commit the Coder read, and stays the same for every attempt of a
+        run: the resulting tree is always *base plus the current edits*, never the previous
+        attempt's tree plus this one's. Otherwise a file changed in attempt 1 and left alone
+        in attempt 2 would survive on the branch while being absent from the diff Build & Test
+        graded, and the branch CI runs on would not be the change anyone reviewed.
+
+        `parent` is the commit the new one is parented on — the branch's own tip once this run
+        has pushed to it, so the branch reads as a history of attempts. It defaults to `base`,
+        which is the first push.
+
+        **Idempotent on `message`.** Temporal retries an activity whose effect landed but
+        whose acknowledgement was lost; an implementation that blindly committed would add a
+        duplicate commit every retry. The message carries run id and attempt, so it names one
+        intended push and no other.
+
+        Never force-updates. A branch that has moved to something this run did not write is
+        refused, because overwriting it destroys evidence rather than resolving a conflict.
+        """
+        ...
+
+    async def delete_branch(self, ref: RepoRef, branch: str) -> bool:
+        """Remove a branch this run created. `False` if it was already gone.
+
+        Idempotent, because compensation is retried: a branch that has already been deleted
+        is the state the caller wanted, not an error.
+
+        Only ever called for a branch KuWarden pushed. There is no method here for deleting
+        an arbitrary ref, and that absence is the point — the SCM interface grants "write my
+        own branch", and being able to remove somebody else's is not part of it.
+        """
+        ...
 
     async def open_pull_request(
         self,

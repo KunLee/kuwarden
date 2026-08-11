@@ -148,3 +148,67 @@ def test_an_undeclared_backend_fails_at_registration(provider: Provider) -> None
     assert config.llm is not None
     with pytest.raises(ConfigError, match="not implemented yet"):
         llm_adapter(config.llm, "planner", BROKER)
+
+
+async def test_a_rejected_key_is_not_retried() -> None:
+    """A bad key is still bad three attempts later.
+
+    `LLMAuthError` is listed as non-retryable in the flow, so this type is what makes the
+    difference between failing in seconds and putting three refused requests on an account.
+    """
+    from engine.adapters.llm import LLMAuthError
+
+    def unauthorised(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"error": {"message": "invalid x-api-key"}})
+
+    adapter = AnthropicLLM(
+        model="claude-opus-5",
+        broker=EnvCredentialBroker({"KUWARDEN_LLM_API_KEY": "sk-wrong"}),
+        realm="anthropic",
+        transport=httpx.MockTransport(unauthorised),
+    )
+    with executing(REGISTRY["planner"]), pytest.raises(LLMAuthError) as caught:
+        await adapter.complete(LLMRequest(system="s", prompt="p", max_tokens=16))
+
+    assert "llm.api_key" in str(caught.value), "the message says which credential to replace"
+    assert "sk-wrong" not in str(caught.value), "and never echoes the key"
+
+
+async def test_a_truncated_response_says_it_was_truncated() -> None:
+    """The check must run *before* the JSON parse.
+
+    A response cut off at `max_tokens` is incomplete JSON. Parsed first, it fails with "the
+    response was not JSON" — true, useless, and it sends the reader to debug the model's
+    formatting rather than raise a limit. That is exactly what happened on a real run, and the
+    check for the real cause was sitting below the parse where it could never fire.
+    """
+
+    def truncated(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_cut",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-opus-5",
+                # Valid JSON that simply stops — what truncation actually looks like.
+                "content": [{"type": "text", "text": '{"reasoning": "x", "edits": [{"path'}],
+                "stop_reason": "max_tokens",
+                "usage": {"input_tokens": 100, "output_tokens": 8192},
+            },
+        )
+
+    adapter = AnthropicLLM(
+        model="claude-opus-5",
+        broker=EnvCredentialBroker({"KUWARDEN_LLM_API_KEY": "sk-x"}),
+        realm="anthropic",
+        transport=httpx.MockTransport(truncated),
+    )
+    with executing(REGISTRY["coder"]), pytest.raises(LLMError) as caught:
+        await adapter.complete(
+            LLMRequest(system="s", prompt="p", max_tokens=8192, schema={"type": "object"})
+        )
+
+    assert "max_tokens" in str(caught.value)
+    assert "8192 output tokens" in str(caught.value)
+    assert "not JSON" not in str(caught.value), "the symptom must not mask the cause"

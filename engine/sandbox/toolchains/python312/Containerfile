@@ -1,0 +1,27 @@
+# Toolchain image: Python 3.12.
+#
+# Dependencies are baked in, not installed at run time. The sandbox has no egress (ADR 0005
+# property 2), so `pip install` cannot work inside it — and that is the point, not a
+# limitation to route around. An image is a reviewable, pinned artefact; a run-time install
+# is an unreviewed download executed next to the customer's source code.
+#
+# Adding a dependency for a target application means rebuilding this image, which is
+# deliberate friction: it puts a human between "the agent needs a package" and "the package
+# is present".
+
+FROM docker.io/library/python:3.12-slim
+
+# Pinned. An unpinned toolchain makes a build reproducible only by accident, and the whole
+# point of the reality anchor is that the same diff produces the same verdict.
+RUN pip install --no-cache-dir \
+      pytest==8.4.2 \
+      pytest-asyncio==1.4.0 \
+      ruff==0.16.2
+
+# The sandbox runs with a read-only root filesystem and a writable /tmp, so anything needing
+# a home directory gets one there.
+ENV HOME=/tmp \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_INDEX=1
+
+WORKDIR /workspace

@@ -168,6 +168,88 @@ async def test_a_multi_file_change_becomes_exactly_one_commit() -> None:
     assert result.commit == "commit-new"
 
 
+async def test_an_empty_repository_says_so_rather_than_reporting_a_404() -> None:
+    """A repo with no commits still reports a `default_branch`, but the ref does not exist.
+
+    Left as a bare 404 this reads like a bad token or a mistyped repository, and the operator
+    spends their time regenerating a credential that was fine.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/git/ref/heads/main"):
+            return httpx.Response(404, json={"message": "Git Repository is empty."})
+        return httpx.Response(200, json={"default_branch": "main"})
+
+    scm = GitHubScm(BROKER, transport=httpx.MockTransport(handler))
+    with pytest.raises(AdapterError, match="the repository is empty"):
+        await scm.default_branch(REPO)
+
+
+async def test_an_existing_branch_is_fast_forwarded_and_never_forced() -> None:
+    """The second attempt of a run — ADR 0007. `force` is what would erase the first.
+
+    Asserted at the request level because that is where the claim lives: a `force: true` here
+    would still pass every test that only reads the returned `BranchRef`.
+    """
+    seen: list[httpx.Request] = []
+    scm = GitHubScm(
+        BROKER,
+        transport=_transport(
+            {
+                "/git/ref/heads/kuwarden/PAY-1234": {"object": {"sha": "attempt-1"}},
+                "/git/commits/attempt-1": {"message": "an earlier attempt"},
+                "/git/commits/base999": {"tree": {"sha": "tree-base"}},
+                "/git/blobs": {"sha": "blob-sha"},
+                "/git/trees": {"sha": "tree-new"},
+                "/git/commits": {"sha": "attempt-2"},
+                "/git/refs/heads/kuwarden/PAY-1234": {},
+            },
+            seen,
+        ),
+    )
+    result = await scm.push_change(
+        REPO,
+        BranchRef(name="main", commit="base999"),
+        branch="kuwarden/PAY-1234",
+        message="PAY-1234 second attempt",
+        edits=[FileEdit("src/health.py", "ok")],
+        parent="attempt-1",
+    )
+
+    patched = next(r for r in seen if r.method == "PATCH")
+    assert json.loads(patched.content) == {"sha": "attempt-2", "force": False}
+    assert not [r for r in seen if r.method == "POST" and r.url.path.endswith("/git/refs")]
+    # The tree still comes from the pinned base, so the branch holds base + this attempt.
+    tree = json.loads(next(r for r in seen if r.url.path.endswith("/git/trees")).content)
+    assert tree["base_tree"] == "tree-base"
+    assert result.commit == "attempt-2"
+
+
+async def test_a_push_that_already_landed_is_not_repeated() -> None:
+    """The commit message is the idempotency key for a retried activity — ADR 0007."""
+    seen: list[httpx.Request] = []
+    scm = GitHubScm(
+        BROKER,
+        transport=_transport(
+            {
+                "/git/ref/heads/kuwarden/PAY-1234": {"object": {"sha": "already-there"}},
+                "/git/commits/already-there": {"message": "PAY-1234"},
+            },
+            seen,
+        ),
+    )
+    result = await scm.push_change(
+        REPO,
+        BranchRef(name="main", commit="base999"),
+        branch="kuwarden/PAY-1234",
+        message="PAY-1234",
+        edits=[FileEdit("src/health.py", "ok")],
+    )
+
+    assert result.commit == "already-there"
+    assert not [r for r in seen if r.method in {"POST", "PATCH"}], "nothing was written twice"
+
+
 async def test_blob_content_is_base64_encoded() -> None:
     seen: list[httpx.Request] = []
     scm = GitHubScm(
@@ -205,24 +287,88 @@ async def test_the_token_travels_as_a_bearer() -> None:
     assert seen[0].headers["X-GitHub-Api-Version"] == "2022-11-28"
 
 
+BASE_PROBE_ROUTES: dict[str, object] = {
+    "/repos/acme/payments-service": {"default_branch": "main"},
+    "/git/ref/heads/main": {"object": {"sha": "abc"}},
+}
+
+
 async def test_probe_records_that_a_404_is_ambiguous() -> None:
     """No protection rule and no admin scope look identical to the API. Say so."""
-    seen: list[httpx.Request] = []
     scm = GitHubScm(
         BROKER,
         transport=_transport(
-            {"/repos/acme/payments-service": {"default_branch": "main"},
-             "/git/ref/heads/main": {"object": {"sha": "abc"}},
-             "/environments": {"environments": []}},
-            seen,
+            {**BASE_PROBE_ROUTES, "/environments": {"total_count": 0, "environments": []}},
+            [],
+        ),
+    )
+    capabilities = await scm.probe(REPO)
+
+    assert capabilities.required_status_checks is False
+    assert "does not distinguish" in capabilities.detail["branch_protection"]
+    assert "operator attestation" in capabilities.detail["workflow_triggers"]
+
+
+async def test_a_403_is_not_reported_as_the_404_ambiguity() -> None:
+    """A 403 says exactly what is wrong; the 404 note would send the reader elsewhere.
+
+    The operator whose fine-grained token lacks Administration gets told that, rather than
+    being invited to wonder whether a protection rule exists.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/protection"):
+            return httpx.Response(403, json={"message": "Resource not accessible by PAT"})
+        for path, body in {
+            **BASE_PROBE_ROUTES,
+            "/environments": {"total_count": 0},
+        }.items():
+            if request.url.path.endswith(path):
+                return httpx.Response(200, json=body)
+        return httpx.Response(404, text="no route")
+
+    scm = GitHubScm(BROKER, transport=httpx.MockTransport(handler))
+    capabilities = await scm.probe(REPO)
+
+    detail = capabilities.detail["branch_protection"]
+    assert "403" in detail
+    assert "does not distinguish" not in detail, "the 404 ambiguity note must not appear on a 403"
+
+
+async def test_a_repository_with_no_environments_cannot_gate_a_deployment() -> None:
+    """The endpoint replying is not a control point.
+
+    A repository with zero environments answers 200 with an empty list. Reading that as
+    "model C is achievable" declares a control point over a deployment that has nothing to
+    pause — the exact overstatement ADR 0004 §2 exists to prevent.
+    """
+    scm = GitHubScm(
+        BROKER,
+        transport=_transport(
+            {**BASE_PROBE_ROUTES, "/environments": {"total_count": 0, "environments": []}}, []
+        ),
+    )
+    capabilities = await scm.probe(REPO)
+
+    assert capabilities.deployment_protection is False
+    assert "no environment is configured" in capabilities.detail["environments"]
+
+
+async def test_a_repository_with_environments_can_gate_a_deployment() -> None:
+    scm = GitHubScm(
+        BROKER,
+        transport=_transport(
+            {
+                **BASE_PROBE_ROUTES,
+                "/environments": {"total_count": 2, "environments": [{"name": "prod"}]},
+            },
+            [],
         ),
     )
     capabilities = await scm.probe(REPO)
 
     assert capabilities.deployment_protection is True
-    assert capabilities.required_status_checks is False
-    assert "admin scope" in capabilities.detail["branch_protection"]
-    assert "operator attestation" in capabilities.detail["workflow_triggers"]
+    assert "2 configured" in capabilities.detail["environments"]
 
 
 async def test_a_pull_request_returns_the_platform_url() -> None:
@@ -238,3 +384,31 @@ async def test_a_pull_request_returns_the_platform_url() -> None:
     assert pr.id == "42"
     assert pr.url == "https://github.com/acme/x/pull/42"
     assert json.loads(seen[0].content)["head"] == "kuwarden/PAY-1234"
+
+
+async def test_a_jira_ping_reads_the_project_not_the_account() -> None:
+    """An "am I authenticated" check passes with a good token and a mistyped project.
+
+    Which is the mistake operators actually make, so the ping is scoped to the project.
+    """
+    seen: list[httpx.Request] = []
+    jira = _jira({"/project/PAY": {"name": "Payments", "key": "PAY"}}, seen)
+
+    assert await jira.ping(ISSUE) == "https://acme.atlassian.net/Payments"
+    assert seen[0].url.path.endswith("/project/PAY")
+
+
+async def test_a_jira_ping_fails_loudly_for_an_unknown_project() -> None:
+    jira = _jira({}, [])
+    with pytest.raises(AdapterError):
+        await jira.ping(ISSUE)
+
+
+async def test_a_jira_issue_carries_its_status_as_state() -> None:
+    """Jira nests it under `status`; Azure DevOps has a flat field. One normalised name."""
+    payload = {
+        "key": "PAY-1234",
+        "fields": {"summary": "x", "status": {"name": "Ready for Agent"}},
+    }
+    jira = _jira({"/issue/PAY-1234": payload}, [])
+    assert (await jira.fetch(ISSUE)).state == "Ready for Agent"

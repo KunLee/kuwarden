@@ -1,0 +1,73 @@
+@import "tailwindcss";
+
+/* Rebind the `dark:` utility variant to the explicit attribute. Without this, every
+   `dark:` class in the components would silently do nothing once the media query is gone. */
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+/*
+ * Light-first, and deliberately quiet.
+ *
+ * This is an operations surface that gets read for long stretches, so the palette is
+ * near-white with separation carried by whitespace and a single hairline rather than by
+ * boxes inside boxes. Colour is reserved for the two things an operator scans for — risk
+ * tier and run status. Anything decorative competes with those, so there is nothing
+ * decorative.
+ *
+ * Light is the default and does **not** follow the system. An operations console that
+ * changes appearance because of an OS preference is a console two people describe
+ * differently while looking at the same screen. Dark is available for anyone who wants it,
+ * as an explicit `data-theme="dark"` on the root — opt in, never inferred.
+ */
+@theme {
+  --color-canvas: oklch(0.99 0.002 250);
+  --color-surface: oklch(1 0 0);
+  --color-line: oklch(0.925 0.004 250);
+  --color-ink: oklch(0.22 0.012 255);
+  --color-muted: oklch(0.55 0.012 255);
+  --color-faint: oklch(0.7 0.01 255);
+  --color-accent: oklch(0.53 0.19 262);
+  --color-accent-soft: oklch(0.96 0.02 262);
+
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+:root[data-theme="dark"] {
+  --color-canvas: oklch(0.17 0.008 255);
+  --color-surface: oklch(0.215 0.009 255);
+  --color-line: oklch(0.3 0.011 255);
+  --color-ink: oklch(0.95 0.004 255);
+  --color-muted: oklch(0.68 0.012 255);
+  --color-faint: oklch(0.52 0.012 255);
+  --color-accent: oklch(0.74 0.14 262);
+  --color-accent-soft: oklch(0.28 0.05 262);
+}
+
+html {
+  color-scheme: light;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+}
+
+body {
+  background: var(--color-canvas);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Identifiers — run ids, commit SHAs, credential kinds — are compared, not read as prose.
+   Tabular figures keep columns of them aligned so a mismatch is visible without reading. */
+.mono {
+  font-family: ui-monospace, "SF Mono", "Cascadia Code", monospace;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+
+/* Tables here are dense by nature. A hairline plus a hover tint reads more calmly at
+   fifty rows than zebra striping, which fights the status colours. */
+.row-hover:hover {
+  background: color-mix(in oklch, var(--color-accent) 4%, transparent);
+}

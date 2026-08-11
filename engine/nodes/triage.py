@@ -39,6 +39,16 @@ async def triage(state: FlowState) -> FlowState:
             f"{ticket.id} does not carry the {trigger.label!r} label "
             f"that {ctx.config.name} requires"
         )
+    # The state is what makes starting work a *deliberate* act. A ticket save fires on every
+    # field change — a reassignment, a typo fix — and admitting on that infers an intention
+    # from activity. Moving a ticket into a named state is somebody saying "go", and this is
+    # the check that reads it. Case-insensitive because platforms title-case inconsistently
+    # and "ready for agent" versus "Ready for Agent" is not a governance distinction.
+    if trigger.ready_state and (ticket.state or "").casefold() != trigger.ready_state.casefold():
+        raise PolicyDenied(
+            f"{ticket.id} is in state {ticket.state or 'unknown'!r}; "
+            f"{ctx.config.name} admits tickets in {trigger.ready_state!r}"
+        )
     if (
         trigger.max_story_points is not None
         and ticket.story_points is not None
