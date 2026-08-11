@@ -27,7 +27,7 @@ from engine.adapters.protocols import (
     TicketRef,
     validate_integration_model,
 )
-from engine.adapters.scm.azure_repos import AzureReposScm
+from engine.adapters.scm.azure_repos import EMPTY_OBJECT_ID, AzureReposScm
 from engine.adapters.ticket.azure_devops import AzureDevOpsTickets
 from engine.errors import AdapterError, PolicyDenied
 
@@ -205,6 +205,8 @@ async def test_a_new_file_is_pushed_as_add_and_an_existing_one_as_edit() -> None
         BROKER,
         transport=_transport(
             {
+                # A filter matching nothing: the branch does not exist yet.
+                "/refs": {"value": []},
                 "/items": {"value": [{"path": "/README.md", "isFolder": False}]},
                 "/pushes": {"commits": [{"commitId": "abc1234"}]},
             },
@@ -226,6 +228,95 @@ async def test_a_new_file_is_pushed_as_add_and_an_existing_one_as_edit() -> None
         {"name": "refs/heads/kuwarden/1234", "oldObjectId": "base999"}
     ]
     assert result.commit == "abc1234"
+
+
+async def test_a_branch_is_created_at_the_base_before_anything_is_pushed_onto_it() -> None:
+    """The zero object id creates a ref; it does not parent a commit.
+
+    Passing it on the push itself — which an earlier version effectively did — would produce a
+    commit with no parent, i.e. a branch containing the change and nothing else.
+    """
+    seen: list[httpx.Request] = []
+    scm = AzureReposScm(
+        BROKER,
+        transport=_transport(
+            {
+                "/refs": {"value": []},
+                "/items": {"value": []},
+                "/pushes": {"commits": [{"commitId": "abc1234"}]},
+            },
+            seen,
+        ),
+    )
+    await scm.push_change(
+        REPO,
+        BranchRef(name="main", commit="base999"),
+        branch="kuwarden/1234",
+        message="PAY-1234",
+        edits=[FileEdit("NEW.md", "created")],
+    )
+
+    created = json.loads(
+        next(r for r in seen if r.method == "POST" and r.url.path.endswith("/refs")).content
+    )
+    assert created == [
+        {
+            "name": "refs/heads/kuwarden/1234",
+            "oldObjectId": EMPTY_OBJECT_ID,
+            "newObjectId": "base999",
+        }
+    ]
+
+
+async def test_a_push_that_already_landed_is_not_repeated() -> None:
+    """Temporal retries an activity whose acknowledgement was lost — ADR 0007.
+
+    The commit message is the idempotency key, so the adapter recognises its own work on the
+    branch instead of committing it a second time.
+    """
+    seen: list[httpx.Request] = []
+    scm = AzureReposScm(
+        BROKER,
+        transport=_transport(
+            {
+                "/refs": {"value": [{"objectId": "abc1234"}]},
+                "/commits/abc1234": {"comment": "PAY-1234"},
+            },
+            seen,
+        ),
+    )
+    result = await scm.push_change(
+        REPO,
+        BranchRef(name="main", commit="base999"),
+        branch="kuwarden/1234",
+        message="PAY-1234",
+        edits=[FileEdit("NEW.md", "created")],
+    )
+
+    assert result.commit == "abc1234"
+    assert not [r for r in seen if r.url.path.endswith("/pushes")], "nothing was pushed again"
+
+
+async def test_a_branch_that_moved_is_refused_rather_than_overwritten() -> None:
+    """Someone else wrote here. Force-pushing over it destroys evidence."""
+    scm = AzureReposScm(
+        BROKER,
+        transport=_transport(
+            {
+                "/refs": {"value": [{"objectId": "somebody-else"}]},
+                "/commits/somebody-else": {"comment": "unrelated work"},
+            },
+            [],
+        ),
+    )
+    with pytest.raises(AdapterError, match="refusing to overwrite"):
+        await scm.push_change(
+            REPO,
+            BranchRef(name="main", commit="base999"),
+            branch="kuwarden/1234",
+            message="PAY-1234",
+            edits=[FileEdit("NEW.md", "created")],
+        )
 
 
 async def test_an_empty_change_is_refused() -> None:
@@ -262,3 +353,31 @@ async def test_opening_a_pull_request_returns_a_usable_url() -> None:
     body = json.loads(seen[0].content)
     assert body["sourceRefName"] == "refs/heads/kuwarden/1234"
     assert body["targetRefName"] == "refs/heads/main"
+
+
+async def test_an_azure_ping_reads_the_project_not_the_account() -> None:
+    """Proves the token *and* that the project name is right — see `TicketAdapter.ping`."""
+    seen: list[httpx.Request] = []
+    routes: dict[str, object] = {"/_apis/projects/Payments": {"name": "Payments"}}
+    tickets = AzureDevOpsTickets("acme", BROKER, transport=_transport(routes, seen))
+
+    assert await tickets.ping(TICKET) == "acme/Payments"
+    assert seen[0].url.path.endswith("/_apis/projects/Payments")
+
+
+async def test_an_azure_ping_fails_loudly_for_an_unknown_project() -> None:
+    tickets = AzureDevOpsTickets("acme", BROKER, transport=_transport({}, []))
+    with pytest.raises(AdapterError):
+        await tickets.ping(TICKET)
+
+
+async def test_a_work_item_carries_its_state() -> None:
+    """Admission may require a specific state, so it has to reach `Ticket` — not be dropped."""
+    routes: dict[str, object] = {
+        "workitems/1234": {
+            "id": 1234,
+            "fields": {"System.Title": "x", "System.State": "Ready for Agent"},
+        }
+    }
+    tickets = AzureDevOpsTickets("acme", BROKER, transport=_transport(routes, []))
+    assert (await tickets.fetch(TICKET)).state == "Ready for Agent"

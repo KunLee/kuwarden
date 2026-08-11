@@ -45,6 +45,10 @@ class Ticket:
     system: str
     title: str
     body: str
+    #: The workflow state the ticket was in when Triage read it — "Active", "Ready for Agent".
+    #: Admission may require a specific one, so that starting work is something a human did
+    #: deliberately rather than something inferred from a save.
+    state: str | None = None
     acceptance_criteria: list[str] = field(default_factory=list)
     labels: list[str] = field(default_factory=list)
     story_points: int | None = None
@@ -104,13 +108,34 @@ class Diff:
         return [f.path for f in self.files]
 
 
+#: Who executed the tests. `ci` is the project's own pipeline — an external system of record,
+#: which is what invariant 3 asks for. `sandbox` is KuWarden's own container: good enough to
+#: drive the Coder's inner loop, and *not* an independent witness, because the same system
+#: both produced the change and graded it.
+VerdictSource = Literal["sandbox", "ci"]
+
+
 @dataclass(frozen=True)
 class CIResult:
-    """A reality anchor. `exit_code` is the verdict; nothing else is."""
+    """A reality anchor. `exit_code` is the verdict; nothing else is.
+
+    `source` is required and never defaulted, for the same reason `control_mode` is not
+    (ADR 0004): the two sources are not equally strong evidence, and silently presenting one
+    as the other overstates what was verified.
+    """
 
     exit_code: int
+    #: Where the exit code came from. Invariant 3 wants an external system of record; the
+    #: sandbox is *ours*, so a `sandbox` verdict is a deviation that must travel with the
+    #: verdict rather than be assumed away at the point it is read.
+    source: VerdictSource
     url: str | None = None
     duration_ms: int = 0
+
+    @property
+    def is_external_anchor(self) -> bool:
+        """Whether this verdict satisfies invariant 3 without qualification."""
+        return self.source == "ci"
 
 
 @dataclass(frozen=True)
@@ -180,10 +205,35 @@ class FlowState:
     workspace: Workspace | None = None
     plan: ChangePlan | None = None
     branch: str | None = None
+    # The default branch, and the commit its tree was read at. Pinned once, by the Coder, and
+    # never re-resolved: Push builds on this commit and Release targets this branch, so a
+    # default branch that moves mid-run cannot change what was reviewed.
+    base_branch: str | None = None
+    base_commit: str | None = None
+    # The tip of the pushed branch, or `None` while nothing has been pushed. Release refuses
+    # without it — a pull request for a branch nobody pushed asks a human to review nothing.
+    head_commit: str | None = None
     diff: Diff | None = None
     proposed_edits: list[ProposedEdit] = field(default_factory=list)
 
+    # Whether the sandbox that executed model-written code was fully isolated. `None` means
+    # nothing was executed. Recorded because it is a property of the run, not of the machine
+    # at the moment someone looks: a report exported next year must still say under which
+    # isolation the change was produced.
+    sandbox_isolation: Literal["enforced", "degraded"] | None = None
+    sandbox_gaps: list[str] = field(default_factory=list)
+
+    # The authoritative verdict. `source` says who produced it, and the two are not equally
+    # strong evidence — see `CIResult`.
     ci_result: CIResult | None = None
+    # The sandbox's own verdict, kept even when CI produced the authoritative one. Where the
+    # two disagree that is itself a finding — environment drift, a missing dependency, a test
+    # that only passes locally — and it would be lost if CI simply overwrote it.
+    sandbox_result: CIResult | None = None
+    # Why no CI verdict is available, or how the one on `ci_result` was reached. Always
+    # recorded when a CI adapter is configured, because "we did not check" must never be
+    # indistinguishable from "we checked and it was fine".
+    ci_detail: str | None = None
     sast_result: SASTResult | None = None
     coverage: float | None = None
     verifications: list[Verification] = field(default_factory=list)
@@ -194,4 +244,8 @@ class FlowState:
     budget_cents_allowed: int = 0
     budget_cents_spent: int = 0
     retry_count: int = 0
+    # What compensation did, or could not do. Carried on the state so the flow can put it
+    # in the audit trail: a cleanup that silently failed leaves a branch on someone's
+    # remote with nothing anywhere saying why.
+    cleanup: str | None = None
     artifacts: list[Artifact] = field(default_factory=list)

@@ -19,6 +19,7 @@ from engine.adapters.secrets import (
 )
 from engine.db import connect, migrate
 from engine.errors import PolicyDenied
+from tests.conftest import track_application
 
 KEY = generate_master_key()
 OTHER_KEY = generate_master_key()
@@ -38,7 +39,8 @@ async def _register() -> uuid.UUID:
             )
     except Exception as exc:  # noqa: BLE001 - any failure here means "infra absent"
         pytest.skip(f"PostgreSQL unavailable: {exc}")
-    return app_id
+    # Tracked so the session teardown removes it, along with the credentials stored against it.
+    return track_application(app_id)
 
 
 async def test_a_credential_round_trips() -> None:
@@ -158,3 +160,85 @@ def test_a_missing_master_key_is_an_error_not_a_default() -> None:
 def test_a_malformed_master_key_is_rejected() -> None:
     with pytest.raises(SecretKeyError, match="must decode to 32 bytes"):
         EncryptedPostgresStore(uuid.uuid4(), master_key="c2hvcnQ=")
+
+
+# --- resolution order at run time -------------------------------------------------------------
+
+
+async def test_the_store_wins_over_a_stale_environment_variable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Workbench writes at run time; the environment is fixed at process start.
+
+    A credential someone just entered must beat a variable exported months ago, or rotating a
+    token through the UI appears to work and changes nothing.
+    """
+    from engine.activities.nodes import StoreThenEnvBroker
+
+    app_id = await _register()
+    store = EncryptedPostgresStore(app_id, master_key=KEY)
+    await store.put(app_id, CredentialKind.SCM_READ, Secret("from-the-store"))
+
+    monkeypatch.setenv("KUWARDEN_SCM_TOKEN", "from-the-environment")
+    monkeypatch.setenv("KUWARDEN_SECRET_KEY", KEY)
+
+    resolved = await StoreThenEnvBroker(app_id).resolve(
+        CredentialRequest(kind=CredentialKind.SCM_READ, realm="github.com/acme")
+    )
+    assert resolved.reveal() == "from-the-store"
+
+
+async def test_an_empty_slot_falls_through_to_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nothing stored is a normal state during setup, not a failure."""
+    from engine.activities.nodes import StoreThenEnvBroker
+
+    app_id = await _register()
+    monkeypatch.setenv("KUWARDEN_SCM_TOKEN", "from-the-environment")
+    monkeypatch.setenv("KUWARDEN_SECRET_KEY", KEY)
+
+    resolved = await StoreThenEnvBroker(app_id).resolve(
+        CredentialRequest(kind=CredentialKind.SCM_READ, realm="github.com/acme")
+    )
+    assert resolved.reveal() == "from-the-environment"
+
+
+async def test_an_unopenable_credential_does_not_fall_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wrong master key is a misconfiguration, not an absence.
+
+    Falling through to the environment here would quietly run with a different credential
+    than the one the operator stored, and the stored one would look fine in the UI.
+    """
+    from engine.activities.nodes import StoreThenEnvBroker
+
+    app_id = await _register()
+    await EncryptedPostgresStore(app_id, master_key=KEY).put(
+        app_id, CredentialKind.SCM_READ, Secret("stored-under-the-first-key")
+    )
+
+    monkeypatch.setenv("KUWARDEN_SCM_TOKEN", "from-the-environment")
+    monkeypatch.setenv("KUWARDEN_SECRET_KEY", OTHER_KEY)
+
+    with pytest.raises(SecretKeyError):
+        await StoreThenEnvBroker(app_id).resolve(
+            CredentialRequest(kind=CredentialKind.SCM_READ, realm="github.com/acme")
+        )
+
+
+async def test_neither_source_names_both_in_the_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The message has to say where it looked, or setup is guesswork."""
+    from engine.activities.nodes import StoreThenEnvBroker
+
+    app_id = await _register()
+    monkeypatch.delenv("KUWARDEN_SCM_TOKEN", raising=False)
+    monkeypatch.setenv("KUWARDEN_SECRET_KEY", KEY)
+
+    with pytest.raises(PolicyDenied, match="Workbench.*environment"):
+        await StoreThenEnvBroker(app_id).resolve(
+            CredentialRequest(kind=CredentialKind.SCM_READ, realm="github.com/acme")
+        )

@@ -1,0 +1,158 @@
+# kuwarden.yaml — one application's configuration.
+#
+# It answers a different question from the Workbench. The Workbench is the *operator's* view —
+# which applications exist, their credentials, who may approve. This file is the *application
+# team's* view: how their changes get delivered. It is meant to live in their repository and be
+# reviewed as a pull request, which is also why it never contains a credential (those are
+# resolved at the point of use from the Workbench's encrypted store) and why `**/kuwarden.yaml`
+# is a protected path an agent may never write — invariant 10.
+#
+# **Where it actually goes today, which is not yet where it belongs.** The worker reads this
+# from its own filesystem at startup (KUWARDEN_CONFIG, default ./kuwarden.yaml) and refuses to
+# start without it. Nothing fetches it from the target repository, so one worker serves exactly
+# one application: copy this next to the worker, not into the repo it is about. Reading it per
+# run from the repository the run is about is the intended shape and is not built.
+
+version: 1
+
+app:
+  name: my-service
+
+# --- Where the code lives ----------------------------------------------------
+# The first repo is the primary one: the Coder reads its tree and writes a branch there.
+workspace:
+  repos:
+    - name: my-service
+      provider: github              # github | azure_repos
+      org: YOUR_GITHUB_USER_OR_ORG
+      repo: YOUR_REPO
+
+# --- Which tickets are admitted ----------------------------------------------
+# Cross-vendor is the normal case: tickets in Azure DevOps, code in GitHub.
+triggers:
+  - provider: azure_devops          # azure_devops | jira
+    organisation: YOUR_ADO_ORG      # the name in dev.azure.com/<organisation>
+    project: YOUR_ADO_PROJECT
+    # Admission control. Omit for "every ticket in the project qualifies" — a decision, so
+    # make it deliberately rather than by leaving the line out and forgetting.
+    label: kuwarden-auto
+
+    # The state a ticket must be in before a run is admitted. This is the trigger that
+    # scales: a ticket *save* fires on every field change — a reassignment, a typo fix, a
+    # tag — so admitting on activity spends a model budget on edits. Moving a ticket into a
+    # named state is a deliberate act, and reading that is reading an intention rather than
+    # inferring one.
+    #
+    # Checked on the manual "Start run" path too, so a ticket nobody marked ready is refused
+    # at Triage rather than half-implemented by an agent.
+    #
+    # Omit to accept any state — a decision, so make it deliberately.
+    ready_state: Ready for Agent
+
+    max_story_points: 5
+
+  # Jira instead:
+  # - provider: jira
+  #   site: https://acme.atlassian.net
+  #   account_email: bot@acme.test
+  #   project: PAY
+  #   label: kuwarden-auto
+  #   # No default: the custom field id differs per Jira instance, and guessing reads the
+  #   # wrong field or nothing at all.
+  #   story_points_field: customfield_10016
+
+# --- Where the control point is ----------------------------------------------
+# Never inferred and never defaulted — ADR 0004, invariant 11.
+#   kuwarden_deploys   KuWarden performs the deployment
+#   gated_merge        KuWarden's verdict gates the merge
+#   gated_deployment   KuWarden's verdict gates the deployment; someone else performs it
+delivery:
+  integration_model: gated_merge
+
+toolchain:
+  id: python3.12
+
+# --- The Coder's inner loop --------------------------------------------------
+sandbox:
+  # Only this image is built today (`uv run python -m engine.sandbox build`). A repository in
+  # another language needs a matching toolchain image before Build & Test means anything.
+  toolchain_image: localhost/kuwarden-python312:1
+
+  # False while testing, so a host that cannot enforce cgroup limits still runs. Production
+  # sets this True. The degradation is reported per run in the audit trail, on GET
+  # /api/sandbox, and as a Workbench banner — it is not silent.
+  require_full_isolation: false
+
+  # Read carefully. `pytest` exits **5** when it collects no tests, which is non-zero, so a
+  # repository with no tests fails every attempt and the run is rejected after the retry
+  # budget — for a reason that has nothing to do with the change. Either add one real test,
+  # or use the tolerant form below while you are only exercising the pipeline:
+  #   test_command: [sh, -c, "python -m pytest -q; test $? -le 5"]
+  test_command: [python, -m, pytest, -q]
+
+  limits: { memory_mb: 2048, timeout_s: 600, tmp_mb: 512 }
+
+# --- The independent verdict -------------------------------------------------
+# Optional, and the difference between a labelled deviation and invariant 3 actually holding.
+#
+# The sandbox above is *ours*: the same system produces the change and grades it, which is
+# useful for the Coder's loop and is not an independent check. This section points Build &
+# Test at the pipeline your organisation already trusts, read back for the exact commit
+# KuWarden pushed.
+#
+# Read-only. KuWarden never triggers, cancels, or re-runs your pipeline — the push is what
+# causes it to run, and a pipeline KuWarden could start is one it could influence.
+#
+# Leaving this out is legal and safe. It means every approval page carries a caveat saying the
+# tests were graded by KuWarden's own sandbox, which is true and is the point.
+#
+# **Commented out on purpose.** Turning this on means your pipeline runs against agent-written
+# code on a `kuwarden/*` branch before any human has seen it — see ADR 0007. That is a decision
+# about your CI environment, so it is made by uncommenting rather than by copying a file. If
+# that pipeline holds deployment credentials or publishes artefacts on any branch, restrict its
+# triggers first.
+#
+# It also needs a `ci.read` credential slot filled in the Workbench, and it costs `grace_s` of
+# waiting per attempt on a repository that turns out to have no workflows.
+#
+# ci:
+#   provider: github_actions
+#
+#   # How long to wait for a pipeline that has appeared and is still running.
+#   wait_s: 900
+#   poll_s: 15
+#
+#   # How long to wait for one to appear at all before concluding this repository has none.
+#   # A run takes seconds to be created after a push; too low here reports "no CI" on a
+#   # repository that has it.
+#   grace_s: 90
+#
+#   # Which workflows gate. Omit or leave empty and every workflow for the commit must pass —
+#   # including a nightly job that happens to be triggered by the push. Names match the
+#   # workflow's display name or its definition path, both exactly.
+#   required_workflows: []
+#   # required_workflows: ["CI", ".github/workflows/lint.yml"]
+
+# --- Models ------------------------------------------------------------------
+# The API key is absent on purpose; it comes from the credential broker.
+llm:
+  provider: anthropic
+  planner:   { model: claude-opus-5, effort: high }
+  # The Coder's schema returns the **complete new content of every file it edits**, so its
+  # output budget scales with the size of those files — not with the length of an answer.
+  # 8192 (the default) truncates on a handful of source files, and a truncated response is
+  # invalid JSON, which used to surface as a formatting complaint rather than as a limit.
+  #
+  # Above 16k the adapter streams, which also avoids the HTTP timeout a long non-streaming
+  # request runs into.
+  coder:     { model: claude-opus-5, effort: xhigh, max_tokens: 32000 }
+  verifiers: { model: claude-opus-5, effort: high }
+
+# --- Tiering -----------------------------------------------------------------
+# Rules first. A model may raise a tier from here; it may never lower one (invariant 5).
+risk:
+  high_labels: [security, payments]
+  high_paths: ["**/auth/**", "**/payments/**"]
+
+budgets:
+  cents_per_run: 500

@@ -12,12 +12,23 @@ from typing import Any
 
 from engine.activities.audit import record_event, record_run_ended, record_run_started
 from engine.activities.nodes import run_node
+from engine.activities.notify import notify_gate_reached
 
+#: The single registration list. The worker and the tests both read it, because two lists
+#: drift and the symptom is a workflow failing on an activity nobody noticed was missing.
 ALL: Sequence[Callable[..., Any]] = [
     run_node,
     record_run_started,
     record_event,
     record_run_ended,
+    notify_gate_reached,
 ]
 
-__all__ = ["ALL", "record_event", "record_run_ended", "record_run_started", "run_node"]
+__all__ = [
+    "ALL",
+    "notify_gate_reached",
+    "record_event",
+    "record_run_ended",
+    "record_run_started",
+    "run_node",
+]

@@ -1,8 +1,8 @@
 """Azure Repos.
 
-`push_change` uses the Pushes API, which creates a branch and a commit in one call. No clone,
-no working tree, no git binary — which matters because it means the Flow Engine can write a
-branch without ever materialising the repository in a process that holds a credential.
+`push_change` uses the Refs and Pushes APIs. No clone, no working tree, no git binary — which
+matters because it means the Flow Engine can write a branch without ever materialising the
+repository in a process that holds a credential.
 
 Note what this class does not implement: merge, and deploy. Those are separate capabilities
 under separate credentials, resolved after gates pass.
@@ -25,8 +25,11 @@ from engine.adapters.protocols import (
     FileEdit,
     PullRequest,
     RepoRef,
+    RepoTree,
     ScmCapabilities,
+    TreeLimits,
 )
+from engine.adapters.scm.tree import check_file_count, check_file_size, excluded, finish
 from engine.errors import AdapterError
 
 API_VERSION = "7.1"
@@ -120,6 +123,64 @@ class AzureReposScm:
             raise AdapterError(f"default branch {name} of {ref.repo} has no ref entry")
         return BranchRef(name=name, commit=str(entries[0]["objectId"]))
 
+    async def write_access(self, ref: RepoRef) -> tuple[bool | None, str]:
+        """Unknown, and said so.
+
+        Azure DevOps exposes a PAT's scopes only through an endpoint the PAT itself may not
+        read, so there is no cheap honest answer. `None` rather than `True`: a check that
+        reports "writable" without checking is worse than no check, because it is trusted.
+        """
+        return None, "Azure DevOps exposes no cheap per-token permission read"
+
+    async def read_tree(
+        self, ref: RepoRef, commit: str, limits: TreeLimits | None = None
+    ) -> RepoTree:
+        """Every file at `commit`, via the Items API.
+
+        Azure Repos returns content inline when asked, so this is one listing call plus one
+        content call per file -- the same N+1 shape as GitHub, bounded the same way.
+        """
+        bounds = limits or TreeLimits()
+        version = {
+            "versionDescriptor.version": commit,
+            "versionDescriptor.versionType": "commit",
+        }
+
+        async with await self._client(ref, CredentialKind.SCM_READ) as client:
+            listing: Any = await client.get(
+                f"{self._repo_path(ref)}/items",
+                params={"api-version": API_VERSION, "recursionLevel": "full", **version},
+            )
+            entries = listing.get("value", []) if isinstance(listing, dict) else []
+
+            wanted = [
+                entry
+                for entry in entries
+                if isinstance(entry, dict)
+                and not entry.get("isFolder")
+                and not excluded(str(entry["path"]).lstrip("/"), bounds)
+            ]
+            check_file_count(len(wanted), bounds, f"{ref.org}/{ref.repo}")
+
+            files: dict[str, bytes] = {}
+            for entry in wanted:
+                path = str(entry["path"]).lstrip("/")
+                check_file_size(path, int(entry.get("size", 0)), bounds)
+                content: Any = await client.request(
+                    "GET",
+                    f"{self._repo_path(ref)}/items",
+                    params={
+                        "api-version": API_VERSION,
+                        "path": str(entry["path"]),
+                        "includeContent": "true",
+                        **version,
+                    },
+                )
+                raw = content.get("content", "") if isinstance(content, dict) else ""
+                files[path] = str(raw).encode()
+
+        return finish(commit, files, bounds, f"{ref.org}/{ref.repo}")
+
     async def push_change(
         self,
         ref: RepoRef,
@@ -127,11 +188,53 @@ class AzureReposScm:
         branch: str,
         message: str,
         edits: list[FileEdit],
+        parent: str | None = None,
     ) -> BranchRef:
+        """Create or fast-forward `branch`. See `ScmAdapter.push_change` for the contract.
+
+        **Known gap against that contract.** The Pushes API expresses a commit as changes
+        relative to the branch tip, not as a tree, so a second push to the same branch is
+        `tip + edits` rather than `base + edits`. A file this run changed in an earlier
+        attempt and left alone in a later one therefore keeps the earlier content on the
+        branch while being absent from the diff Build & Test graded. GitHub does not have this
+        gap because the Git Data API takes an explicit `base_tree`. Closing it here needs the
+        base content of every path the run has ever touched, which the state does not carry.
+        """
         if not edits:
             raise AdapterError("refusing to push an empty change")
 
-        existing = await self._file_paths(ref, base)
+        tip = await self._branch_tip(ref, branch)
+        if tip is not None:
+            # The idempotency key -- a retried activity whose push landed must not commit
+            # again. See the protocol docstring.
+            if await self._commit_message(ref, tip.commit) == message:
+                return tip
+            expected = parent or base.commit
+            if tip.commit != expected:
+                raise AdapterError(
+                    f"branch {branch} is at {tip.commit[:8]}, not the {expected[:8]} this "
+                    "push was built on; refusing to overwrite work this run did not do"
+                )
+        else:
+            # A push cannot create the branch and commit onto it in one call: the refUpdate's
+            # `oldObjectId` must be the ref's current value, and for a ref that does not exist
+            # that value is the zero id -- which produces a commit parented on nothing, losing
+            # the entire history. So the ref is created at `base` first, then pushed onto.
+            async with await self._client(ref, CredentialKind.SCM_WRITE_BRANCH) as client:
+                await client.post(
+                    f"{self._repo_path(ref)}/refs",
+                    params={"api-version": API_VERSION},
+                    json=[
+                        {
+                            "name": f"refs/heads/{branch}",
+                            "oldObjectId": EMPTY_OBJECT_ID,
+                            "newObjectId": base.commit,
+                        }
+                    ],
+                )
+
+        onto = tip.commit if tip is not None else base.commit
+        existing = await self._file_paths(ref, onto)
         changes = [
             {
                 # Azure DevOps rejects "add" for a path that exists and "edit" for one that
@@ -148,9 +251,7 @@ class AzureReposScm:
                 f"{self._repo_path(ref)}/pushes",
                 params={"api-version": API_VERSION},
                 json={
-                    "refUpdates": [
-                        {"name": f"refs/heads/{branch}", "oldObjectId": base.commit}
-                    ],
+                    "refUpdates": [{"name": f"refs/heads/{branch}", "oldObjectId": onto}],
                     "commits": [{"comment": message, "changes": changes}],
                 },
             )
@@ -159,14 +260,43 @@ class AzureReposScm:
             raise AdapterError("push returned no commit")
         return BranchRef(name=branch, commit=str(commits[0]["commitId"]))
 
-    async def _file_paths(self, ref: RepoRef, base: BranchRef) -> set[str]:
+    async def _branch_tip(self, ref: RepoRef, branch: str) -> BranchRef | None:
+        """Where `branch` currently points, or `None` if it does not exist yet.
+
+        Azure answers a filter that matches nothing with an empty list and a 200, not a 404,
+        so absence is read from the payload rather than from the status code.
+        """
+        async with await self._client(ref, CredentialKind.SCM_READ) as client:
+            refs: Any = await client.get(
+                f"{self._repo_path(ref)}/refs",
+                params={"api-version": API_VERSION, "filter": f"heads/{branch}"},
+            )
+        entries = refs.get("value", []) if isinstance(refs, dict) else []
+        if not entries:
+            return None
+        return BranchRef(name=branch, commit=str(entries[0]["objectId"]))
+
+    async def _commit_message(self, ref: RepoRef, commit: str) -> str:
+        """The message on `commit`. Read to decide whether a push has already landed."""
+        async with await self._client(ref, CredentialKind.SCM_READ) as client:
+            payload: Any = await client.get(
+                f"{self._repo_path(ref)}/commits/{commit}",
+                params={"api-version": API_VERSION},
+            )
+        return str(payload.get("comment", "")) if isinstance(payload, dict) else ""
+
+    async def _file_paths(self, ref: RepoRef, commit: str) -> set[str]:
+        """Every file present at `commit`, to decide `add` versus `edit` per change."""
         async with await self._client(ref, CredentialKind.SCM_READ) as client:
             items: Any = await client.get(
                 f"{self._repo_path(ref)}/items",
                 params={
                     "api-version": API_VERSION,
                     "recursionLevel": "full",
-                    "versionDescriptor.version": base.name,
+                    # By commit, not by branch name: after the first attempt the branch has
+                    # moved, and the add/edit decision must reflect the commit being built on.
+                    "versionDescriptor.version": commit,
+                    "versionDescriptor.versionType": "commit",
                 },
             )
         entries = items.get("value", []) if isinstance(items, dict) else []
@@ -175,6 +305,25 @@ class AzureReposScm:
             for e in entries
             if isinstance(e, dict) and not e.get("isFolder")
         }
+
+    async def delete_branch(self, ref: RepoRef, branch: str) -> bool:
+        """Azure deletes a ref by updating it to the empty object id."""
+        tip = await self._branch_tip(ref, branch)
+        if tip is None:
+            return False
+        async with await self._client(ref, CredentialKind.SCM_WRITE_BRANCH) as client:
+            await client.post(
+                f"{self._repo_path(ref)}/refs",
+                params={"api-version": API_VERSION},
+                json=[
+                    {
+                        "name": f"refs/heads/{branch}",
+                        "oldObjectId": tip.commit,
+                        "newObjectId": EMPTY_OBJECT_ID,
+                    }
+                ],
+            )
+        return True
 
     async def open_pull_request(
         self,
