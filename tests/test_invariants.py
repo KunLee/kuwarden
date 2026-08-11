@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from engine.adapters.credentials import PRIVILEGED_KINDS, CredentialKind, CredentialRequest
 from engine.adapters.llm import assert_may_call_llm
 from engine.errors import InvariantViolation, RiskTierLowered
 from engine.nodes import NODES, REGISTRY
@@ -45,6 +46,56 @@ def test_deterministic_nodes_may_not_call_a_model(node_id: str) -> None:
 def test_generative_and_verifier_nodes_pass_the_guard(node_id: str) -> None:
     with executing(REGISTRY[node_id]):
         assert_may_call_llm()
+
+
+# --- invariant 2: agent nodes never hold CI, merge, or deploy credentials -----------------
+
+
+@pytest.mark.parametrize("kind", sorted(PRIVILEGED_KINDS))
+@pytest.mark.parametrize(
+    "node_id", [n for n, s in REGISTRY.items() if s.node_class is not NodeClass.DETERMINISTIC]
+)
+def test_a_node_containing_a_model_may_not_hold_a_privileged_credential(
+    node_id: str, kind: CredentialKind
+) -> None:
+    """Every generative and verifier node, against every privileged kind.
+
+    Parametrised over the registry rather than naming the Coder, so a node added later is
+    covered without anyone remembering to extend this.
+    """
+    with executing(REGISTRY[node_id]), pytest.raises(InvariantViolation, match="invariant 2"):
+        CredentialRequest(kind=kind, realm="acme")
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [CredentialKind.SCM_READ, CredentialKind.SCM_WRITE_BRANCH, CredentialKind.LLM_API_KEY],
+)
+def test_an_agent_node_still_gets_what_it_legitimately_needs(kind: CredentialKind) -> None:
+    """The Coder reads code, writes its own branch, and calls a model. Invariant 2 stops there."""
+    with executing(REGISTRY["coder"]):
+        CredentialRequest(kind=kind, realm="github.com:acme")
+
+
+@pytest.mark.parametrize("kind", sorted(PRIVILEGED_KINDS))
+def test_a_deterministic_node_may_hold_a_privileged_credential(kind: CredentialKind) -> None:
+    """Otherwise this is not a tightening, it is a broken product.
+
+    Node ⑦ Release is `deterministic` and is what actually merges or deploys under
+    integration model A — ADR 0004 §4.
+    """
+    with executing(REGISTRY["release"]):
+        CredentialRequest(kind=kind, realm="k8s:prod")
+
+
+def test_engine_plumbing_outside_any_node_is_unaffected() -> None:
+    """The Flow Engine and the Workbench resolve these; only nodes with a model are refused."""
+    CredentialRequest(kind=CredentialKind.DEPLOY, realm="k8s:prod")
+
+
+def test_the_privileged_set_is_exactly_what_the_invariant_names() -> None:
+    """CI, merge, deploy. A drift here silently narrows the control."""
+    assert {k.value for k in PRIVILEGED_KINDS} == {"ci.trigger", "scm.merge", "deploy"}
 
 
 # --- invariant 4: verifiers get a fresh context -------------------------------------------
@@ -140,6 +191,7 @@ def test_topology_has_the_expected_nodes() -> None:
         "triage",
         "planner",
         "coder",
+        "push",
         "build_test",
         "verifier.correctness",
         "verifier.security",
@@ -149,3 +201,4 @@ def test_topology_has_the_expected_nodes() -> None:
         "compensate",
         "reporter",
     }
+

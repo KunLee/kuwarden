@@ -44,7 +44,7 @@ The single rule they establish, on which everything below depends:
 │  ┌──────┴───────────────────────────────────────────────────┐   │
 │  │                    AGENT NODES                            │   │
 │  │                                                           │   │
-│  │   [Planner] → [Coder] ⇄ [Build & Test]  ← bounded loop    │   │
+│  │   [Planner] → [Coder] → [Push] ⇄ [Build & Test]  ← loop   │   │
 │  │                            │  (CI exit code, not a claim) │   │
 │  │                            ▼                              │   │
 │  │              [Verifiers ×4 — fresh context, fan-out]      │   │
@@ -135,11 +135,12 @@ replaced by a child flow without changing its callers.
 |---|---|---|---|---|
 | ① | **Triage & Risk Router** | `deterministic` (+ advisory LLM) | Assigns `risk_tier`; rejects unclear or out-of-scope tickets back to a human | Ticket API, path rules |
 | ② | **Planner** | `generative` | Ticket + codebase → structured change plan | Ticket API, SCM read, LLM |
-| ③ | **Coder** | `generative` | Implements the plan inside a sandbox, iterating on build/test feedback | SCM write, file tools, sandbox exec, LLM |
-| ④ | **Build & Test** | `deterministic` — **no LLM** | Runs CI; emits the objective verdict | CI/CD trigger + poll, coverage tool |
+| ③ | **Coder** | `generative` | Implements the plan inside a sandbox, iterating on build/test feedback | File tools, sandbox exec, LLM. **No credentials** — the tree is fetched for it |
+| ③ⓑ | **Push** | `deterministic` — **no LLM** | Writes the branch so CI has something to run on, and denies `protected_paths` before anything leaves the perimeter — [ADR 0007](docs/adr/0007-push-before-verification.md) | SCM branch write |
+| ④ | **Build & Test** | `deterministic` — **no LLM** | Grades the change twice: KuWarden's sandbox for speed, then the project's own pipeline for independence. The second one is the verdict when it exists | CI **read** (never trigger), coverage tool |
 | ⑤ | **Verifiers ×4** | `verifier` — **fresh context** | Adversarially attempt to falsify the change | SAST runner, SCM read, LLM |
 | ⑥ | **Approval Gate** | `deterministic` | Suspends the run; depth determined by `risk_tier` | Notification adapter |
-| ⑦ | **Release** | `deterministic` — **no LLM** | The control point. Mechanism set by `integration_model` — see [ADR 0004](docs/adr/0004-delivery-integration-models.md) | SCM PR API, Deploy API, platform gate callback |
+| ⑦ | **Release** | `deterministic` — **no LLM** | The control point. Opens the pull request, then whatever `integration_model` sets — see [ADR 0004](docs/adr/0004-delivery-integration-models.md). The branch was pushed at ③ⓑ | SCM PR API, Deploy API, platform gate callback |
 | ⑧ | **Abort / Rollback** | `deterministic` | Compensation — rollback, branch cleanup, ticket update | Deploy API, SCM, Ticket API |
 | | **Reporter** | `deterministic` | Posts outcome and evidence back to the ticket | Ticket API |
 
@@ -151,6 +152,13 @@ The pipeline is **configurable per application** via `kuwarden.yaml`.
 compiler and test output from the *previous* attempt and iterates until the build is green or
 the retry budget is exhausted. Nearly all of a coding agent's quality comes from this cycle;
 generating each file once and hoping does not work.
+
+**Push sits inside the cycle**, between the two. CI cannot run on a branch that does not
+exist, so a push that happened at Release could only ever produce a result arriving after
+KuWarden had finished deciding — a receipt, not an anchor. [ADR 0007](docs/adr/0007-push-before-verification.md)
+records what that costs: unverified model-written code reaches the customer's SCM, bounded by
+`protected_paths` denied *before* the push, no merge credential anywhere, and no pull request
+until the gate has passed.
 
 Loops are not abolished — they are **contained**. A loop lives inside a node, where its
 context is bounded and its retries are budgeted. The flow *between* nodes stays deterministic.
@@ -202,6 +210,62 @@ one**. A model must not be able to argue its way into a weaker gate.
 
 Uniform gating is correct for the first ten runs and fatal at a hundred: it turns the platform
 into a queue in front of a human, which is the constraint KuWarden exists to relieve.
+
+#### What crosses into the sandbox, and what never does
+
+The single most common misreading of this architecture is that the sandbox is where the agent
+lives — that it holds the configuration, the credentials, and the model. It holds none of the
+three. Everything privileged happens in the worker process; the sandbox is handed files and
+told to run a command.
+
+```
+worker process  ──  holds credentials, reaches the network, calls the model
+│
+├─ Flow Engine ....... engine/flows/ — DETERMINISTIC, no LLM (invariant 1)
+│                      Sequences nodes, reads exit codes, counts retries, holds the gate.
+│                      Never sees a token: workflow history IS the audit record.
+│                      Passes exactly one thing to a node — the `app_id`.
+│
+└─ Coder node ........ engine/nodes/ — the only place a model runs
+   │
+   │  ① decrypt the SCM token for this app_id      ← credential, in process memory
+   │  ② call GitHub, read the tree at a pinned SHA ← network
+   │  ③ write file contents to a temp directory    ← files only, never the token
+   │  ④ call the model, apply its edits            ← LLM
+   │  │
+   │  └─▶ ⑤ sandbox.exec(directory, image, command, limits)
+   │                     │
+   │        ┌────────────▼──────────────────────────┐
+   │        │  ephemeral container                  │
+   │        │    --network=none      no egress      │
+   │        │    host env not forwarded → no token  │
+   │        │    --read-only, --cap-drop=ALL        │
+   │        │    no configuration file of any kind  │
+   │        │                                       │
+   │        │  It knows one thing:                  │
+   │        │  "run `pytest -q` in /workspace"      │
+   │        └────────────┬──────────────────────────┘
+   │                     │  exit code
+   │  ⑥ read the diff from git, not from the model
+   └─────────────────────┘
+```
+
+Four things go in — **a directory, an image name, a command, resource limits**. No config, no
+credential, no network, no knowledge of which repository, ticket, or tenant it is serving.
+
+That ignorance is the security property, not a limitation. A prompt injection that fully
+succeeds inside the sandbox has nothing to steal and no way to send it, and the container is
+destroyed either way. Generating a config file for the sandbox — or letting it read the
+database — would hand it exactly the value it currently lacks.
+
+Two consequences worth stating separately, because both are load-bearing:
+
+- **`kuwarden.yaml` is not the sandbox's configuration.** It is the *application's*, read by
+  the worker. The sandbox never sees it. Questions about where that file should live
+  ([ADR 0007](docs/adr/0007-push-before-verification.md) era discussion: worker disk, database,
+  or the application's own repository) have nothing to do with the sandbox at all.
+- **The diff comes from git, not from the model.** `read_changes` reads what is actually on
+  disk after the loop. An agent's account of what it changed is never an input to anything.
 
 ---
 
@@ -269,64 +333,84 @@ Different agents can use different models, optimising for cost, quality, and sov
 
 ### 2.5 Application Hook (`kuwarden.yaml`)
 
-Every application that uses KuWarden registers itself with a `kuwarden.yaml` file at the repo root. This is the **single configuration file** that tells KuWarden everything it needs to know about the application.
+Every application registers itself with a `kuwarden.yaml` at its repository root. It declares
+how *that application's* changes are delivered.
+
+It is distinct from `policy.yaml`, which describes the platform deployment. **An application
+cannot grant itself capabilities**: `kuwarden.yaml` may only select from what `policy.yaml`
+already permits — [ADR 0003](docs/adr/0003-role-graph-and-traceability.md) §1. It is also a
+protected path, so an agent may never write it.
+
+> **It is not the sandbox's configuration**, and the sandbox never reads it — see *What
+> crosses into the sandbox* in §2.2. The worker reads this file and uses it to decide what to
+> hand the sandbox; the container itself receives four things and a config file is not among
+> them. Where this file should ultimately be read *from* — the worker's disk today, the
+> database, or the application's own repository at the pinned commit — is an open question,
+> and it is a question about the worker, not about the sandbox.
+
+> **There is no `pipeline` key, deliberately.** An earlier version of this section listed one
+> (`planner → coder → reviewer → tester → deployer`) with per-stage approval gates. Both were
+> replaced: [ADR 0002](docs/adr/0002-flow-topology.md) fixes the topology as a graph and makes
+> gate depth a function of `risk_tier`, and rejected a configurable flow builder outright.
+> The topology is not per-application configuration.
 
 ```yaml
-# kuwarden.yaml — example for a Java Spring Boot microservice
+# kuwarden.yaml
+version: 1
 
 app:
   name: payments-service
-  repo: https://github.com/acme/payments-service
-  language: java
-  framework: spring-boot
+
+# One or more repositories the Coder sees as a single tree — ADR 0005 §2.
+# Contract-coupled changes across services are authored in one context.
+workspace:
+  repos:
+    - { name: payments-service, provider: github, org: acme, repo: payments-service }
 
 triggers:
-  - type: jira
-    project_key: PAY
-    label: kuwarden-auto          # tickets with this label trigger the flow
-    min_story_points: 1
-    max_story_points: 5         # only auto-handle small tickets
+  - provider: jira                       # jira | azure_devops
+    site: https://acme.atlassian.net     # azure_devops uses `organisation:` instead
+    account_email: bot@acme.test
+    project: PAY
+    label: kuwarden-auto                 # admission control: no label, no run
+    max_story_points: 5
+    story_points_field: customfield_10016  # no default; the id differs per Jira instance
 
-flow:
-  pipeline:
-    - planner
-    - coder
-    - reviewer
-    - tester
-    - deployer
-    - reporter
+# Where the control point sits. Declared, never inferred — ADR 0004.
+# An absent value is an error, not a default.
+delivery:
+  integration_model: gated_deployment
 
-  approval_gates:
-    - after: reviewer           # human must approve before tests run
-      notify: slack:#pay-team
-    - after: tester             # human must approve before deploy
-      notify: slack:#pay-team
+# Dependencies are baked into the image. The sandbox has no egress, so there is no
+# run-time install — ADR 0005.
+sandbox:
+  toolchain_image: localhost/kuwarden-python312:1
+  test_command: [pytest, -q]
+  require_full_isolation: true           # false only during the testing phase
+  limits: { memory_mb: 2048, cpus: 2.0, pids: 256, timeout_s: 600, tmp_mb: 512 }
 
-  deploy:
-    test:
-      target: kubernetes
-      namespace: payments-test
-      manifest_path: k8s/test/
-    uat:
-      target: kubernetes
-      namespace: payments-uat
-      manifest_path: k8s/uat/
-      requires_approval: true
+# Rules-first tiering. A model may raise a tier from here; it may never lower one.
+risk:
+  high_paths: ["**/migrations/**", "**/auth/**"]
+  high_labels: [security, payments]
 
+# Model ids live in docs/reference/models.md with a review date, never in a strategy
+# document. No API key appears here — the credential broker resolves it at the point of
+# use, and this file is committed to the application's own repository.
 llm:
-  planner:
-    adapter: bedrock
-    model: anthropic.claude-3-5-sonnet-20241022-v2:0
-  coder:
-    adapter: openai_compatible
-    base_url: http://vllm.internal:8000/v1
-    model: Qwen2.5-Coder-32B-Instruct
+  provider: anthropic                    # anthropic | azure_openai | openai_compatible | bedrock
+  planner:   { model: claude-opus-5, effort: high }
+  coder:     { model: claude-opus-5, effort: xhigh }
+  verifiers: { model: claude-opus-5, effort: high }
 
-quality:
-  sast: semgrep
-  test_coverage_threshold: 80
-  branch_protection: true
+budgets:
+  cents_per_run: 500
 ```
+
+Loaded with `yaml.safe_load` only. This file is written by whoever can open a pull request in
+the application's repository, and `yaml.load` constructs arbitrary Python objects.
+
+Schema and validation: `engine/config.py`.
 
 ---
 
@@ -377,12 +461,18 @@ A real-time web dashboard that gives full visibility into every KuWarden agent r
    → Clones repo at pinned SHA via kuwarden-scm
    → LLM → structured ChangePlan (files, approach, test strategy)
 
-4. ③⇄④ CODER  ⇄  BUILD & TEST      [bounded inner loop]
-   → Coder creates feature branch, works inside an ephemeral sandbox
-   → Commits with a signed commit (bot service account)
-   → Build & Test triggers CI via kuwarden-cicd and polls
-   → ★ REALITY ANCHOR: the verdict is the CI system's exit code.
-     The Coder's opinion of its own work is not an input.
+4. ③→③ⓑ→④ CODER → PUSH ⇄ BUILD & TEST   [bounded inner loop]
+   → Coder works inside an ephemeral sandbox, holding no credentials
+   → Push writes the branch — the Flow Engine holds the token, not the Coder.
+     ★ protected_paths is denied HERE, before anything reaches origin.
+   → Build & Test runs the suite in the sandbox for fast feedback, then reads
+     the project's own pipeline for the pushed commit — read-only; the push is
+     what caused it to run.
+   → ★ REALITY ANCHOR: the verdict is the CI system's exit code, for THIS commit.
+     The Coder's opinion of its own work is not an input. Neither is a green
+     pipeline belonging to a different revision.
+   → No pipeline, or none finished in time: the sandbox verdict stands, labelled,
+     and the approver is told why. Absence is never promoted to a pass.
    → On failure with retries remaining: compiler + test output is fed back
      to the Coder, which iterates. Retry budget and token budget both enforced.
    → On failure with budget exhausted → ⑧ ABORT
@@ -404,8 +494,11 @@ A real-time web dashboard that gives full visibility into every KuWarden agent r
    → Notification sent to slack:#pay-team; resumes on approval signal
    → Timeout → ⑧ ABORT
 
-7. ⑦ DEPLOY                         [deterministic — sole credential holder]
-   → Raises/merges PR via kuwarden-scm (description generated earlier, not here)
+7. ⑦ RELEASE / DEPLOY               [deterministic — sole credential holder]
+   → Opens the PR via kuwarden-scm against the branch pushed at ③ⓑ.
+     A pull request is a request addressed to a human, so it is not made
+     until the verifiers and the gate have both passed.
+   → Merges via kuwarden-scm (description generated earlier, not here)
    → ★ Deployment credentials are resolved HERE, by the Flow Engine.
      They were never present in any process containing an LLM.
    → Deploys to payments-test via kuwarden-deploy

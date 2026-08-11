@@ -23,6 +23,7 @@ if TYPE_CHECKING:  # pragma: no cover - import cycle: adapters import state, nod
 
     from engine.adapters.credentials import CredentialBroker
     from engine.config import AppConfig
+    from engine.sandbox import Sandbox
 
 type NodeFn = Callable[[FlowState], Awaitable[FlowState]]
 
@@ -40,6 +41,9 @@ class NodeContext:
     config: AppConfig
     broker: CredentialBroker
     transport: httpx.AsyncBaseTransport | None = None
+    #: Where the Coder's inner loop executes. `None` in tests that never reach it, so a node
+    #: that needs one asks explicitly rather than discovering a null halfway through.
+    sandbox: Sandbox | None = None
 
 
 _context: ContextVar[NodeContext | None] = ContextVar("node_context", default=None)

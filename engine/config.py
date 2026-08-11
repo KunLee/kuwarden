@@ -49,6 +49,14 @@ class TriggerConfig:
     account_email: str | None = None
     organisation: str | None = None
     label: str | None = None
+    #: The workflow state a ticket must be in for a run to be admitted — "Ready for Agent".
+    #: `None` means state is not checked.
+    #:
+    #: This is the trigger that scales. A ticket *save* fires on every field change — a
+    #: reassignment, a typo fix, a tag — and starting an agent run on each is someone else's
+    #: model budget. Moving a ticket into a named state is a deliberate act, so admission
+    #: reads an intention rather than inferring one from activity.
+    ready_state: str | None = None
     max_story_points: int | None = None
     story_points_field: str | None = None
 
@@ -65,6 +73,54 @@ class RiskConfig:
     high_labels: list[str] = field(default_factory=list)
     #: Above this many changed files, the change stops being small whatever it touched.
     high_changed_files: int | None = None
+
+
+@dataclass(frozen=True)
+class SandboxConfig:
+    """Where and how the Coder's inner loop executes — ADR 0005.
+
+    `require_full_isolation` defaults to **False** during the testing phase, so a developer
+    host that cannot enforce cgroup limits still runs. Production should set it True.
+
+    Defaulting an isolation control to off is normally how a control never gets turned on, so
+    the degradation is made expensive to ignore instead of expensive to hit: it is reported
+    by `GET /api/sandbox`, banner-level in the Workbench on every page, and logged at WARNING
+    on every execution. The fact that a run executed under weakened isolation is a property
+    of that run, not a transient UI state.
+    """
+
+    #: Image reference. Dependencies are baked in; there is no egress to install any.
+    toolchain_image: str = "localhost/kuwarden-python312:1"
+    memory_mb: int = 2048
+    cpus: float = 2.0
+    pids: int = 256
+    timeout_s: int = 600
+    tmp_mb: int = 512
+    require_full_isolation: bool = False
+    #: What Build & Test runs. Its exit code is the reality anchor -- ADR 0001.
+    test_command: list[str] = field(default_factory=lambda: ["pytest", "-q"])
+
+
+@dataclass(frozen=True)
+class CiConfig:
+    """Where the independent verdict comes from — invariant 3, and ADR 0007.
+
+    Absent is legal and means the sandbox verdict stands, carrying its caveat. That is the
+    honest default: a repository with no pipeline cannot be made to have one by configuration,
+    and refusing to run there would trade a labelled weakness for no product.
+
+    Two waits, because two different things go wrong. `grace_s` bounds *nothing has appeared
+    yet* — a pipeline takes seconds to be created after a push. `wait_s` bounds *it appeared
+    and is still going*.
+    """
+
+    provider: str  # "github_actions"
+    wait_s: int = 900
+    poll_s: int = 15
+    grace_s: int = 90
+    #: Which workflows gate. Empty means all of them. Names match the workflow's display name
+    #: or its definition path, both exactly.
+    required_workflows: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -104,6 +160,8 @@ class AppConfig:
     toolchain_id: str = "none"
     risk: RiskConfig = field(default_factory=RiskConfig)
     llm: LLMConfig | None = None
+    sandbox: SandboxConfig = field(default_factory=SandboxConfig)
+    ci: CiConfig | None = None
     budget_cents_per_run: int = 0
     max_coder_retries: int = 3
     default_risk_tier: RiskTier = "low"
@@ -165,6 +223,8 @@ def parse(text: str) -> AppConfig:
     risk_raw = raw.get("risk") or {}
     budgets = raw.get("budgets") or {}
     llm = _llm(raw.get("llm"))
+    sandbox = _sandbox(raw.get("sandbox"))
+    ci = _ci(raw.get("ci"))
 
     return AppConfig(
         name=name,
@@ -173,6 +233,8 @@ def parse(text: str) -> AppConfig:
         integration_model=integration_model,
         toolchain_id=str(raw.get("toolchain", {}).get("id", "none")),
         llm=llm,
+        sandbox=sandbox,
+        ci=ci,
         risk=RiskConfig(
             high_paths=[str(p) for p in risk_raw.get("high_paths", [])],
             medium_paths=[str(p) for p in risk_raw.get("medium_paths", [])],
@@ -242,6 +304,7 @@ def _trigger(entry: Any, index: int) -> TriggerConfig:
         account_email=str(entry["account_email"]) if entry.get("account_email") else None,
         organisation=str(entry["organisation"]) if entry.get("organisation") else None,
         label=str(entry["label"]) if entry.get("label") else None,
+        ready_state=str(entry["ready_state"]) if entry.get("ready_state") else None,
         max_story_points=entry.get("max_story_points"),
         story_points_field=(
             str(entry["story_points_field"]) if entry.get("story_points_field") else None
@@ -292,4 +355,58 @@ def _llm(raw: Any) -> LLMConfig | None:
         provider=provider,
         per_node=per_node,
         base_url=str(raw["base_url"]) if raw.get("base_url") else None,
+    )
+
+
+def _ci(raw: Any) -> CiConfig | None:
+    """Absent is legal: it means no independent anchor, which is stated rather than hidden."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ConfigError("ci must be a mapping")
+
+    provider = str(raw.get("provider", ""))
+    if provider not in {"github_actions"}:
+        raise ConfigError(f"ci.provider must be github_actions, got {provider!r}")
+
+    required = raw.get("required_workflows") or []
+    if not isinstance(required, list):
+        raise ConfigError("ci.required_workflows must be a list of workflow names or paths")
+
+    poll_s = int(raw.get("poll_s", 15))
+    if poll_s < 1:
+        # A zero here would spin the poll loop against someone else's API without ever
+        # advancing the elapsed counter, which is an infinite loop wearing a timeout.
+        raise ConfigError("ci.poll_s must be at least 1 second")
+
+    return CiConfig(
+        provider=provider,
+        wait_s=int(raw.get("wait_s", 900)),
+        poll_s=poll_s,
+        grace_s=int(raw.get("grace_s", 90)),
+        required_workflows=[str(name) for name in required],
+    )
+
+
+def _sandbox(raw: Any) -> SandboxConfig:
+    """Absent is legal and yields the defaults, which are the strict ones."""
+    if raw is None:
+        return SandboxConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("sandbox must be a mapping")
+
+    limits = raw.get("limits") or {}
+    command = raw.get("test_command")
+    if command is not None and not isinstance(command, list):
+        raise ConfigError("sandbox.test_command must be a list of arguments, not a string")
+
+    return SandboxConfig(
+        toolchain_image=str(raw.get("toolchain_image", SandboxConfig.toolchain_image)),
+        memory_mb=int(limits.get("memory_mb", 2048)),
+        cpus=float(limits.get("cpus", 2.0)),
+        pids=int(limits.get("pids", 256)),
+        timeout_s=int(limits.get("timeout_s", 600)),
+        tmp_mb=int(limits.get("tmp_mb", 512)),
+        require_full_isolation=bool(raw.get("require_full_isolation", False)),
+        test_command=[str(part) for part in (command or ["pytest", "-q"])],
     )

@@ -14,6 +14,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from engine.errors import ProtectedPathWritten
+
 # Mirrors policy.yaml. Until the schema loader exists this is the enforced copy, and the
 # test asserts the two have not drifted apart.
 DEFAULT_PROTECTED_PATHS: tuple[str, ...] = (
@@ -75,3 +77,15 @@ class ProtectedPaths:
         """Every (path, pattern) pair that must fail the run."""
         found = [(p, m) for p in paths if (m := self.matches(p)) is not None]
         return found
+
+
+def assert_not_protected(paths: list[str]) -> None:
+    """Fail the run if the diff touches a path agents may never write — invariant 10.
+
+    One function, called from Push and again from Build & Test. Two nodes enforce the same
+    rule and neither may own a second copy of it: copies drift, and drift here is invisible —
+    both copies keep passing their own tests while denying different sets of paths.
+    """
+    violations = ProtectedPaths().violations(paths)
+    if violations:
+        raise ProtectedPathWritten(", ".join(f"{path} ({pattern})" for path, pattern in violations))
