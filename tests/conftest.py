@@ -162,6 +162,10 @@ class FakePlatform:
         #: one, so a test has to be able to put the ticket in the wrong state.
         self.ticket_state: str = "Ready for Agent"
         self.story_points: int | None = 3
+        #: What the fake verifiers return. `verifier_blocks = True` is the case the whole
+        #: topology exists for — a change that does not survive review.
+        self.verifier_blocks: bool = False
+        self.verifier_findings: list[str] = []
         #: Set to a category string to make the model decline the next completion.
         self.refuse_with: str | None = None
         self.messages_requests: list[dict[str, object]] = []
@@ -332,6 +336,18 @@ class FakePlatform:
         # The Planner and the Coder use different schemas. A fake that returned one shape for
         # both would let a schema mismatch pass unnoticed in every flow test.
         system = str(body.get("system", ""))
+        if "independent reviewers of a proposed software change" in system:
+            # The verdict shape, so the verifier's own parsing is exercised rather than
+            # accidentally satisfied by the Planner's payload.
+            payload = json.dumps(
+                {"findings": self.verifier_findings, "blocks": self.verifier_blocks}
+            )
+            return httpx.Response(200, json={
+                "id": "msg_verdict", "type": "message", "role": "assistant",
+                "model": body.get("model"),
+                "content": [{"type": "text", "text": payload}],
+                "stop_reason": "end_turn", "usage": usage,
+            })
         if "You implement one software change" in system:
             edits = (
                 self.coder_edits_factory()

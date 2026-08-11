@@ -94,6 +94,68 @@ def _failure(exc: BaseException) -> dict[str, Any]:
     return {"error": str(kind), "message": str(cause)[:500]}
 
 
+#: Everything a verifier is allowed to see. Anything not listed is cleared.
+#:
+#: Written as an allow-list, not a deny-list. A field added to `FlowState` later is invisible
+#: to verifiers until somebody names it here — the safe direction, because the failure mode of
+#: forgetting is a verifier that sees less than it could, not one that sees the Coder's
+#: reasoning.
+VERIFIER_MAY_SEE = frozenset(
+    {
+        # Lineage and provenance. Needed to write a verdict that can be attributed.
+        "run_id",
+        "root_run_id",
+        "parent_run_id",
+        "schema_version",
+        "policy_commit",
+        "policy_bundle",
+        # The original ask, and the change as it actually is.
+        "ticket",
+        "diff",
+        "proposed_edits",
+        "branch",
+        "base_branch",
+        "base_commit",
+        "head_commit",
+        # Objective evidence. `source` travels with it, so a verifier can tell a sandbox
+        # verdict from a CI one rather than treating both as "the tests passed".
+        "ci_result",
+        "sandbox_result",
+        "ci_detail",
+        "sast_result",
+        "coverage",
+        "sandbox_isolation",
+        "sandbox_gaps",
+        "risk_tier",
+    }
+)
+
+
+def _verifier_brief(state: FlowState) -> FlowState:
+    """The state a verifier is allowed to see — invariant 4.
+
+    "Fresh context" was a promise the topology made and nothing enforced: `_verify` handed each
+    verifier the whole `FlowState`, so the Coder's plan, its retry count and the other
+    verifiers' verdicts were all one attribute access away. A verifier that has seen the
+    author's reasoning is not an independent check of it, and one that can see another's
+    verdict is a vote rather than a fan-out.
+
+    Built by **construction from the allow-list**, not by clearing a copy. An earlier version
+    blanked each forbidden field to the empty value of its runtime type, which put `""` on
+    `provisional_risk_tier: RiskTier | None` — not a member of that Literal, so Temporal's
+    converter refused to decode the activity argument and every verifier retried three times
+    before failing. Constructing leaves every unnamed field at its declared default, and a
+    declared default is by definition a value the field may hold.
+
+    Each brief also gets its own mutable defaults, so four verifiers running in parallel cannot
+    see one another's verdicts accumulate.
+
+    The signature stays `(FlowState) -> FlowState` — ADR 0002 fixes it so any node can later
+    become a child flow — so this is the same type carrying less, not a narrower one.
+    """
+    return FlowState(**{name: getattr(state, name) for name in VERIFIER_MAY_SEE})
+
+
 class _Rejected(Exception):
     """The change did not survive. Routed to compensation, not to a crash."""
 
@@ -108,6 +170,13 @@ class DeliveryFlow:
         self._approvals: list[ApprovalSignal] = []
         self._status = "running"
         self._node: str | None = None
+        #: The most recent state any node returned.
+        #:
+        #: `state = await self._deliver(...)` never assigns when `_deliver` raises, so the
+        #: exception handler would otherwise hand compensation the state as it was at run
+        #: *start* — no branch, no commit, nothing to clean up. Compensation would then do
+        #: nothing, silently, on exactly the runs it exists for.
+        self._latest: FlowState | None = None
 
     # --- signals and queries -------------------------------------------------------------
 
@@ -162,7 +231,7 @@ class DeliveryFlow:
             self._status = "succeeded"
         except _Rejected as rejected:
             await self._emit("aborting", payload={"reason": str(rejected)})
-            state = await self._node_step("compensate", state)
+            state = await self._node_step("compensate", self._latest or state)
             await self._emit_cleanup(state)
             self._status = "rejected"
         except Exception as exc:
@@ -172,7 +241,7 @@ class DeliveryFlow:
             # Emitted before compensating, so the record reads in the order things happened:
             # what broke, then what was done about it.
             await self._emit("run_failed", payload=_failure(exc))
-            state = await self._node_step("compensate", state)
+            state = await self._node_step("compensate", self._latest or state)
             await self._emit_cleanup(state)
             self._status = "failed"
             await self._node_step("reporter", state)
@@ -293,8 +362,9 @@ class DeliveryFlow:
         replay-stable but needlessly hard to reason about.
         """
         await self._emit("verifiers_started", payload={"count": len(VERIFIERS)})
+        brief = _verifier_brief(state)
         results = await asyncio.gather(
-            *(self._node_step(v, state, record=False) for v in VERIFIERS)
+            *(self._node_step(v, brief, record=False) for v in VERIFIERS)
         )
         for result in results:
             state.verifications = [*state.verifications, *result.verifications]
@@ -375,6 +445,9 @@ class DeliveryFlow:
             await self._emit("node_started", node_id=node_id)
         try:
             result: FlowState = await self._execute(node_id, state)
+            # Published before anything else can fail, so the handlers below always see how
+            # far the run actually got.
+            self._latest = result
         except Exception as exc:
             # Recorded, then re-raised. Without this the trail shows `node_started` and then
             # nothing at all, and a reader has to infer the failure from a missing row and

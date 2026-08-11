@@ -51,7 +51,7 @@ not.
 run goes ticket → real repository tree → sandboxed edit loop, pushing a branch and grading
 each attempt against both the sandbox and the project's own GitHub Actions pipeline →
 verifiers → gate → pull request → comment, through real Temporal and real PostgreSQL. A run
-whose worker is destroyed mid-flight is finished by a different worker. **241 tests**; `ruff`
+whose worker is destroyed mid-flight is finished by a different worker. **251 tests**; `ruff`
 and `mypy --strict` clean.
 
 | Component | State | Where |
@@ -69,7 +69,7 @@ and `mypy --strict` clean.
 | Push node — branch written inside the loop, idempotent, never forced | Working | `engine/nodes/push.py` |
 | Approval gate — evidence document, digest binding, email | Working | `engine/evidence.py`, `engine/activities/notify.py` |
 | Run trigger — `POST /api/applications/{id}/runs` | Working; manual only, no webhook | `engine/api/main.py` |
-| Four verifier nodes | **Empty — pass unconditionally** | `engine/nodes/verifiers.py` |
+| Four verifier nodes — adversarial, fresh context enforced | Working | `engine/nodes/verifiers.py` |
 | Compensation — deletes the branch it pushed, unless a PR exists | Working | `engine/nodes/compensate.py` |
 | CI adapter — read a real pipeline verdict | Working, GitHub Actions only | `engine/adapters/ci` |
 | `policy.yaml` loader + constraint evaluator | **Does not exist.** The constraints are decorative | — |
@@ -276,7 +276,7 @@ skate past and a customer could not.
 
 | # | Missing | What it means today | Blocks |
 |---|---|---|---|
-| 1 | **The four verifiers are stubs** | `Verification(passed=True)`, unconditionally. **Nothing has reviewed any diff KuWarden has ever produced.** A run that reports "verifiers passed" is reporting that four empty functions returned | Any claim the verifier design works. `EVALUATION.md`. The whole "a change ships when it survives" argument |
+| 1 | **`EVALUATION.md`, and a golden task set** | The verifiers are real now, but nothing measures whether they *work*. CLAUDE.md requires prompt changes to be run against a golden set before merge, and there is no set | Any claim the verifier design works. Every prompt change is currently an invisible regression |
 | 2 | **`policy.yaml` has no loader** | The `assert:` expressions in `policy.example.yaml` are illustrative pseudocode. Runs pin the literal `unpinned:no-policy-loader` | Invariant 8 entirely. Org-level defaults, which is what stops every application repeating "which model, what budget" |
 | 3 | **Budgets are recorded, never enforced** | `budget_cents_spent` is incremented and compared against nothing. `cents_per_run` is decorative | Any deployment where an unbounded model bill matters — i.e. every paid one |
 | 4 | **No webhook receiver** | A run starts only when a human presses a button. Design agreed 2026-08-11: state-transition trigger, Temporal workflow id for serialisation, no coalescing | Tickets starting their own work |
@@ -291,6 +291,9 @@ skate past and a customer could not.
 
 | Was missing | Resolved |
 |---|---|
+| ~~The four verifiers were stubs~~ | 2026-08-11. Adversarial prompts per angle; `test_evidence` counts assertions removed, skips added and test-versus-source churn *before* any model sees it. A verifier that cannot reach a model **blocks** — failing open would put "verified" on a change nothing verified |
+| ~~Fresh context was a promise nothing enforced~~ | `_verifier_brief` constructs the state from an allow-list, so `plan`, `retry_count` and the other verdicts are absent by construction. Invariant 4 moved from **review** to **machine** |
+| ~~Compensation received the state as it was at run *start*~~ | `_deliver` raising meant `state = await self._deliver(...)` never assigned, so compensation saw no branch and silently did nothing on exactly the runs it exists for. The flow now publishes the latest state as each node returns |
 | ~~Compensation did nothing~~ | 2026-08-11. Deletes the branch it pushed **unless a pull request was opened** — deleting is destroying evidence, and once a human is involved removing the branch takes away the thing they were asked to look at. Never raises; records what it did as a `compensated` event |
 | ~~The push happened after verification~~ | [ADR 0007](adr/0007-push-before-verification.md) |
 | ~~No CI adapter~~ | GitHub Actions, read-only, anchored to the pushed commit |
