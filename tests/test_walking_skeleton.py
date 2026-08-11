@@ -423,6 +423,50 @@ async def test_a_ticket_not_in_the_ready_state_is_refused(platform: FakePlatform
     assert not platform.pull_requests, "nothing was pushed for a ticket nobody marked ready"
 
 
+async def test_a_blocking_verifier_stops_the_change_and_cleans_up(
+    platform: FakePlatform,
+) -> None:
+    """The case the whole topology exists for, end to end.
+
+    A change ships when it survives, not when it is liked. Until this session the verifiers
+    returned `passed=True` unconditionally, so this path had never been walked by anything —
+    "a verifier falsified the change" was a string in the flow that nothing could produce.
+    """
+    platform.verifier_blocks = True
+    platform.verifier_findings = ["src/app.py: subtract() returns a + b"]
+    client = await _client()
+    run_id = uuid.uuid4()
+
+    result = await _run(
+        client,
+        FlowInput(
+            run_id=run_id,
+            app_id=await _register_app(),
+            ticket=_ticket(),
+            policy_commit="c" * 40,
+            policy_bundle={},
+            provisional_risk_tier="low",
+        ),
+        approvals=[],
+    )
+
+    assert result.status == "rejected"
+    assert not platform.pull_requests, "a blocked change is never offered to a human"
+
+    async with connect() as conn:
+        rows = await conn.fetch(
+            "SELECT kind, payload FROM flow_events WHERE run_id = $1 ORDER BY seq", run_id
+        )
+    kinds = [r["kind"] for r in rows]
+    assert "aborting" in kinds
+    # Compensation ran and said what it did. A branch removed with nothing recording it is a
+    # branch that vanished.
+    cleaned = [r for r in rows if r["kind"] == "compensated"]
+    assert cleaned, "compensation must leave a trace"
+    assert "deleted" in json.loads(cleaned[0]["payload"])["detail"]
+    assert not platform.branches, "the branch the run pushed is gone"
+
+
 async def test_weakened_sandbox_isolation_is_recorded_in_the_audit_trail(
     platform: FakePlatform,
 ) -> None:

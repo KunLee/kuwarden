@@ -202,3 +202,57 @@ def test_topology_has_the_expected_nodes() -> None:
         "reporter",
     }
 
+
+
+# --- invariant 4: verifiers get a fresh context --------------------------------------------
+
+
+def test_a_verifier_never_sees_the_coders_reasoning() -> None:
+    """Fresh context, enforced rather than asked for.
+
+    `_verify` used to hand each verifier the whole `FlowState`, so the plan the Coder worked
+    from, its retry count and the other verifiers' verdicts were one attribute access away.
+    A verifier that has seen the author's reasoning is not an independent check of it.
+    """
+    import uuid as _uuid
+
+    from engine.flows.delivery import _verifier_brief
+    from engine.state import ChangePlan, Diff, FileChange, FlowState, Ticket, Verification
+
+    state = FlowState(
+        run_id=_uuid.uuid4(),
+        root_run_id=_uuid.uuid4(),
+        ticket=Ticket(id="PAY-1", system="jira", title="t", body="b"),
+        policy_commit="0" * 40,
+        policy_bundle={"pinned": True},
+        plan=ChangePlan(summary="how I decided to do it", steps=["step"]),
+        diff=Diff(files=[FileChange(path="src/app.py", added=1, removed=0)]),
+        retry_count=3,
+        budget_cents_spent=99,
+        verifications=[Verification(verifier="security", passed=False)],
+    )
+
+    brief = _verifier_brief(state)
+
+    # The author's reasoning, its failed attempts, and the other verdicts.
+    assert brief.plan is None, "the Coder's plan is reasoning about this change"
+    assert brief.retry_count == 0, "retry_count *is* prior attempts"
+    assert brief.verifications == [], "a fan-out, not a vote"
+    assert brief.budget_cents_spent == 0
+
+    # What a verifier legitimately needs: the ask, the change, the evidence, the lineage.
+    assert brief.ticket == state.ticket
+    assert brief.diff == state.diff
+    assert brief.run_id == state.run_id
+    assert brief.policy_commit == state.policy_commit
+
+
+def test_the_brief_is_an_allow_list_so_a_new_field_is_invisible_by_default() -> None:
+    """The safe direction. Forgetting to name a field shows a verifier *less*, never more."""
+    from engine.flows.delivery import VERIFIER_MAY_SEE
+    from engine.state import FlowState as _FlowState
+
+    declared = set(_FlowState.__dataclass_fields__)
+    assert declared >= VERIFIER_MAY_SEE, "the allow-list names only real fields"
+    # The ones that would defeat the purpose must never appear in it.
+    assert not (VERIFIER_MAY_SEE & {"plan", "retry_count", "verifications", "approvals"})
