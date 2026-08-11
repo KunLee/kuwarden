@@ -31,7 +31,9 @@ from engine.adapters.credentials import (
 )
 from engine.adapters.llm import (
     Completion,
+    LLMAuthError,
     LLMError,
+    LLMOutputTruncated,
     LLMRequest,
     ModelRefusal,
     Provider,
@@ -91,6 +93,27 @@ class AnthropicLLM:
             ),
         )
 
+    async def ping(self) -> str:
+        """List models. Authenticated, cheap, and generates nothing.
+
+        Not a one-token completion: that bills, and a check an operator hesitates to press is
+        a check they will not press.
+        """
+        client = await self._client()
+        try:
+            listing = await client.models.list(limit=1)
+        except Exception as exc:
+            if type(exc).__name__ in {"AuthenticationError", "PermissionDeniedError"}:
+                raise LLMAuthError(
+                    f"{type(exc).__name__} from the Anthropic API — the stored "
+                    "llm.api_key was rejected. Replace it in the Workbench."
+                ) from None
+            raise LLMError(f"{type(exc).__name__} from the Anthropic API") from None
+        available = [m.id for m in getattr(listing, "data", [])]
+        return f"anthropic, model {self._model}" + (
+            "" if not available else f" (API reachable, e.g. {available[0]})"
+        )
+
     async def complete(self, request: LLMRequest) -> Completion:
         assert_may_call_llm()
         client = await self._client()
@@ -118,6 +141,17 @@ class AnthropicLLM:
             else:
                 message = await client.messages.create(**params)
         except Exception as exc:
+            # The provider's own message is not carried through: it can echo request content,
+            # and this exception reaches the audit trail. The class name is enough to act on.
+            #
+            # Authentication is separated because it is the one failure a retry cannot fix.
+            # Rate limits and 5xx genuinely are transient; a rejected key is not, and the
+            # flow marks this type non-retryable so it fails in seconds rather than minutes.
+            if type(exc).__name__ in {"AuthenticationError", "PermissionDeniedError"}:
+                raise LLMAuthError(
+                    f"{type(exc).__name__} from the Anthropic API — the stored "
+                    "llm.api_key was rejected. Replace it in the Workbench."
+                ) from None
             raise LLMError(f"{type(exc).__name__} from the Anthropic API") from None
 
         return _to_completion(message, expects_schema=request.schema is not None)
@@ -136,19 +170,31 @@ def _to_completion(message: Any, *, expects_schema: bool) -> Completion:
         block.text for block in message.content if getattr(block, "type", None) == "text"
     )
 
+    # Truncation is checked **before** parsing, and the order is the whole point.
+    #
+    # A response cut off at `max_tokens` is incomplete JSON, so parsing it first fails with
+    # "the response was not JSON" — which is true, useless, and sends the reader to debug the
+    # model's formatting instead of raising a limit. The check for the real cause was written
+    # below the parse, where it could never fire.
+    if message.stop_reason == "max_tokens":
+        raise LLMOutputTruncated(
+            f"response hit max_tokens after {message.usage.output_tokens} output tokens; "
+            "the output is truncated. Raise `max_tokens` for this node — the Coder returns "
+            "whole file contents, so it needs far more than a node that returns a summary."
+        )
+
     parsed: dict[str, Any] | None = None
     if expects_schema:
         try:
             candidate = json.loads(text)
         except ValueError:
-            raise LLMError("schema was requested but the response was not JSON") from None
+            raise LLMError(
+                "schema was requested but the response was not JSON "
+                f"(stop_reason={message.stop_reason}, {len(text)} characters returned)"
+            ) from None
         if not isinstance(candidate, dict):
             raise LLMError(f"schema was requested but the response was a {type(candidate)}")
         parsed = candidate
-
-    if message.stop_reason == "max_tokens":
-        # Surfaced rather than swallowed: a truncated plan looks like a short plan.
-        raise LLMError("response hit max_tokens; the output is truncated")
 
     return Completion(
         text=text,

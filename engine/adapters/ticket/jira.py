@@ -99,6 +99,16 @@ class JiraTickets:
             transport=self._transport,
         )
 
+    async def ping(self, ref: TicketRef) -> str:
+        """Read the project itself. See `TicketAdapter.ping` for why the project and not the
+        account."""
+        async with await self._client(ref) as client:
+            body: Any = await client.get(f"{API}/project/{ref.project}")
+        name = body.get("name") if isinstance(body, dict) else None
+        if not name:
+            raise AdapterError(f"project {ref.project!r} returned no name")
+        return f"{self._site}/{name}"
+
     async def fetch(self, ref: TicketRef) -> Ticket:
         async with await self._client(ref) as client:
             body: Any = await client.get(f"{API}/issue/{ref.id}")
@@ -106,6 +116,10 @@ class JiraTickets:
             raise AdapterError(f"unexpected issue payload for {ref.id}")
 
         fields: dict[str, Any] = body.get("fields", {})
+        # Jira nests the workflow state under `status`; Azure DevOps has a flat
+        # `System.State`. Normalised to one field so admission has one rule, not two.
+        status = fields.get("status")
+        state = status.get("name") if isinstance(status, dict) else None
         points = self._story_points_field and fields.get(self._story_points_field)
 
         return Ticket(
@@ -113,6 +127,7 @@ class JiraTickets:
             system="jira",
             title=str(fields.get("summary", "")),
             body=_adf_text(fields.get("description")).strip(),
+            state=str(state) if state else None,
             acceptance_criteria=[],
             labels=[str(label) for label in fields.get("labels", [])],
             story_points=int(points) if isinstance(points, int | float) else None,

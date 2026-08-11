@@ -74,7 +74,13 @@ holds no resources open while suspended.
 
 **release**
 The control point — the last moment KuWarden can refuse. Node ⑦. Prefer this over "deploy",
-because deploying is only what happens under integration model A.
+because deploying is only what happens under integration model A. Release opens the pull
+request; it does not push the branch — see **push**.
+
+**push**
+Node ③ⓑ, inside the inner loop. Writes the branch so that CI has something to run on
+([ADR 0007](adr/0007-push-before-verification.md)). Distinct from **release**: pushing moves
+code, releasing moves a control point. A push is not an approval and carries no `control_mode`.
 
 **integration model**
 `kuwarden_deploys` (A) | `gated_merge` (B) | `gated_deployment` (C). Declared per application in
@@ -101,10 +107,41 @@ coherent tree. Not "repository" — contract-coupled changes must be authored to
 The ephemeral, network-restricted, credential-free environment where build and test run. It
 produces a diff; it never pushes.
 
+It receives exactly four things — a directory, an image name, a command, resource limits. No
+configuration, no credentials, no network, and no knowledge of which repository or ticket it
+is serving. That ignorance is the security property. The model does **not** run here: it runs
+in the Coder node, in the worker process. See *What crosses into the sandbox* in
+[ARCHITECTURE.md](../ARCHITECTURE.md) §2.2.
+
 **inner loop**
-The bounded `Coder ⇄ Build & Test` cycle. Nearly all code quality comes from here. Loops are
+The bounded `Coder → Push ⇄ Build & Test` cycle. Nearly all code quality comes from here. Loops are
 not abolished — they are *contained* inside a node, where context is bounded and retries are
 budgeted.
+
+**credential broker**
+The one thing that turns "I need a token for *this*" into an actual secret. One method,
+`resolve(CredentialRequest) -> Secret`, where a request is a **kind** (what the credential is
+for — `scm.read`, `ticket.read_write`, `deploy`) and a **realm** (which platform instance —
+`github.com:acme`).
+
+It exists so privileged credentials are resolved **at the point of use** and nowhere else.
+A credential placed on `FlowState` would be serialised into Temporal's workflow history, and
+that history is the audit record — which is append-only, so a token that reaches it has
+escaped permanently. Implementations: `EnvCredentialBroker` (development),
+`EncryptedPostgresStore` (per application, ADR 0006), `StoreThenEnvBroker` (store first,
+environment as fallback).
+
+Not "secret store" — the store is *where* a secret sits; the broker is *who decides* whether
+this caller gets it for this realm right now. Invariant 2 is a statement about the broker.
+
+**credential kind**
+What a credential is *for*, not what it *is*. Grants stay narrow and separately revocable:
+one PAT may be stored under `scm.read`, `scm.write_branch` and `scm.pull_request` as three
+entries, so revoking the ability to open pull requests does not revoke the ability to read.
+
+**realm**
+The platform instance a credential is scoped to — `github.com:acme`, `jira:PAY`. Keeps one
+tenant's token from being resolvable for another tenant's resources inside a single process.
 
 **policy pinning**
 Recording `policy_commit` and `policy_bundle` on a run at start, so an audit record remains

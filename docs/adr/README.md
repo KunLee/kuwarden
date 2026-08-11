@@ -31,6 +31,8 @@ from re-deriving the answer from scratch.
 | [0003](0003-role-graph-and-traceability.md) | Role graph and end-to-end traceability | Accepted | Not expected |
 | [0004](0004-delivery-integration-models.md) | Delivery integration models and the control point | Accepted | Per-platform, as adapters are added |
 | [0005](0005-sandbox-contract.md) | Execution sandbox contract | Accepted | Not expected — implementation grows behind it |
+| [0006](0006-credential-storage.md) | Credential storage — encrypted locally, behind a Protocol | Accepted | When a customer runs Vault or a cloud secret manager, or their threat model includes host compromise |
+| [0007](0007-push-before-verification.md) | The branch is pushed before the change is verified | Accepted | If per-push CI cost dominates, or a customer forbids agent commits on their origin |
 
 ## Conventions
 

@@ -25,7 +25,7 @@ from engine.db import connect, migrate
 from engine.flows.delivery import ApprovalSignal, DeliveryFlow, FlowInput
 from engine.state import Ticket
 from engine.worker import namespace, target
-from tests.conftest import FakePlatform
+from tests.conftest import FakePlatform, track_application
 
 pytestmark = pytest.mark.asyncio
 
@@ -52,7 +52,9 @@ async def _register_app() -> uuid.UUID:
             f"test-app-{app_id.hex[:8]}",
             "https://example.invalid/test-app",
         )
-    return app_id
+    # Tracked so the session teardown removes it. Without this the developer's Workbench
+    # fills with test-app rows that outlive the run that made them.
+    return track_application(app_id)
 
 
 def _ticket() -> Ticket:
@@ -321,11 +323,33 @@ async def test_ticket_to_pull_request_end_to_end(platform: FakePlatform) -> None
         next(r for r in platform.requests if r.url.path.endswith("/git/commits")).content
     )
     # ADR 0003 §7: backward resolution must not depend on correlating timestamps.
-    assert f"kuwarden-run-id: {run_id}" in commit["message"]
     assert f"kuwarden-policy-commit: {'7' * 40}" in commit["message"]
 
     assert platform.comments, "the ticket was told what happened"
     assert str(run_id) in platform.comments[0]
+
+    # The verdict came from the project's pipeline, for the commit that was actually pushed.
+    # This is invariant 3 holding end to end rather than being described — and the assertion
+    # on `head_sha` is the load-bearing half: a verdict about some other commit would satisfy
+    # every other assertion here.
+    async with connect() as conn:
+        verdict = await conn.fetchrow(
+            "SELECT payload FROM flow_events WHERE run_id = $1 AND kind = 'build_test_verdict'",
+            run_id,
+        )
+    assert verdict is not None
+    payload = json.loads(verdict["payload"])
+    assert payload["source"] == "ci"
+    assert payload["independent_anchor"] is True
+
+    pushed = json.loads(
+        next(r for r in platform.requests if r.url.path.endswith("/git/commits")).content
+    )
+    graded = next(r for r in platform.requests if r.url.path.endswith("/actions/runs"))
+    assert graded.url.params["head_sha"] == "commit-1", (
+        "CI was asked about the commit this run pushed"
+    )
+    assert f"kuwarden-run-id: {run_id}" in pushed["message"]
 
 
 async def test_a_ticket_outside_declared_scope_is_refused(platform: FakePlatform) -> None:
@@ -352,3 +376,131 @@ async def test_a_ticket_outside_declared_scope_is_refused(platform: FakePlatform
     assert isinstance(activity_error, ActivityError)
     assert "does not carry" in str(activity_error.cause)
     assert not platform.pull_requests, "nothing was pushed for a refused ticket"
+
+    # And the record says so. A trail that shows `node_started` then nothing forces a reader
+    # to infer the failure from a missing row, and never tells them why.
+    async with connect() as conn:
+        rows = await conn.fetch(
+            "SELECT kind, node_id, payload FROM flow_events WHERE run_id = $1 ORDER BY seq",
+            run_id,
+        )
+    failed = [r for r in rows if r["kind"] == "node_failed"]
+    assert failed, "a node that failed must leave a row saying so"
+    assert failed[0]["node_id"] == "triage"
+    payload = json.loads(failed[0]["payload"])
+    assert payload["error"] == "PolicyDenied", "the kind of failure, not just that there was one"
+    assert "does not carry" in payload["message"], "and the reason, readable without Temporal"
+    assert any(r["kind"] == "run_failed" for r in rows)
+
+
+async def test_a_ticket_not_in_the_ready_state_is_refused(platform: FakePlatform) -> None:
+    """Starting work is something a human did deliberately, not something inferred.
+
+    A ticket save fires on every field change. Admitting on that would start an agent run —
+    and spend a model budget — because somebody fixed a typo. The state is the signal that
+    says "go", and this is the refusal that makes it mean something.
+    """
+    platform.ticket_state = "New"
+    client = await _client()
+
+    with pytest.raises(WorkflowFailureError) as failure:
+        await _run(
+            client,
+            FlowInput(
+                run_id=uuid.uuid4(),
+                app_id=await _register_app(),
+                ticket=_ticket(),
+                policy_commit="b" * 40,
+                policy_bundle={},
+                provisional_risk_tier="low",
+            ),
+            approvals=[],
+        )
+
+    activity_error = failure.value.cause
+    assert isinstance(activity_error, ActivityError)
+    assert "Ready for Agent" in str(activity_error.cause)
+    assert not platform.pull_requests, "nothing was pushed for a ticket nobody marked ready"
+
+
+async def test_a_blocking_verifier_stops_the_change_and_cleans_up(
+    platform: FakePlatform,
+) -> None:
+    """The case the whole topology exists for, end to end.
+
+    A change ships when it survives, not when it is liked. Until this session the verifiers
+    returned `passed=True` unconditionally, so this path had never been walked by anything —
+    "a verifier falsified the change" was a string in the flow that nothing could produce.
+    """
+    platform.verifier_blocks = True
+    platform.verifier_findings = ["src/app.py: subtract() returns a + b"]
+    client = await _client()
+    run_id = uuid.uuid4()
+
+    result = await _run(
+        client,
+        FlowInput(
+            run_id=run_id,
+            app_id=await _register_app(),
+            ticket=_ticket(),
+            policy_commit="c" * 40,
+            policy_bundle={},
+            provisional_risk_tier="low",
+        ),
+        approvals=[],
+    )
+
+    assert result.status == "rejected"
+    assert not platform.pull_requests, "a blocked change is never offered to a human"
+
+    async with connect() as conn:
+        rows = await conn.fetch(
+            "SELECT kind, payload FROM flow_events WHERE run_id = $1 ORDER BY seq", run_id
+        )
+    kinds = [r["kind"] for r in rows]
+    assert "aborting" in kinds
+    # Compensation ran and said what it did. A branch removed with nothing recording it is a
+    # branch that vanished.
+    cleaned = [r for r in rows if r["kind"] == "compensated"]
+    assert cleaned, "compensation must leave a trace"
+    assert "deleted" in json.loads(cleaned[0]["payload"])["detail"]
+    assert not platform.branches, "the branch the run pushed is gone"
+
+
+async def test_weakened_sandbox_isolation_is_recorded_in_the_audit_trail(
+    platform: FakePlatform,
+) -> None:
+    """A run that executed model-written code under weakened isolation says so, permanently.
+
+    The banner in the Workbench and the log line both disappear. This does not: it is in the
+    run's own append-only record, so a report exported next year still says under which
+    isolation the change was produced.
+    """
+    client = await _client()
+    run_id = uuid.uuid4()
+    await _run(
+        client,
+        FlowInput(
+            run_id=run_id,
+            app_id=await _register_app(),
+            ticket=_ticket(),
+            policy_commit="a" * 40,
+            policy_bundle={},
+            provisional_risk_tier="low",
+        ),
+        approvals=[],
+    )
+
+    async with connect() as conn:
+        row = await conn.fetchrow(
+            "SELECT payload FROM flow_events WHERE run_id = $1 AND kind = 'sandbox_isolation'",
+            run_id,
+        )
+
+    assert row is not None, "the run executed a sandbox and must record its isolation"
+    payload = json.loads(row["payload"])
+    assert payload["state"] in {"enforced", "degraded"}
+    if payload["state"] == "degraded":
+        # Self-describing: the record names what was missing, so interpreting it later does
+        # not require the host still existing to re-probe.
+        assert payload["gaps"], "a degraded record must say what was not enforced"

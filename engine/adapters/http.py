@@ -14,7 +14,7 @@ from typing import Any
 import httpx
 
 from engine.adapters.credentials import Secret
-from engine.errors import AdapterError
+from engine.errors import AdapterError, NotFound, PermissionDenied
 
 DEFAULT_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 
@@ -83,6 +83,16 @@ class RestClient:
             # The token is in `headers`; never let the exception carry the request.
             raise AdapterError(f"{method} {url} failed: {type(exc).__name__}") from None
 
+        # 404 first, and as its own type. Every platform here answers "this ref does not
+        # exist" with one, and a caller deciding between creating a branch and updating one
+        # must not have to distinguish that case by matching on an error string.
+        if response.status_code == 404:
+            raise NotFound(f"{method} {url} returned 404: {response.text[:200]}")
+        # Typed so the adapter can name the missing grant. A caller that knows it was pushing
+        # a branch can say "this needs Contents: Read and write"; the platform's own message
+        # cannot, because it does not know why the call was made.
+        if response.status_code == 403:
+            raise PermissionDenied(f"{method} {url} returned 403: {response.text[:300]}")
         if response.status_code >= 400:
             raise AdapterError(
                 f"{method} {url} returned {response.status_code}: {response.text[:500]}"
@@ -99,3 +109,9 @@ class RestClient:
 
     async def post(self, url: str, *, json: Any, params: Mapping[str, str] | None = None) -> Any:
         return await self.request("POST", url, json=json, params=params)
+
+    async def patch(self, url: str, *, json: Any, params: Mapping[str, str] | None = None) -> Any:
+        return await self.request("PATCH", url, json=json, params=params)
+
+    async def delete(self, url: str, *, params: Mapping[str, str] | None = None) -> Any:
+        return await self.request("DELETE", url, params=params)

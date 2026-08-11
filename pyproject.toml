@@ -13,6 +13,11 @@ requires-python = ">=3.12"
 #               files are read from application repositories
 #   cryptography  AES-256-GCM for tenant credentials at rest (ADR 0006). The one
 #               primitive nobody should hand-roll.
+#   argon2-cffi the password hash. Memory-hard, the current OWASP recommendation, and
+#               the one primitive nobody should hand-roll. Chosen over a framework like
+#               fastapi-users, which drags in an ORM to save ~150 lines.
+#   itsdangerous  signed session cookies. An OPTIONAL Starlette extra, not a transitive
+#               dependency -- SessionMiddleware imports it and fails at startup without it.
 #   fastapi     the Workbench API
 #   uvicorn     serving it
 #   anthropic   the Anthropic LLM adapter. Optional at runtime -- imported inside
@@ -26,8 +31,10 @@ dependencies = [
     "asyncpg>=0.30",
     "httpx>=0.28",
     "pyyaml>=6.0",
+    "argon2-cffi>=23.1",
     "cryptography>=44",
     "fastapi>=0.115",
+    "itsdangerous>=2.2",
     "uvicorn[standard]>=0.34",
     "anthropic>=0.69",
 ]

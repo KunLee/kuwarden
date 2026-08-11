@@ -41,3 +41,23 @@ class SandboxInfrastructureError(KuWardenError):
 
 class AdapterError(KuWardenError):
     """An external system of record could not be reached or answered unusably."""
+
+
+class PermissionDenied(AdapterError):
+    """The credential reached the platform and was refused this specific action.
+
+    Distinguished from the rest of `AdapterError` so a caller can say *which grant is
+    missing*. Platforms answer with their own wording — GitHub's is "Resource not accessible
+    by personal access token" — which is true and leaves the operator to guess which of a
+    dozen permission toggles it meant.
+    """
+
+
+class NotFound(AdapterError):
+    """The external system answered, and the thing asked for does not exist.
+
+    Separated from the rest of `AdapterError` because absence is frequently a *normal* state —
+    a branch this run has not created yet — and a caller that cannot tell "not there" from
+    "could not reach it" has to treat a network failure as an absence, which is how a retry
+    turns into a second push.
+    """

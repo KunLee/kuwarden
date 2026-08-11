@@ -71,6 +71,18 @@ class AzureDevOpsTickets:
             transport=self._transport,
         )
 
+    async def ping(self, ref: TicketRef) -> str:
+        """Read the project itself. See `TicketAdapter.ping` for why the project and not the
+        account."""
+        async with await self._client(ref) as client:
+            body: Any = await client.get(
+                f"/_apis/projects/{ref.project}", params={"api-version": API_VERSION}
+            )
+        name = body.get("name") if isinstance(body, dict) else None
+        if not name:
+            raise AdapterError(f"project {ref.project!r} returned no name")
+        return f"{self._org}/{name}"
+
     async def fetch(self, ref: TicketRef) -> Ticket:
         async with await self._client(ref) as client:
             body: Any = await client.get(
@@ -82,6 +94,7 @@ class AzureDevOpsTickets:
 
         fields: dict[str, Any] = body.get("fields", {})
         tags = fields.get("System.Tags") or ""
+        state = fields.get("System.State")
         points = fields.get("Microsoft.VSTS.Scheduling.StoryPoints")
 
         return Ticket(
@@ -89,6 +102,7 @@ class AzureDevOpsTickets:
             system="azure_devops",
             title=str(fields.get("System.Title", "")),
             body=_plain(fields.get("System.Description")),
+            state=str(state) if state else None,
             acceptance_criteria=_criteria(fields.get("Microsoft.VSTS.Common.AcceptanceCriteria")),
             labels=[t.strip() for t in tags.split(";") if t.strip()],
             story_points=int(points) if isinstance(points, int | float) else None,

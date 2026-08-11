@@ -1,0 +1,161 @@
+/**
+ * Shapes returned by the Workbench API.
+ *
+ * Deliberately mirrors the engine's own vocabulary — `risk_tier`, `control_mode`,
+ * `integration_model` — rather than inventing UI-side synonyms. docs/GLOSSARY.md fixes this
+ * vocabulary, and terminology drift in this project has already caused one design error.
+ */
+
+/** Where the control point sits. Declared per application, never inferred — ADR 0004. */
+export type IntegrationModel =
+  | "kuwarden_deploys"
+  | "gated_merge"
+  | "gated_deployment";
+
+/** How much verification and human approval a change receives — ADR 0002. */
+export type RiskTier = "low" | "medium" | "high";
+
+export type RunStatus =
+  | "running"
+  | "suspended"
+  | "succeeded"
+  | "rejected"
+  | "failed"
+  | "aborted";
+
+export interface Application {
+  id: string;
+  name: string;
+  repo_url: string;
+  integration_model: IntegrationModel;
+  created_at: string;
+}
+
+/** Which tickets an application accepts. Mirrors the `triggers` block of kuwarden.yaml. */
+export interface Trigger {
+  id: string;
+  provider: "jira" | "azure_devops";
+  project: string;
+  site: string | null;
+  account_email: string | null;
+  organisation: string | null;
+  /** null means every ticket in the project qualifies — a decision, not an omission. */
+  label: string | null;
+  /**
+   * The workflow state that means "go". null means state is not checked. A ticket *save*
+   * fires on every field change; a state transition is deliberate, which is the difference
+   * between reading an intention and inferring one.
+   */
+  ready_state: string | null;
+  max_story_points: number | null;
+  /** Jira custom field id. Differs per instance, so there is no default. */
+  story_points_field: string | null;
+}
+
+export interface CredentialState {
+  /** Which credentials are stored. Values are never returned by any endpoint. */
+  present: string[];
+  supported: string[];
+}
+
+export interface ProbeResult {
+  declared: IntegrationModel;
+  /** False when the platform cannot support the declared model. Registration should stop. */
+  achievable: boolean;
+  reason: string;
+  capabilities: {
+    deployment_protection: boolean;
+    required_status_checks: boolean;
+    restrictable_pipeline_triggers: boolean;
+    detail: Record<string, string>;
+  };
+}
+
+export interface Run {
+  id: string;
+  /** Which application this run belongs to — what a re-run needs. */
+  app_id: string;
+  ticket_system: string;
+  ticket_id: string;
+  risk_tier: RiskTier;
+  status: RunStatus;
+  policy_commit: string;
+  created_at: string;
+}
+
+export interface RunEvent {
+  seq: number;
+  kind: string;
+  node_id: string | null;
+  /**
+   * `authorized` means KuWarden gated the effect; `observed` means we watched it happen.
+   * `null` means the event represents no external effect at all — never "we did not check".
+   * Invariant 11.
+   */
+  control_mode: "authorized" | "observed" | null;
+  /** Event-specific detail. Self-describing on purpose, so reading an old record needs
+      nothing but the record. */
+  payload: Record<string, unknown>;
+  occurred_at: string;
+}
+
+/**
+ * What the sandbox host actually enforces.
+ *
+ * Probed by running a container, not by asking the runtime: rootless podman on a cgroups v1
+ * host accepts `--memory` and silently ignores it, so "what was requested" and "what is
+ * applied" are different questions.
+ */
+export interface SandboxStatus {
+  available: boolean;
+  fully_enforced: boolean;
+  /** Human-readable list of bounds that are *not* applied. Empty when nothing is missing. */
+  gaps: string[];
+  reason?: string;
+  enforced?: Record<string, boolean>;
+}
+
+/** ADR 0003 §1. Ordered: each role includes the ones before it. */
+export type Role = "viewer" | "approver" | "admin";
+
+/** Who is signed in. The start of ADR 0003's delegation chain. */
+export interface Principal {
+  id: string;
+  email: string;
+  display_name: string;
+  role: Role;
+}
+
+export interface User extends Principal {
+  disabled_at: string | null;
+  created_at: string;
+  last_login_at: string | null;
+}
+
+/**
+ * The evidence document an approver decides against, and the digest that binds them to it.
+ *
+ * `digest` is opaque here on purpose — the UI never recomputes it. Two implementations of
+ * "canonical form" drift, and the symptom would be approvals bouncing for no visible reason.
+ * The server computes it, the UI echoes it back.
+ */
+export interface Evidence {
+  digest: string;
+  document: {
+    schema: number;
+    run_id: string;
+    application: string | null;
+    ticket: { system: string; id: string };
+    risk_tier: string;
+    status: string;
+    policy_commit: string;
+    policy_bundle: Record<string, unknown>;
+    started_at: string;
+    /** Empty when no verdict was recorded. `source` says who ran the tests, not just that they ran. */
+    tests: { exit_code?: number; source?: string; duration_ms?: number; url?: string | null };
+    sandbox_isolation: { state?: string; gaps?: string[] };
+    /** Everything about this evidence that is weaker than it looks. Rendered above the controls. */
+    caveats: string[];
+    events: RunEvent[];
+  };
+}

@@ -75,6 +75,11 @@ def _load_master_key(raw: str | None = None) -> bytes:
     return key
 
 
+def load_master_key(raw: str | None = None) -> bytes:
+    """The master key, as bytes. Public entry point for anything that needs to derive from it."""
+    return _load_master_key(raw)
+
+
 def key_fingerprint(key: bytes) -> str:
     """Identifies a key without revealing it, so rotation can tell rows apart."""
     return hashlib.sha256(b"kuwarden-key-id\x00" + key).hexdigest()[:16]

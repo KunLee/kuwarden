@@ -3,8 +3,9 @@
 > Governed, auditable change delivery — from ticket to production — for enterprises that
 > cannot put their code on someone else's cloud.
 
-**Status: pre-implementation.** The architecture is decided and recorded; the code is not yet
-written. See [Where things stand](#where-things-stand).
+**Status: early implementation.** The control plane runs, the sandbox runs, and there is a
+Workbench. The agent nodes are mostly still empty. See
+[Where things stand](#where-things-stand).
 
 ---
 
@@ -65,6 +66,7 @@ Read in this order.
 | | |
 |---|---|
 | **[CLAUDE.md](CLAUDE.md)** | **Start here to write code.** Invariants, the determinism boundary, conventions. |
+| **[docs/KNOWLEDGE_BASE.md](docs/KNOWLEDGE_BASE.md)** | **Start here to pick the project up.** Current state, lessons, operational knowledge, open questions — reconciled from `log/` |
 | [VISION.md](VISION.md) | Problem, positioning, who it is for |
 | [NON_GOALS.md](NON_GOALS.md) | What we deliberately do not do, and why |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Components, flow topology, data flow, security, governance |
@@ -138,6 +140,33 @@ uv run python -m engine.adapters.secrets keygen >> .env
 uv sync && uv run python -m engine.db migrate && uv run python -m engine.worker
 ```
 
+### The sandbox
+
+Where the Coder's inner loop executes — [ADR 0005](docs/adr/0005-sandbox-contract.md). Build
+the toolchain image once, then check what this host actually enforces:
+
+```bash
+uv run python -m engine.sandbox build && uv run python -m engine.sandbox doctor
+```
+
+`doctor` matters more than it looks. Rootless podman on a cgroups v1 host **accepts
+`--memory` and silently ignores it**, so the sandbox probes by running a container rather
+than by asking `podman info`, and reports what is actually applied. A sandbox that claims a
+bound it is not enforcing is the same class of error as an audit row claiming `authorized`
+for something merely observed.
+
+With `sandbox.require_full_isolation: true` (the default), a host that cannot enforce cgroup
+limits **refuses to run** rather than running while under-reporting. What still holds on such
+a host: the wall clock, the egress block, per-process memory via `ulimit -v`, and the disk
+quota via `tmpfs size=`. What is lost: total memory across processes, and CPU.
+
+```bash
+uv run python -m engine.sandbox smoke
+```
+
+Dependencies are baked into the toolchain image. With no egress there is no `pip install` at
+run time — that is the design, not a gap to route around.
+
 ### The Workbench
 
 ```bash
@@ -161,18 +190,34 @@ Workflow histories are visible at [localhost:8233](http://localhost:8233) while 
 
 ## Where things stand
 
-**Decided and recorded.** Notably the choices that are expensive to retrofit: durable
-execution, the tree-structured audit trail (`parent_run_id`), policy pinning (`policy_commit`),
-the uniform node contract, and the sandbox contract.
+**Built and tested.** A run goes ticket → branch → commit → pull request → comment through
+real Temporal and real PostgreSQL. A run whose worker is destroyed mid-flight is finished by
+a different worker. The audit trail refuses `UPDATE` and `DELETE`. Credentials are encrypted
+at rest and write-only through the API. The sandbox has no egress, no credentials, and
+reports which resource limits the host actually enforces rather than assuming.
+
+| Working | Where |
+|---|---|
+| Flow Engine — eight nodes, gates, compensation, audit tree | `engine/flows`, `engine/nodes` |
+| Adapters — Azure DevOps, Jira, Azure Repos, GitHub | `engine/adapters` |
+| LLM adapter — Anthropic implemented, three more declared | `engine/adapters/llm` |
+| Credential storage — AES-256-GCM, [ADR 0006](docs/adr/0006-credential-storage.md) | `engine/adapters/secrets.py` |
+| Sandbox — podman, capability-probed | `engine/sandbox` |
+| Workbench — register, credentials, runs, audit trail | `engine/api`, `ui/` |
 
 **Not yet written.**
 
 | Item | Note |
 |---|---|
-| Nodes that do anything | The walking skeleton runs eight empty nodes end to end. Models go in after the control plane is proven, not before |
-| `THREAT_MODEL.md` | Primary threats identified: prompt injection via ticket content, workflow-definition write escalation |
+| Coder, and the four verifiers | The Planner is the only node with a model. The Coder writes a marker file until the sandbox can materialise a real base tree |
+| Authentication | The Workbench API is **unauthenticated**. ADR 0003's approval constraints depend on approvers being identifiable humans |
+| Ticketing configuration in the Workbench | The schema supports it; the UI does not yet write it |
+| `THREAT_MODEL.md` | Primary threats identified: prompt injection via ticket content, workflow-definition write escalation. ADR 0006's host-compromise limit belongs here |
 | `EVALUATION.md` | Blocks any claim that the verifier design works |
-| `policy.yaml` schema + constraint evaluator | Until it exists, the constraints in [policy.example.yaml](docs/reference/policy.example.yaml) are decorative |
+| `policy.yaml` schema + constraint evaluator | The `assert:` expressions in [policy.example.yaml](docs/reference/policy.example.yaml) are written in a language that does not exist yet |
+| `ROADMAP.md` | Still describes the pre-ADR design and contradicts ADR 0001 and ADR 0002 |
+
+**How it got built**, including what turned out to be wrong, is in [log/](log/).
 
 **Naming.** This project was called *KuFlow* until 2026-08-08. It was renamed because
 [kuflow.com](https://kuflow.com) is an unrelated existing product in an adjacent category — a

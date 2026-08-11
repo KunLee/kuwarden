@@ -8,13 +8,15 @@ from __future__ import annotations
 
 import httpx
 
+from engine.adapters.ci import CiAdapter
+from engine.adapters.ci.github_actions import GitHubActionsCi
 from engine.adapters.credentials import CredentialBroker
 from engine.adapters.protocols import ScmAdapter, TicketAdapter
 from engine.adapters.scm.azure_repos import AzureReposScm
 from engine.adapters.scm.github import GitHubScm
 from engine.adapters.ticket.azure_devops import AzureDevOpsTickets
 from engine.adapters.ticket.jira import JiraTickets
-from engine.config import ConfigError, RepoConfig, TriggerConfig
+from engine.config import CiConfig, ConfigError, RepoConfig, TriggerConfig
 
 
 def ticket_adapter(
@@ -53,3 +55,15 @@ def scm_adapter(
         case "azure_repos":
             return AzureReposScm(broker, transport=transport)
     raise ConfigError(f"no SCM adapter for provider {repo.provider!r}")
+
+
+def ci_adapter(
+    ci: CiConfig,
+    broker: CredentialBroker,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> CiAdapter:
+    match ci.provider:
+        case "github_actions":
+            return GitHubActionsCi(broker, transport=transport)
+    raise ConfigError(f"no CI adapter for provider {ci.provider!r}")
