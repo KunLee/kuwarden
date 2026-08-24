@@ -14,6 +14,7 @@ import {
   Banner,
   Button,
   Card,
+  ConfirmDialog,
   Empty,
   Field,
   Input,
@@ -34,6 +35,10 @@ const ROLE_NOTES: Record<Role, string> = {
 export function Users() {
   const { principal } = useSession();
   const [users, setUsers] = useState<User[]>([]);
+  //: The account awaiting confirmation, so the dialog can name it rather than
+  //: asking a generic question about "the selected user".
+  const [confirming, setConfirming] = useState<User | null>(null);
+  const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<{ tone: "ok" | "error"; text: string } | null>(null);
   const [draft, setDraft] = useState({
     email: "",
@@ -66,18 +71,37 @@ export function Users() {
     }
   }
 
-  async function disable(user: User) {
-    if (!confirm(`Disable ${user.email}? Their sessions end immediately.`)) return;
+  async function disable() {
+    if (!confirming) return;
+    setBusy(true);
     try {
-      await api.disableUser(user.id);
+      await api.disableUser(confirming.id);
+      setConfirming(null);
       await refresh();
     } catch (e) {
+      setConfirming(null);
       setMessage({ tone: "error", text: e instanceof ApiError ? e.message : String(e) });
+    } finally {
+      setBusy(false);
     }
   }
 
   return (
     <div>
+      {/* Disabling an account is not reversible from this page, and it ends live sessions
+          rather than taking effect at next sign-in. Both belong in front of the click. */}
+      <ConfirmDialog
+        open={confirming !== null}
+        onOpenChange={(open) => !open && setConfirming(null)}
+        title={confirming ? `Disable ${confirming.email}?` : ""}
+        confirmLabel="Disable account"
+        onConfirm={() => void disable()}
+        busy={busy}
+      >
+        Their sessions end immediately — the guard reads `token_version` on every request, so
+        they are signed out mid-page rather than at next sign-in. Approvals they already gave
+        stay in the audit trail.
+      </ConfirmDialog>
       <PageHeader
         title="Users"
         description="Local accounts. Approval gates are only evidence of review if the approver is a real, identifiable person."
@@ -165,7 +189,7 @@ export function Users() {
                     ) : (
                       user.id !== principal?.id && (
                         <button
-                          onClick={() => disable(user)}
+                          onClick={() => setConfirming(user)}
                           className="text-[12px] text-red-600 hover:underline dark:text-red-400"
                         >
                           Disable

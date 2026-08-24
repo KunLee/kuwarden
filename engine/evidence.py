@@ -104,12 +104,31 @@ async def assemble(run_id: UUID) -> Evidence:
     verdict = payload_of("build_test_verdict")
     isolation = payload_of("sandbox_isolation")
 
+    # The tier from the trail, falling back to the column only when final tiering has not run.
+    #
+    # `flow_runs.risk_tier` is written once, at run start, and never again — so it holds the
+    # *provisional* tier that intake guessed from the ticket's labels. Reading it here showed
+    # an approver "risk tier: low" on a page that was demanding two signatures because the
+    # diff had raised the change to high. The evidence document is what a decision is bound
+    # to; a document that understates the tier understates the reason the reader is being
+    # asked at all.
+    #
+    # This is also what the docstring above already promised: the audit trail is the record,
+    # and a parallel view that happens to agree today is not the same thing.
+    final = payload_of("risk_tier_final")
+    risk_tier = final.get("tier") or run["risk_tier"]
+
     document: dict[str, Any] = {
         "schema": EVIDENCE_SCHEMA,
         "run_id": str(run["id"]),
         "application": app_name,
         "ticket": {"system": run["ticket_system"], "id": run["ticket_id"]},
-        "risk_tier": run["risk_tier"],
+        "risk_tier": risk_tier,
+        # Both, when they differ. "It is high" and "intake guessed low and the diff
+        # raised it" are different facts, and the second is the one that tells an
+        # approver why a change that read as routine is in front of them.
+        "provisional_risk_tier": final.get("provisional") or run["risk_tier"],
+        "risk_tier_reason": final.get("reason") or "final tiering did not run",
         "status": run["status"],
         # Pinned at run start. An approver deciding under one policy and a run executing
         # under another is the failure ADR 0003 §4 exists to make visible.

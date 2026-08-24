@@ -26,8 +26,10 @@
 - [ ] Redis setup — task queue and event pub/sub
 - [ ] Docker Compose dev environment — all services start with one command
 - [ ] Helm chart skeleton — deploys all services to Kubernetes
-- [ ] GitHub Actions CI — lint, typecheck, unit tests on every PR
-- [ ] Secret scanning and SAST in CI (Semgrep, Gitleaks)
+- [x] GitHub Actions CI — lint, typecheck, unit tests on every PR
+- [ ] Secret scanning and SAST in CI (Semgrep, Gitleaks) — **half done.** Gitleaks runs over
+      full history on every PR. Semgrep is not wired up, so SAST remains **none** here and in
+      invariant 3
 - [ ] `kuwarden.yaml` schema definition and validator
 
 **Exit criteria:** `docker compose up` starts a working (empty) KuWarden instance. UI shows login screen. Engine health check passes.

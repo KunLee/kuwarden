@@ -115,18 +115,24 @@ async def changed_files(workspace: Workspace) -> list[FileChange]:
     return changes
 
 
-async def read_changes(workspace: Workspace) -> dict[str, str]:
-    """The content of every changed file, for the Flow Engine to push.
+async def read_changes(workspace: Workspace) -> dict[str, str | None]:
+    """Every changed path and its new content, for the Flow Engine to push.
 
     The sandbox produces the change; something outside it, under a different identity, sends
     it onward — ADR 0005 property 5.
+
+    `None` means the path was deleted. It used to be dropped: the loop read `changed_files`,
+    which is git-computed and does report deletions, and then skipped anything that failed
+    `is_file()`. A change that only removed files therefore arrived at Push carrying nothing,
+    and was refused as though the Coder had proposed no edits at all.
     """
     root = Path(workspace.root)
-    contents: dict[str, str] = {}
+    contents: dict[str, str | None] = {}
     for change in await changed_files(workspace):
         path = root / change.path
-        if path.is_file():
-            contents[change.path] = path.read_text(encoding="utf-8", errors="replace")
+        contents[change.path] = (
+            path.read_text(encoding="utf-8", errors="replace") if path.is_file() else None
+        )
     return contents
 
 

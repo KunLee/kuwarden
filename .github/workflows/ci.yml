@@ -1,0 +1,149 @@
+---
+# KuWarden's own CI.
+#
+# Not to be confused with the CI this product *reads* — that pipeline belongs to the
+# application under delivery, is named in its `kuwarden.yaml`, and is the external system of
+# record behind invariant 3. Nothing here touches it. This workflow only checks KuWarden's own
+# source.
+#
+# Why it exists: most rows in the CLAUDE.md invariant table say "enforced by machine", and the
+# machine is `tests/test_invariants.py`. Until this file existed, that machine ran when
+# somebody remembered to run it — which is the definition of a control this project would
+# refuse to describe as held.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Read-only. Nothing here writes to the repository, publishes anything, or needs a token
+# beyond checkout; a workflow that cannot push cannot be turned into one that does by an
+# edit to a script it calls.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  engine:
+    name: engine — lint, types, tests
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          # `trust`, not a password. This container is reachable only from this job and is
+          # destroyed with it. The alternative is a literal password committed to the
+          # repository, which teaches the habit that the secret-scanning job below exists to
+          # break — and a fake credential in a committed file is indistinguishable, to a
+          # reader, from a real one somebody forgot to remove.
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_USER: kuwarden
+          POSTGRES_DB: kuwarden
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Taken verbatim by engine.db.dsn(). No password component: see the service env above.
+      KUWARDEN_DATABASE_URL: postgresql://kuwarden@127.0.0.1:5432/kuwarden
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: '0.7.17'
+
+      # --frozen: resolve from the committed uv.lock and fail rather than update it. uv.lock
+      # is committed deliberately (see pyproject.toml) because this ships into air-gapped
+      # environments, where a non-reproducible resolve is a blocker rather than a nuisance.
+      - name: Install dependencies
+        run: uv sync --python 3.12 --frozen
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Types
+        run: uv run mypy engine tests
+
+      # Also the precondition check for the step below. Several test modules skip themselves
+      # when PostgreSQL is absent, which is right on a laptop and wrong here: a service
+      # container that failed to start would produce a green run with the credential-store and
+      # Workbench tests silently skipped. Migrating first fails the job loudly instead.
+      - name: Apply migrations, and prove the database is reachable
+        run: uv run python -m engine.db migrate
+
+      - name: Tests
+        run: uv run pytest -q -rs
+
+  ui:
+    name: ui — types and lint
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ui
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # `npm install`, not `npm ci`: ui/package-lock.json is currently excluded by the blanket
+      # `package-lock.json` rule in .gitignore, so there is no lockfile to install from and
+      # this job resolves fresh versions on every run. That is the opposite of the reasoning
+      # that put uv.lock under version control. Switch to `npm ci` once the lockfile is
+      # committed.
+      - name: Install dependencies
+        run: npm install
+
+      # tsconfig.app.json sets noEmit, so build mode type-checks without producing output.
+      - name: Types
+        run: npx tsc -b
+
+      - name: Lint
+        run: npm run lint
+
+  secrets:
+    name: secret scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history. A secret added three commits ago and "removed" in the fourth is
+          # still in the pack, still reachable, and still compromised — scanning only the tip
+          # would report it clean.
+          fetch-depth: 0
+
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          # Recorded here rather than fetched from the release at run time. A checksums file
+          # downloaded alongside the artifact it attests to proves only that the two agree;
+          # whoever can replace one can replace the other. Pinning the digest in the
+          # repository is the out-of-band half that makes the check mean something.
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          set -euo pipefail
+          curl -sSfL -o gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks
+          sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
+
+      # --redact: a finding must not print the secret it found. CI logs are readable by
+      # everyone who can see the repository, and a scanner that leaks what it catches has
+      # widened the exposure it was added to narrow.
+      - name: Scan history
+        run: gitleaks git . --config .gitleaks.toml --redact --verbose

@@ -124,6 +124,36 @@ export const api = {
 
   // --- triggers ---------------------------------------------------------------------------
 
+  /** The application's stored kuwarden.yaml, or a note that it has none. */
+  readConfig: (appId: string) =>
+    request<{
+      stored: boolean;
+      yaml: string | null;
+      detail?: string;
+      updated_at?: string;
+      updated_by?: string;
+    }>(`/api/applications/${appId}/config`),
+
+  /** Parsed server-side before it is written, so a typo fails here rather than in a run. */
+  storeConfig: (appId: string, yaml: string) =>
+    request<{ stored: boolean; application: string }>(
+      `/api/applications/${appId}/config`,
+      { method: "PUT", body: JSON.stringify({ yaml }) },
+    ),
+
+  /** Which verifiers may stop a change, and which only advise. */
+  readVerifiers: (appId: string) =>
+    request<{ verifiers: { name: string; blocking: boolean }[]; advisory: string[] }>(
+      `/api/applications/${appId}/verifiers`,
+    ),
+
+  /** Arm or disarm one. Disarmed means advisory — it still runs and still records findings. */
+  setVerifiers: (appId: string, blocking: Record<string, boolean>) =>
+    request<{ verifiers: { name: string; blocking: boolean }[]; advisory: string[] }>(
+      `/api/applications/${appId}/verifiers`,
+      { method: "PUT", body: JSON.stringify({ blocking }) },
+    ),
+
   listTriggers: (appId: string) =>
     request<Trigger[]>(`/api/applications/${appId}/triggers`),
 
@@ -133,6 +163,23 @@ export const api = {
   ) =>
     request<{ id: string }>(`/api/applications/${appId}/triggers`, {
       method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  /**
+   * Change an existing trigger's admission rules.
+   *
+   * Identity — provider, organisation, project — is deliberately not amendable server-side;
+   * those decide which board the rule governs. Send only the fields being changed: `null`
+   * clears a rule, omitting one leaves it alone.
+   */
+  amendTrigger: (
+    appId: string,
+    triggerId: string,
+    body: Partial<Pick<Trigger, "label" | "ready_state" | "max_story_points" | "story_points_field">>,
+  ) =>
+    request<{ id: string }>(`/api/applications/${appId}/triggers/${triggerId}`, {
+      method: "PATCH",
       body: JSON.stringify(body),
     }),
 
@@ -232,5 +279,16 @@ export const api = {
         method: "POST",
         body: JSON.stringify({ approved, evidence_digest: digest, comment }),
       },
+    ),
+
+  /**
+   * Stop a run that is going nowhere. Admin only, and abrupt by design: the workflow is
+   * terminated rather than cancelled, so compensation does not run and the pushed branch is
+   * left on the remote. The response names it so the caller can say so.
+   */
+  terminateRun: (runId: string) =>
+    request<{ terminated: boolean; principal: string; branch_left_behind: string | null }>(
+      `/api/runs/${runId}/terminate`,
+      { method: "POST" },
     ),
 };

@@ -33,6 +33,8 @@ from re-deriving the answer from scratch.
 | [0005](0005-sandbox-contract.md) | Execution sandbox contract | Accepted | Not expected — implementation grows behind it |
 | [0006](0006-credential-storage.md) | Credential storage — encrypted locally, behind a Protocol | Accepted | When a customer runs Vault or a cloud secret manager, or their threat model includes host compromise |
 | [0007](0007-push-before-verification.md) | The branch is pushed before the change is verified | Accepted | If per-push CI cost dominates, or a customer forbids agent commits on their origin |
+| [0008](0008-configuration-is-operator-owned.md) | Application configuration is operator-owned, not repository-owned | Accepted | When `policy.yaml` is enforced — a repository-owned file becomes safe once it can only select from operator-permitted options |
+| [0009](0009-two-approval-levels.md) | Two approval levels: business authorisation and code review | Accepted | When the same person performs both — two levels done by one human is ceremony, and the second should be removed |
 
 ## Conventions
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 from engine.adapters.llm import LLMRequest
 from engine.adapters.llm.factory import llm_adapter
 from engine.config import ConfigError
+from engine.nodes import notes
 from engine.nodes.base import context, node
 from engine.state import ChangePlan, FlowState, NodeClass
 
@@ -54,18 +55,22 @@ async def planner(state: FlowState) -> FlowState:
     adapter = llm_adapter(ctx.config.llm, "planner", ctx.broker, transport=ctx.transport)
 
     criteria = "\n".join(f"- {c}" for c in state.ticket.acceptance_criteria) or "- none stated"
+    # Bound to a name rather than inlined, so the audit record can carry the exact bytes the
+    # model was sent. A note reconstructing the prompt afterwards would be a plausible account
+    # of it, which is the kind of evidence this project exists to argue against.
+    prompt = (
+        # Fenced and labelled, so the boundary between our instructions and their text is
+        # explicit rather than positional.
+        f"<ticket id={state.ticket.id!r} system={state.ticket.system!r}>\n"
+        f"<title>{state.ticket.title}</title>\n"
+        f"<body>\n{state.ticket.body}\n</body>\n"
+        f"<acceptance_criteria>\n{criteria}\n</acceptance_criteria>\n"
+        "</ticket>"
+    )
     completion = await adapter.complete(
         LLMRequest(
             system=SYSTEM,
-            # Fenced and labelled, so the boundary between our instructions and their text is
-            # explicit rather than positional.
-            prompt=(
-                f"<ticket id={state.ticket.id!r} system={state.ticket.system!r}>\n"
-                f"<title>{state.ticket.title}</title>\n"
-                f"<body>\n{state.ticket.body}\n</body>\n"
-                f"<acceptance_criteria>\n{criteria}\n</acceptance_criteria>\n"
-                "</ticket>"
-            ),
+            prompt=prompt,
             max_tokens=settings.max_tokens,
             effort=settings.effort,
             schema=PLAN_SCHEMA,
@@ -79,7 +84,53 @@ async def planner(state: FlowState) -> FlowState:
     )
     # Spend is tracked on the state so the budget ceiling means something before the run
     # rather than after the invoice.
-    state.budget_cents_spent += _estimate_cents(completion.input_tokens, completion.output_tokens)
+    cost = _estimate_cents(completion.input_tokens, completion.output_tokens)
+    state.budget_cents_spent += cost
+
+    steps = "\n".join(f"{i}. {s}" for i, s in enumerate(state.plan.steps, 1)) or "(no steps)"
+    state.notes = notes.compose(
+        f"Planned {len(state.plan.steps)} step(s) with {completion.model}",
+        notes.fields(
+            "Model call",
+            [
+                # The model id belongs in the record of the run that used it. ADR guidance
+                # keeps identifiers out of *strategy* documents because they go stale; an audit
+                # trail is the opposite case — it must say what actually ran.
+                ("Model", completion.model),
+                ("Effort", settings.effort),
+                ("Max tokens", settings.max_tokens),
+                ("Input tokens", completion.input_tokens),
+                ("Output tokens", completion.output_tokens),
+                ("Schema enforced", "yes — a plan that fails validation is not a plan"),
+                ("Estimated cost", f"{cost} cents"),
+                (
+                    "Run spend so far",
+                    f"{state.budget_cents_spent} of {state.budget_cents_allowed} cents",
+                ),
+            ],
+        ),
+        notes.fields(
+            "What was assembled into the prompt",
+            [
+                ("Ticket title", f"{len(state.ticket.title)} characters"),
+                ("Ticket body", f"{len(state.ticket.body)} characters"),
+                ("Acceptance criteria", f"{len(state.ticket.acceptance_criteria)} stated"),
+                # Named explicitly because it is the most common wrong assumption about this
+                # node: the Planner has never seen the repository. It plans from the ticket
+                # alone, and the Coder is the first node given a tree.
+                ("Repository contents", "not included — the Coder is the first node given a tree"),
+            ],
+        ),
+        notes.text("System prompt — written by KuWarden", SYSTEM),
+        notes.text("Prompt sent — contains ticket text", prompt, untrusted=True),
+        notes.text(
+            "Plan returned",
+            f"{state.plan.summary}\n\n{steps}",
+            # The model wrote this. It is the one output that becomes the next node's input,
+            # so a reader should know it is generated rather than derived.
+            untrusted=True,
+        ),
+    )
     return state
 
 

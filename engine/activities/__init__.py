@@ -10,7 +10,12 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from typing import Any
 
-from engine.activities.audit import record_event, record_run_ended, record_run_started
+from engine.activities.audit import (
+    record_event,
+    record_run_ended,
+    record_run_started,
+    record_run_status,
+)
 from engine.activities.nodes import run_node
 from engine.activities.notify import notify_gate_reached
 
@@ -19,6 +24,7 @@ from engine.activities.notify import notify_gate_reached
 ALL: Sequence[Callable[..., Any]] = [
     run_node,
     record_run_started,
+    record_run_status,
     record_event,
     record_run_ended,
     notify_gate_reached,
@@ -30,5 +36,6 @@ __all__ = [
     "record_event",
     "record_run_ended",
     "record_run_started",
+    "record_run_status",
     "run_node",
 ]

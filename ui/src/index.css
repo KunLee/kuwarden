@@ -5,45 +5,103 @@
 @custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
 
 /*
- * Light-first, and deliberately quiet.
+ * The Workbench design system.
  *
- * This is an operations surface that gets read for long stretches, so the palette is
- * near-white with separation carried by whitespace and a single hairline rather than by
- * boxes inside boxes. Colour is reserved for the two things an operator scans for — risk
- * tier and run status. Anything decorative competes with those, so there is nothing
- * decorative.
+ * Three token groups, and the rule for each is different:
+ *
+ * **Palette** — near-white, separation carried by whitespace and a single hairline rather
+ * than by boxes inside boxes. This is an operations surface read for long stretches.
+ *
+ * **Semantic colour** — `ok` / `warn` / `danger`, and nothing else. Colour is reserved for
+ * the two things an operator scans for: risk tier and run status. Anything decorative
+ * competes with those, so there is nothing decorative. These exist as tokens because the
+ * alternative — `text-amber-700 dark:text-amber-400` repeated across a dozen files — is a
+ * palette nobody can change and nobody can audit.
+ *
+ * **Type scale** — six steps, named for what they carry rather than how big they are, and
+ * sized in `rem`. The names matter more than the numbers: `text-[12px]` in one file and
+ * `text-[13px]` in another is not a decision anybody made, it is two people guessing.
  *
  * Light is the default and does **not** follow the system. An operations console that
  * changes appearance because of an OS preference is a console two people describe
- * differently while looking at the same screen. Dark is available for anyone who wants it,
- * as an explicit `data-theme="dark"` on the root — opt in, never inferred.
+ * differently while looking at the same screen. Dark is opt-in, as an explicit
+ * `data-theme="dark"` on the root — never inferred.
  */
 @theme {
+  /* --- palette ------------------------------------------------------------------------ */
   --color-canvas: oklch(0.99 0.002 250);
   --color-surface: oklch(1 0 0);
+  --color-sunken: oklch(0.975 0.003 250);
   --color-line: oklch(0.925 0.004 250);
   --color-ink: oklch(0.22 0.012 255);
-  --color-muted: oklch(0.55 0.012 255);
-  --color-faint: oklch(0.7 0.01 255);
+  --color-muted: oklch(0.5 0.012 255);
+  --color-faint: oklch(0.66 0.01 255);
   --color-accent: oklch(0.53 0.19 262);
   --color-accent-soft: oklch(0.96 0.02 262);
 
-  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  /* --- semantic ----------------------------------------------------------------------- */
+  /* Hue-matched to the palette's blue bias so they read as one family rather than as three
+     borrowed stoplight colours. Every one is legible on both `surface` and `sunken`. */
+  --color-ok: oklch(0.52 0.13 155);
+  --color-ok-soft: oklch(0.965 0.03 160);
+  --color-warn: oklch(0.53 0.13 72);
+  --color-warn-soft: oklch(0.968 0.033 80);
+  --color-danger: oklch(0.53 0.18 20);
+  --color-danger-soft: oklch(0.965 0.03 22);
+
+  /* --- type scale --------------------------------------------------------------------- */
+  /* `rem`, so the density control below scales the whole console from one place. Pixel
+     literals would ignore it, which is why they are being retired. */
+  --text-micro: 0.6875rem;   /* 11px — timestamps, legends, unit labels */
+  --text-meta: 0.75rem;      /* 12px — table cells, node state, identifiers */
+  --text-body: 0.8125rem;    /* 13px — descriptions, findings, list rows */
+  --text-prose: 0.875rem;    /* 14px — paragraphs meant to be read, not scanned */
+  --text-title: 1.0625rem;   /* 17px — card titles */
+  --text-display: 1.5rem;    /* 24px — page headings */
+
+  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", "Cascadia Code", monospace;
 }
 
 :root[data-theme="dark"] {
   --color-canvas: oklch(0.17 0.008 255);
   --color-surface: oklch(0.215 0.009 255);
+  --color-sunken: oklch(0.195 0.009 255);
   --color-line: oklch(0.3 0.011 255);
   --color-ink: oklch(0.95 0.004 255);
-  --color-muted: oklch(0.68 0.012 255);
-  --color-faint: oklch(0.52 0.012 255);
+  --color-muted: oklch(0.72 0.012 255);
+  --color-faint: oklch(0.54 0.012 255);
   --color-accent: oklch(0.74 0.14 262);
   --color-accent-soft: oklch(0.28 0.05 262);
+
+  /* Not the light values inverted. Each is re-chosen to hold its contrast on the dark
+     ground, because a hue that reads as caution at 0.53 lightness reads as mud at 0.8. */
+  --color-ok: oklch(0.78 0.13 158);
+  --color-ok-soft: oklch(0.27 0.05 158);
+  --color-warn: oklch(0.81 0.12 78);
+  --color-warn-soft: oklch(0.29 0.05 75);
+  --color-danger: oklch(0.72 0.16 22);
+  --color-danger-soft: oklch(0.28 0.06 20);
 }
 
+/*
+ * Density.
+ *
+ * The console is dense on purpose — an operator scanning fifty runs wants rows, not air.
+ * But the same screen recorded or projected is read at a fraction of its native size, and
+ * 11px state labels are unreadable in a video frame.
+ *
+ * So density is a stated setting rather than a compromise baked into the type scale. Every
+ * size is `rem`, so this single declaration moves all of them together and nothing else in
+ * the system has to know.
+ */
 html {
   color-scheme: light;
+  font-size: 16px;
+}
+
+:root[data-density="presentation"] {
+  font-size: 18.5px;
 }
 
 :root[data-theme="dark"] {
@@ -54,6 +112,7 @@ body {
   background: var(--color-canvas);
   color: var(--color-ink);
   font-family: var(--font-sans);
+  font-size: var(--text-body);
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
 }
@@ -61,13 +120,39 @@ body {
 /* Identifiers — run ids, commit SHAs, credential kinds — are compared, not read as prose.
    Tabular figures keep columns of them aligned so a mismatch is visible without reading. */
 .mono {
-  font-family: ui-monospace, "SF Mono", "Cascadia Code", monospace;
+  font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
   letter-spacing: -0.01em;
+}
+
+/* Headings are set tighter than body text: at display sizes the default tracking reads as
+   loose, and a console's headings are labels rather than prose. */
+h1,
+h2,
+h3 {
+  letter-spacing: -0.02em;
+  text-wrap: balance;
 }
 
 /* Tables here are dense by nature. A hairline plus a hover tint reads more calmly at
    fifty rows than zebra striping, which fights the status colours. */
 .row-hover:hover {
   background: color-mix(in oklch, var(--color-accent) 4%, transparent);
+}
+
+/* Every interactive element gets a visible focus ring. A console that can only be operated
+   with a mouse is a console somebody eventually operates by guessing. */
+:where(button, a, input, select, textarea, [role="switch"]):focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
 }

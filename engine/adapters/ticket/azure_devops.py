@@ -116,6 +116,16 @@ class AzureDevOpsTickets:
                 json={"text": body},
             )
 
+    async def comments(self, ref: TicketRef) -> list[str]:
+        """See `TicketAdapter.comments`."""
+        async with await self._client(ref) as client:
+            payload: Any = await client.get(
+                f"/{ref.project}/_apis/wit/workItems/{ref.id}/comments",
+                params={"api-version": COMMENTS_API_VERSION},
+            )
+        items = payload.get("comments") if isinstance(payload, dict) else None
+        return [str(c.get("text", "")) for c in items or [] if isinstance(c, dict)]
+
     async def transition(self, ref: TicketRef, state: str) -> None:
         async with await self._client(ref) as client:
             await client.request(

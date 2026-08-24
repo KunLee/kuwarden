@@ -27,6 +27,7 @@ from __future__ import annotations
 from engine.adapters.factory import scm_adapter
 from engine.adapters.protocols import BranchRef, FileEdit
 from engine.errors import AdapterError
+from engine.nodes import notes
 from engine.nodes.base import context, node
 from engine.policy.protected_paths import assert_not_protected
 from engine.state import Artifact, FlowState, NodeClass
@@ -35,8 +36,20 @@ from engine.state import Artifact, FlowState, NodeClass
 @node(node_id="push", name="Push", node_class=NodeClass.DETERMINISTIC)
 async def push(state: FlowState) -> FlowState:
     ctx = context()
-    if not state.proposed_edits:
-        raise AdapterError("push reached with no proposed edits")
+    # Tested against the git-computed diff rather than against `proposed_edits`, and the two
+    # are not the same question. A removal is an edit: it appears in the diff and, before
+    # deletions were carried, contributed no content-bearing entry — so a change that only
+    # deleted files was refused here as though the Coder had produced nothing.
+    #
+    # An empty diff is still a failure, but it belongs to the Coder, and the message says so:
+    # "no proposed edits" named the symptom three nodes downstream of the cause and sent a
+    # reader looking at Push.
+    if state.diff is None or not state.diff.files:
+        raise AdapterError(
+            "the Coder produced no change — the sandbox tree is identical to the base commit. "
+            "Read the Coder's notes for what it was shown and what it decided; a run reaches "
+            "here having proposed nothing when the model could not find what the ticket names."
+        )
     if not state.branch or not state.base_branch or not state.base_commit:
         raise AdapterError("push reached before the Coder pinned a branch and a base commit")
 
@@ -49,16 +62,25 @@ async def push(state: FlowState) -> FlowState:
     scm = scm_adapter(repo, ctx.broker, transport=ctx.transport)
     ref = repo.ref()
 
+    # Read before the push overwrites it. `None` on the first attempt; on a later one it is the
+    # previous attempt's commit, which is what makes the branch a history rather than a
+    # replacement — and is worth having in the record for exactly that reason.
+    parent = state.head_commit
+    message = _commit_message(state)
+
     pushed = await scm.push_change(
         ref,
         # Always the pinned base, so every attempt's tree is base + that attempt's edits.
         BranchRef(name=state.base_branch, commit=state.base_commit),
         branch=state.branch,
-        message=_commit_message(state),
-        edits=[FileEdit(path=e.path, content=e.content) for e in state.proposed_edits],
+        message=message,
+        edits=[
+            FileEdit(path=e.path, content=e.content, deleted=e.deleted)
+            for e in state.proposed_edits
+        ],
         # ...but parented on what this run already pushed, so the branch reads as a history of
         # attempts rather than one commit that quietly replaced another.
-        parent=state.head_commit,
+        parent=parent,
     )
 
     state.head_commit = pushed.commit
@@ -66,6 +88,63 @@ async def push(state: FlowState) -> FlowState:
         *state.artifacts,
         Artifact(kind="commit", uri=f"{ref.org}/{ref.repo}@{pushed.commit}", digest=pushed.commit),
     ]
+
+    state.notes = notes.compose(
+        f"Pushed {len(state.proposed_edits)} file(s) to {state.branch} as {pushed.commit[:12]}",
+        notes.fields(
+            "Where it went",
+            [
+                ("Repository", f"{ref.org}/{ref.repo}"),
+                ("Branch", state.branch),
+                ("Base commit, pinned by the Coder", state.base_commit),
+                (
+                    "Parent",
+                    parent or "none — first attempt, so this commit sits on the base",
+                ),
+                ("New commit", pushed.commit),
+                ("Pass of the Coder/Build cycle", state.push_attempt),
+                ("Retries inside the Coder", state.retry_count),
+            ],
+        ),
+        notes.checks(
+            "Checked before anything reached origin",
+            [
+                (
+                    "Protected paths",
+                    "no CI definition, deploy manifest, IaC or KuWarden config",
+                    state.diff.paths if state.diff else "no diff to check",
+                    True,
+                ),
+            ],
+        ),
+        notes.fields(
+            "What this node may do",
+            [
+                # Invariant 2, stated in the record rather than only in the ADR. The reader of
+                # a run is entitled to see which permissions were in play at the moment code
+                # left the building.
+                ("Credential held", "scm.write_branch, and nothing else"),
+                ("Merge", "not on the adapter interface"),
+                ("Pull request", "not here — Release opens it, after the gate"),
+                ("Control point moved", "no — pushing a branch is not one of the three"),
+            ],
+        ),
+        notes.text("Commit message, with the trailers that make the run resolvable", message),
+        notes.fields(
+            "Files written",
+            [
+                (
+                    edit.path,
+                    # A deletion has no line count to report, and "0 lines" would read as an
+                    # emptied file rather than a removed one.
+                    "deleted"
+                    if edit.deleted
+                    else f"{len(edit.content.splitlines())} lines",
+                )
+                for edit in state.proposed_edits
+            ],
+        ),
+    )
     return state
 
 
@@ -94,6 +173,10 @@ def _commit_message(state: FlowState) -> str:
             f"kuwarden-root-run-id: {state.root_run_id}",
             f"kuwarden-policy-commit: {state.policy_commit}",
             f"kuwarden-risk-tier-at-push: {state.risk_tier}",
-            f"kuwarden-attempt: {state.retry_count}",
+            # The idempotency key, and it must be the OUTER loop's counter. `retry_count`
+            # is the Coder's inner one, which restarts at 0 on every invocation — using it
+            # made the second pass produce an identical message, which the adapters read as
+            # "this push already landed" and skipped, discarding the work silently.
+            f"kuwarden-attempt: {state.push_attempt}",
         ]
     )

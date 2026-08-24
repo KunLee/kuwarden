@@ -12,6 +12,7 @@ Runs against the real PostgreSQL from the compose stack, because the guard reads
 
 from __future__ import annotations
 
+import json
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -22,7 +23,9 @@ from fastapi.routing import APIRoute
 
 from engine.api.auth import Role, create_user
 from engine.api.main import _repo_config, app
+from engine.config import ConfigError
 from engine.db import connect
+from tests.conftest import KUWARDEN_YAML
 
 #: A password that satisfies the length rule without being a plausible real one.
 PASSWORD = "correct-horse-battery-staple"
@@ -81,6 +84,11 @@ def test_every_endpoint_declares_who_may_call_it() -> None:
         "/docs/oauth2-redirect": "schema",
         "/redoc": "schema",
         "/": "the Workbench itself",
+        "/api/applications/{app_id}/hooks/azure_devops": (
+            "a service hook has no session to present. Authenticated by a shared secret "
+            "compared with hmac.compare_digest, and refuses to run at all when "
+            "KUWARDEN_WEBHOOK_SECRET is unset — see test_a_service_hook_without_a_secret_is_refused"
+        ),
     }
 
     unguarded: list[str] = []
@@ -439,6 +447,38 @@ def test_an_azure_repos_url_parses() -> None:
     assert repo.repo == "sasagayo"
 
 
+def test_a_url_without_a_scheme_parses_the_same() -> None:
+    """Operators paste what is in front of them, and the address bar hides the scheme."""
+    assert _repo_config("github.com/KunLee/sasagayo").org == "KunLee"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.invalid/x",
+        "https://github.com",
+        "https://github.com/KunLee",
+        "https://dev.azure.com/kunleeing0494",
+        # Parses into a plausible RepoConfig from the wrong segments unless `_git` is required
+        # — org would become "dev.azure.com", and the 404 that follows names a repository the
+        # operator never typed.
+        "https://dev.azure.com/kunleeing0494/Sasagayo",
+    ],
+)
+def test_a_url_that_is_not_a_repository_says_so(url: str) -> None:
+    """It used to be an `IndexError` off the end of the segment list.
+
+    That reaches the operator as a 500 with no body — the least actionable failure this
+    endpoint can produce, for the most obvious kind of mistake. `ConfigError` is caught by both
+    callers, so it now surfaces as a named check failure instead.
+    """
+    with pytest.raises(ConfigError) as raised:
+        _repo_config(url)
+    # The message names the shape that was wanted. "Invalid URL" tells nobody what to type.
+    assert "expected" in str(raised.value)
+    assert url in str(raised.value)
+
+
 # --- the control point, after registration --------------------------------------------------
 
 
@@ -573,3 +613,673 @@ async def test_the_change_log_cannot_be_rewritten(accounts: dict[Role, str]) -> 
             )
         with pytest.raises(Exception, match="append-only"):
             await conn.execute("DELETE FROM app_changes WHERE app_id = $1", uuid.UUID(app_id))
+
+
+# --- the Azure DevOps service hook ---------------------------------------------------------
+#
+# The endpoint is reachable without a session, so these are the only thing standing between
+# the internet and something that spends model budget and writes code.
+
+
+def _updated(state: str | None, tags: str = "kuwarden-auto", rev: int = 3) -> dict[str, object]:
+    """A `workitem.updated` payload. `state=None` is a save that changed something else."""
+    fields: dict[str, object] = {"System.AreaPath": {"oldValue": "A", "newValue": "B"}}
+    if state is not None:
+        fields = {"System.State": {"oldValue": "New", "newValue": state}}
+    return {
+        "eventType": "workitem.updated",
+        "resource": {
+            "workItemId": 29,
+            "rev": rev,
+            "fields": fields,
+            "revision": {"fields": {"System.Tags": tags}},
+        },
+    }
+
+
+@pytest.fixture
+async def hooked_app(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[uuid.UUID]:
+    """An application with an azure_devops trigger that declares a ready state."""
+    monkeypatch.setenv("KUWARDEN_WEBHOOK_SECRET", "shared-secret-for-the-test")
+    app_id = uuid.uuid4()
+    async with connect() as conn:
+        await conn.execute(
+            "INSERT INTO app_registry (id, name, repo_url, integration_model) "
+            "VALUES ($1,$2,$3,'gated_merge')",
+            app_id, f"hook-{app_id.hex[:8]}", "https://example.invalid/hooked",
+        )
+        await conn.execute(
+            "INSERT INTO app_triggers (id, app_id, provider, project, organisation, label, "
+            "ready_state) VALUES ($1,$2,'azure_devops','Sasagayo','org','kuwarden-auto',"
+            "'Ready for Agent')",
+            uuid.uuid4(), app_id,
+        )
+    try:
+        yield app_id
+    finally:
+        async with connect() as conn:
+            await conn.execute("DELETE FROM app_triggers WHERE app_id = $1", app_id)
+            await conn.execute("DELETE FROM app_registry WHERE id = $1", app_id)
+
+
+def _hook(app_id: uuid.UUID) -> str:
+    return f"/api/applications/{app_id}/hooks/azure_devops"
+
+
+async def test_a_service_hook_without_a_secret_is_refused(
+    hooked_app: uuid.UUID, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fail closed. An unset secret must not mean "accept anyone"."""
+    monkeypatch.delenv("KUWARDEN_WEBHOOK_SECRET", raising=False)
+    async with _client() as client:
+        response = await client.post(_hook(hooked_app), json=_updated("Ready for Agent"))
+    assert response.status_code == 503
+
+
+async def test_a_service_hook_with_the_wrong_token_is_refused(hooked_app: uuid.UUID) -> None:
+    async with _client() as client:
+        response = await client.post(
+            _hook(hooked_app),
+            json=_updated("Ready for Agent"),
+            headers={"X-KuWarden-Token": "not-the-secret"},
+        )
+    assert response.status_code == 401
+
+
+async def test_a_save_that_did_not_change_the_state_starts_nothing(
+    hooked_app: uuid.UUID,
+) -> None:
+    """The distinction the whole design rests on — migration 006.
+
+    Azure DevOps fires `workitem.updated` for a reassignment or a typo fix. Only the fields
+    that actually changed appear in `resource.fields`, so a save that left the state alone
+    carries no `System.State` at all.
+    """
+    async with _client() as client:
+        response = await client.post(
+            _hook(hooked_app),
+            json=_updated(None),
+            headers={"X-KuWarden-Token": "shared-secret-for-the-test"},
+        )
+    assert response.status_code == 200
+    assert response.json()["started"] is False
+
+
+async def test_a_move_into_another_state_starts_nothing(hooked_app: uuid.UUID) -> None:
+    async with _client() as client:
+        response = await client.post(
+            _hook(hooked_app),
+            json=_updated("Active"),
+            headers={"X-KuWarden-Token": "shared-secret-for-the-test"},
+        )
+    assert response.json()["started"] is False
+
+
+async def test_the_ready_state_without_the_tag_starts_nothing(hooked_app: uuid.UUID) -> None:
+    async with _client() as client:
+        response = await client.post(
+            _hook(hooked_app),
+            json=_updated("Ready for Agent", tags="bug; needs-triage"),
+            headers={"X-KuWarden-Token": "shared-secret-for-the-test"},
+        )
+    assert response.json()["started"] is False
+
+
+async def test_a_trigger_with_no_ready_state_refuses_to_fire(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a transition to test, every state change qualifies — the rejected design."""
+    monkeypatch.setenv("KUWARDEN_WEBHOOK_SECRET", "shared-secret-for-the-test")
+    app_id = uuid.uuid4()
+    async with connect() as conn:
+        await conn.execute(
+            "INSERT INTO app_registry (id, name, repo_url, integration_model) "
+            "VALUES ($1,$2,$3,'gated_merge')",
+            app_id, f"hook-{app_id.hex[:8]}", "https://example.invalid/nostate",
+        )
+        await conn.execute(
+            "INSERT INTO app_triggers (id, app_id, provider, project, organisation, label) "
+            "VALUES ($1,$2,'azure_devops','Sasagayo','org','kuwarden-auto')",
+            uuid.uuid4(), app_id,
+        )
+    try:
+        async with _client() as client:
+            response = await client.post(
+                _hook(app_id),
+                json=_updated("Ready for Agent"),
+                headers={"X-KuWarden-Token": "shared-secret-for-the-test"},
+            )
+        assert response.status_code == 409
+        assert "ready_state" in response.json()["detail"]
+    finally:
+        async with connect() as conn:
+            await conn.execute("DELETE FROM app_triggers WHERE app_id = $1", app_id)
+            await conn.execute("DELETE FROM app_registry WHERE id = $1", app_id)
+
+
+async def test_a_qualifying_transition_starts_exactly_one_run(
+    hooked_app: uuid.UUID, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """And a redelivery of the same revision starts none.
+
+    `_launch` is replaced rather than reaching Temporal: what is under test is the decision to
+    start and the id it derives, not Temporal's ability to run a workflow. The second call
+    raises what Temporal raises for a duplicate id, which is the behaviour being relied on.
+    """
+    from temporalio.exceptions import WorkflowAlreadyStartedError
+
+    import engine.api.main as api
+
+    launched: list[str] = []
+
+    async def fake_launch(
+        _client: object,
+        _app: uuid.UUID,
+        ticket: str,
+        provider: str,
+        workflow_id: str,
+        *,
+        app_name: str = "",
+        reject_duplicate: bool = False,
+    ) -> tuple[uuid.UUID, str]:
+        # The hook must ask for REJECT_DUPLICATE. Temporal's default only refuses an id while
+        # the previous run is open, so without this a redelivery arriving after the run
+        # finished starts a second one — and a webhook retry is exactly that case.
+        assert reject_duplicate is True, "the hook path must reject duplicate workflow ids"
+        # Carried so Triage can refuse a run whose application does not match the
+        # configuration the worker resolved for it.
+        assert app_name, "the hook path must name the application the run is for"
+        if workflow_id in launched:
+            raise WorkflowAlreadyStartedError(workflow_id, "DeliveryFlow")
+        launched.append(workflow_id)
+        assert (ticket, provider) == ("29", "azure_devops")
+        return uuid.uuid4(), workflow_id
+
+    async def fake_connect(*_a: object, **_k: object) -> object:
+        return object()
+
+    monkeypatch.setattr(api, "_launch", fake_launch)
+    monkeypatch.setattr("temporalio.client.Client.connect", fake_connect)
+
+    headers = {"X-KuWarden-Token": "shared-secret-for-the-test"}
+    async with _client() as client:
+        url, body = _hook(hooked_app), _updated("Ready for Agent")
+        first = await client.post(url, json=body, headers=headers)
+        second = await client.post(url, json=body, headers=headers)
+
+    assert first.json()["started"] is True
+    # The id is derived from the work item and the revision that moved it, so the redelivery
+    # collides deliberately.
+    assert second.json()["started"] is False
+    assert len(launched) == 1
+
+
+#: Azure DevOps' own sample payload, as delivered by the subscription dialog's Test button.
+#: Trimmed to the fields this endpoint reads, and otherwise verbatim — including the three
+#: different id numbers, which is the point of keeping it.
+ADO_TEST_BUTTON_PAYLOAD: dict[str, object] = {
+    "eventType": "workitem.updated",
+    "publisherId": "tfs",
+    "resource": {
+        # The update record's id. NOT the work item.
+        "id": 2,
+        # Zero in the sample, and zero is falsy — the reason this payload is worth keeping.
+        "workItemId": 0,
+        "rev": 2,
+        "fields": {
+            "System.Rev": {"oldValue": "1", "newValue": "2"},
+            "System.State": {"oldValue": "New", "newValue": "Approved"},
+            "System.Reason": {
+                "oldValue": "New defect reported",
+                "newValue": "Approved by the Product Owner",
+            },
+        },
+        "revision": {
+            # The work item.
+            "id": 5,
+            "rev": 2,
+            "fields": {
+                "System.TeamProject": "FabrikamCloud",
+                "System.State": "New",
+                "System.Title": "Some great new idea!",
+            },
+        },
+    },
+}
+
+
+async def test_the_test_button_payload_is_handled_and_admits_nothing(
+    hooked_app: uuid.UUID,
+) -> None:
+    """Azure DevOps' sample moves to 'Approved', so a correct receiver declines it.
+
+    Worth asserting because the Test button is how an operator checks their subscription, and
+    "started: false" there is success rather than the failure it looks like.
+    """
+    async with _client() as client:
+        response = await client.post(
+            _hook(hooked_app),
+            json=ADO_TEST_BUTTON_PAYLOAD,
+            headers={"X-KuWarden-Token": "shared-secret-for-the-test"},
+        )
+    assert response.status_code == 200
+    assert response.json()["started"] is False
+    assert "Approved" in response.json()["reason"]
+
+
+async def test_the_work_item_is_never_taken_from_the_update_record_id(
+    hooked_app: uuid.UUID, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`resource.id`, `resource.workItemId` and `revision.id` are three different numbers.
+
+    With `workItemId` falsy, the work item must come from `revision.id` (5) and never from
+    `resource.id` (2) — which identifies the update, not the ticket. Reading the wrong one
+    starts a real run against a ticket nobody asked about, and every other assertion in this
+    file would still pass.
+    """
+    import engine.api.main as api
+
+    seen: list[str] = []
+
+    async def fake_launch(
+        _client: object,
+        _app: uuid.UUID,
+        ticket: str,
+        _provider: str,
+        workflow_id: str,
+        **_kw: object,
+    ) -> tuple[uuid.UUID, str]:
+        seen.append(ticket)
+        return uuid.uuid4(), workflow_id
+
+    async def fake_connect(*_a: object, **_k: object) -> object:
+        return object()
+
+    monkeypatch.setattr(api, "_launch", fake_launch)
+    monkeypatch.setattr("temporalio.client.Client.connect", fake_connect)
+
+    # The sample payload, moved into the state this application admits.
+    payload = json.loads(json.dumps(ADO_TEST_BUTTON_PAYLOAD))
+    payload["resource"]["fields"]["System.State"]["newValue"] = "Ready for Agent"
+    payload["resource"]["revision"]["fields"]["System.Tags"] = "kuwarden-auto"
+
+    async with _client() as client:
+        response = await client.post(
+            _hook(hooked_app),
+            json=payload,
+            headers={"X-KuWarden-Token": "shared-secret-for-the-test"},
+        )
+
+    assert response.json()["started"] is True
+    assert seen == ["5"], "the work item is revision.id, not resource.id"
+
+
+# --- amending a trigger ----------------------------------------------------------------------
+
+
+async def test_a_trigger_can_be_amended_without_being_recreated(
+    hooked_app: uuid.UUID, accounts: dict[Role, str]
+) -> None:
+    """The whole point: no window in which the application accepts no work.
+
+    Delete-and-recreate leaves `POST /runs` refusing and a service hook 404ing for as long as
+    the gap lasts, to change one field.
+    """
+    async with connect() as conn:
+        trigger_id = await conn.fetchval(
+            "SELECT id FROM app_triggers WHERE app_id = $1", hooked_app
+        )
+
+    async with _signed_in(accounts[Role.ADMIN]) as client:
+        response = await client.patch(
+            f"/api/applications/{hooked_app}/triggers/{trigger_id}",
+            json={"ready_state": "Approved", "max_story_points": 8},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["ready_state"] == "Approved"
+
+    async with connect() as conn:
+        row = await conn.fetchrow(
+            "SELECT label, ready_state, max_story_points FROM app_triggers WHERE id = $1",
+            trigger_id,
+        )
+    assert row["ready_state"] == "Approved"
+    assert row["max_story_points"] == 8
+    # Untouched, because it was not in the body.
+    assert row["label"] == "kuwarden-auto"
+
+
+async def test_an_omitted_field_is_left_alone_and_an_explicit_null_clears_it(
+    hooked_app: uuid.UUID, accounts: dict[Role, str]
+) -> None:
+    """`null` and absent must not mean the same thing.
+
+    If they did there would be no way to stop requiring a ready state, and unsetting one is
+    exactly the amendment somebody eventually needs.
+    """
+    async with connect() as conn:
+        trigger_id = await conn.fetchval(
+            "SELECT id FROM app_triggers WHERE app_id = $1", hooked_app
+        )
+
+    async with _signed_in(accounts[Role.ADMIN]) as client:
+        cleared = await client.patch(
+            f"/api/applications/{hooked_app}/triggers/{trigger_id}",
+            json={"ready_state": None},
+        )
+    assert cleared.status_code == 200
+
+    async with connect() as conn:
+        row = await conn.fetchrow(
+            "SELECT label, ready_state FROM app_triggers WHERE id = $1", trigger_id
+        )
+    assert row["ready_state"] is None
+    assert row["label"] == "kuwarden-auto", "an omitted field must not be cleared"
+
+
+async def test_identity_fields_are_not_amendable(
+    hooked_app: uuid.UUID, accounts: dict[Role, str]
+) -> None:
+    """Provider, organisation and project decide *which* board a rule governs.
+
+    Amending them in place would silently re-point an existing rule at a different board, so
+    the model forbids extra keys — the request is refused by name rather than answered with a
+    200 that changed nothing, which is what dropping unknown keys would produce.
+    """
+    async with connect() as conn:
+        trigger_id = await conn.fetchval(
+            "SELECT id FROM app_triggers WHERE app_id = $1", hooked_app
+        )
+
+    async with _signed_in(accounts[Role.ADMIN]) as client:
+        response = await client.patch(
+            f"/api/applications/{hooked_app}/triggers/{trigger_id}",
+            json={"project": "SomeOtherProject"},
+        )
+
+    assert response.status_code == 422
+    async with connect() as conn:
+        project = await conn.fetchval(
+            "SELECT project FROM app_triggers WHERE id = $1", trigger_id
+        )
+    assert project == "Sasagayo"
+
+
+async def test_a_viewer_cannot_amend_a_trigger(
+    hooked_app: uuid.UUID, accounts: dict[Role, str]
+) -> None:
+    async with connect() as conn:
+        trigger_id = await conn.fetchval(
+            "SELECT id FROM app_triggers WHERE app_id = $1", hooked_app
+        )
+    async with _signed_in(accounts[Role.VIEWER]) as client:
+        response = await client.patch(
+            f"/api/applications/{hooked_app}/triggers/{trigger_id}",
+            json={"ready_state": "Anything"},
+        )
+    assert response.status_code == 403
+
+
+async def test_diagnostics_uses_the_stored_workflow_id_not_a_rebuilt_one(
+    accounts: dict[Role, str]
+) -> None:
+    """A hook-started run is keyed on the work item, not on the run id.
+
+    `kuwarden-{run_id}` is the manual path's convention only. Rebuilding it here looked up a
+    workflow that never existed and told the operator their history was missing, for a run
+    whose history was fine — so the id must come from the row that recorded it.
+    """
+    app_id, run_id = uuid.uuid4(), uuid.uuid4()
+    stored = f"kuwarden-ado-{app_id}-29-r14"
+    asked: list[str] = []
+
+    class FakeHandle:
+        async def fetch_history_events(self) -> AsyncIterator[object]:
+            # An async generator that raises on first use: what Temporal does for an id it
+            # does not know. The endpoint turns it into the "history unavailable" 404, which
+            # is the path the bug showed up on.
+            for _ in ():
+                yield _
+            raise RuntimeError("workflow not found")
+
+    class FakeClient:
+        def get_workflow_handle(self, workflow_id: str) -> FakeHandle:
+            asked.append(workflow_id)
+            return FakeHandle()
+
+    async def fake_connect(*_a: object, **_k: object) -> FakeClient:
+        return FakeClient()
+
+    async with connect() as conn:
+        await conn.execute(
+            "INSERT INTO app_registry (id, name, repo_url, integration_model) "
+            "VALUES ($1,$2,$3,'gated_merge')",
+            app_id, f"diag-{app_id.hex[:8]}", "https://example.invalid/diag",
+        )
+        await conn.execute(
+            "INSERT INTO flow_runs (id, root_run_id, app_id, workflow_id, ticket_system, "
+            "ticket_id, risk_tier, status, schema_version, policy_commit, policy_bundle) "
+            "VALUES ($1,$1,$2,$3,'azure_devops','29','low','rejected',1,'unpinned:test','{}')",
+            run_id, app_id, stored,
+        )
+    try:
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr("temporalio.client.Client.connect", fake_connect)
+            async with _signed_in(accounts[Role.VIEWER]) as client:
+                await client.get(f"/api/runs/{run_id}/diagnostics")
+        assert asked == [stored], f"asked Temporal for {asked}, expected the stored id"
+    finally:
+        async with connect() as conn:
+            await conn.execute("DELETE FROM flow_runs WHERE id = $1", run_id)
+            await conn.execute("DELETE FROM app_registry WHERE id = $1", app_id)
+
+
+# --- arming and disarming verifiers ---------------------------------------------------------
+
+
+async def test_disarming_a_verifier_makes_it_advisory_not_absent(
+    hooked_app: uuid.UUID, accounts: dict[Role, str]
+) -> None:
+    """Off must not mean skipped.
+
+    A skipped verifier saves a model call and destroys the evidence. An advisory one still
+    runs, still records findings, and still reaches the trail — it simply cannot abort. For a
+    product whose value is the record, only one of those is an acceptable meaning for "off".
+    """
+    async with connect() as conn:
+        await conn.execute(
+            "INSERT INTO app_config (app_id, yaml, updated_by) VALUES ($1,$2,'test')",
+            hooked_app, KUWARDEN_YAML,
+        )
+
+    async with _signed_in(accounts[Role.ADMIN]) as client:
+        response = await client.put(
+            f"/api/applications/{hooked_app}/verifiers",
+            json={"blocking": {"test_evidence": False}},
+        )
+    assert response.status_code == 200
+    assert response.json()["advisory"] == ["test_evidence"]
+
+    # The other three are untouched — a partial request must not disarm what it did not name.
+    blocking = {v["name"]: v["blocking"] for v in response.json()["verifiers"]}
+    assert blocking == {
+        "correctness": True,
+        "security": True,
+        "test_evidence": False,
+        "regression_risk": True,
+    }
+
+
+async def test_re_arming_does_not_duplicate_the_block(
+    hooked_app: uuid.UUID, accounts: dict[Role, str]
+) -> None:
+    """The rewrite is textual, so it has to be idempotent or the file grows a block per click."""
+    async with connect() as conn:
+        await conn.execute(
+            "INSERT INTO app_config (app_id, yaml, updated_by) VALUES ($1,$2,'test')",
+            hooked_app, KUWARDEN_YAML,
+        )
+
+    async with _signed_in(accounts[Role.ADMIN]) as client:
+        await client.put(
+            f"/api/applications/{hooked_app}/verifiers",
+            json={"blocking": {"test_evidence": False}},
+        )
+        again = await client.put(
+            f"/api/applications/{hooked_app}/verifiers",
+            json={"blocking": {"test_evidence": True}},
+        )
+    assert again.json()["advisory"] == []
+
+    async with connect() as conn:
+        stored = str(await conn.fetchval("SELECT yaml FROM app_config WHERE app_id=$1", hooked_app))
+    assert stored.count("verification:") == 1
+    # The comments in a kuwarden.yaml carry the reasoning for its settings, which is most of
+    # what makes the file reviewable. A YAML round-trip would have discarded every one.
+    assert stored.count("#") >= KUWARDEN_YAML.count("#")
+
+
+async def test_an_unknown_verifier_is_refused(
+    hooked_app: uuid.UUID, accounts: dict[Role, str]
+) -> None:
+    """A typo would otherwise disable nothing while reading as though it had."""
+    async with _signed_in(accounts[Role.ADMIN]) as client:
+        response = await client.put(
+            f"/api/applications/{hooked_app}/verifiers",
+            json={"blocking": {"test_evidince": False}},
+        )
+    assert response.status_code == 422
+    assert "test_evidince" in response.json()["detail"]
+
+
+async def test_a_viewer_cannot_disarm_a_verifier(
+    hooked_app: uuid.UUID, accounts: dict[Role, str]
+) -> None:
+    async with _signed_in(accounts[Role.VIEWER]) as client:
+        response = await client.put(
+            f"/api/applications/{hooked_app}/verifiers",
+            json={"blocking": {"test_evidence": False}},
+        )
+    assert response.status_code == 403
+
+
+# --- stopping a run -------------------------------------------------------------------------
+
+
+async def test_terminating_a_run_records_who_did_it_and_what_was_left_behind(
+    accounts: dict[Role, str], suspended_run: uuid.UUID, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run stopped by a person gets its own outcome, not `aborted`.
+
+    Two facts have to survive, and neither is recoverable afterwards. **Who** stopped it —
+    the flow did not decide this, a named human did, and `aborted` would say the opposite.
+    And **what is still on the remote** — terminating skips compensation, so the branch this
+    run pushed is still there, and an operator who finds that out a week later has already
+    lost the chance to decide about it.
+    """
+    async with connect() as conn:
+        await conn.execute(
+            "INSERT INTO flow_events (run_id, seq, kind, node_id, payload) "
+            "VALUES ($1, 2, 'branch_pushed', 'push', $2::jsonb)",
+            suspended_run,
+            '{"branch": "kuwarden/pay-1234-abcd1234", "commit": "c0ffee12"}',
+        )
+
+    terminated: list[str] = []
+
+    class _Handle:
+        async def terminate(self, reason: str = "") -> None:
+            terminated.append(reason)
+
+    class _Client:
+        def get_workflow_handle(self, workflow_id: str) -> _Handle:
+            return _Handle()
+
+    async def _connect(*_: object, **__: object) -> _Client:
+        return _Client()
+
+    monkeypatch.setattr("temporalio.client.Client.connect", _connect)
+
+    async with _signed_in(accounts[Role.ADMIN]) as client:
+        response = await client.post(f"/api/runs/{suspended_run}/terminate")
+
+    assert response.status_code == 202
+    assert response.json()["branch_left_behind"] == "kuwarden/pay-1234-abcd1234"
+    assert terminated
+    assert accounts[Role.ADMIN] in terminated[0]
+
+    async with connect() as conn:
+        status = await conn.fetchval("SELECT status FROM flow_runs WHERE id = $1", suspended_run)
+        payload = await conn.fetchval(
+            "SELECT payload FROM flow_events WHERE run_id = $1 AND kind = 'run_terminated'",
+            suspended_run,
+        )
+    assert status == "terminated", "not 'aborted' — the flow did not decide this"
+    recorded = json.loads(payload)
+    assert recorded["branch_left_behind"] == "kuwarden/pay-1234-abcd1234"
+    assert "compensation did not run" in recorded["detail"]
+
+
+async def test_a_finished_run_cannot_be_terminated(
+    accounts: dict[Role, str], suspended_run: uuid.UUID
+) -> None:
+    """Nothing to stop, and a `terminated` row over a succeeded run would rewrite its outcome."""
+    async with connect() as conn:
+        await conn.execute("UPDATE flow_runs SET status = 'succeeded' WHERE id = $1", suspended_run)
+
+    async with _signed_in(accounts[Role.ADMIN]) as client:
+        refused = await client.post(f"/api/runs/{suspended_run}/terminate")
+
+    assert refused.status_code == 409
+    assert "there is nothing to stop" in refused.json()["detail"]
+
+
+async def test_an_approver_cannot_terminate_a_run(
+    accounts: dict[Role, str], suspended_run: uuid.UUID
+) -> None:
+    """Approving is a judgment about the change; killing a run is an act on the platform.
+
+    An approver who disagrees with a change rejects it at the gate, which compensates and
+    leaves no branch. Terminating skips all of that, so it is deliberately a different role.
+    """
+    async with _signed_in(accounts[Role.APPROVER]) as client:
+        refused = await client.post(f"/api/runs/{suspended_run}/terminate")
+    assert refused.status_code == 403
+
+
+async def test_the_evidence_shows_the_tier_the_gate_actually_used(
+    accounts: dict[Role, str], suspended_run: uuid.UUID
+) -> None:
+    """An approver must be shown the tier that put the decision in front of them.
+
+    `flow_runs.risk_tier` is written once, at run start, and holds the *provisional* tier
+    intake guessed from the ticket's labels. Final tiering runs later, over the actual diff,
+    and only ever raises. Reading the column here showed "risk tier: low" on a page that was
+    demanding two signatures because a change had touched `app/layout.tsx` and been raised to
+    high — the document understating the very reason it existed.
+
+    The reason travels with it. "It is high" and "intake guessed low and the diff raised it,
+    because of this rule" are different facts, and an approver can only weigh the second.
+    """
+    async with connect() as conn:
+        await conn.execute(
+            "INSERT INTO flow_events (run_id, seq, kind, node_id, payload) "
+            "VALUES ($1, 9, 'risk_tier_final', NULL, $2::jsonb)",
+            suspended_run,
+            json.dumps(
+                {
+                    "tier": "high",
+                    "provisional": "low",
+                    "reason": "app/layout.tsx matches high_paths '**/layout.*'",
+                    "files_changed": 1,
+                }
+            ),
+        )
+
+    async with _signed_in(accounts[Role.VIEWER]) as client:
+        document = (await client.get(f"/api/runs/{suspended_run}/evidence")).json()["document"]
+
+    assert document["risk_tier"] == "high", "the authoritative tier, not the intake guess"
+    assert document["provisional_risk_tier"] == "low"
+    assert "high_paths" in document["risk_tier_reason"]

@@ -26,14 +26,24 @@ with workflow.unsafe.imports_passed_through():
         EventRecorded,
         RunEnded,
         RunStarted,
+        RunStatusChanged,
         record_event,
         record_run_ended,
         record_run_started,
+        record_run_status,
     )
     from engine.activities.nodes import NodeInput, run_node
     from engine.activities.notify import GateNotice, notify_gate_reached
-    from engine.policy.tiering import assert_not_lowered, raise_to, required_approvals
-    from engine.state import SCHEMA_VERSION, Approval, FlowState, RiskTier, Ticket
+    from engine.config import ALL_VERIFIERS as _ALL_VERIFIER_NAMES
+    from engine.policy.tiering import raise_to, required_approvals, tier_for_diff
+    from engine.state import (
+        SCHEMA_VERSION,
+        Approval,
+        FlowState,
+        RiskRules,
+        RiskTier,
+        Ticket,
+    )
 
 VERIFIERS = (
     "verifier.correctness",
@@ -53,7 +63,18 @@ class FlowInput:
     ticket: Ticket
     policy_commit: str
     policy_bundle: dict[str, Any] = field(default_factory=dict)
+    #: The registered application's name, from `app_registry`. Checked in Triage against the
+    #: `kuwarden.yaml` the worker loaded — see `assert_configured_for`.
+    app_name: str = ""
     provisional_risk_tier: RiskTier = "low"
+    #: The second tiering stage's rules, passed as data because workflow code may not read
+    #: configuration from disk. Empty means no rule escalates — ADR 0002.
+    risk_rules: RiskRules = field(default_factory=RiskRules)
+    #: Verifier ids (bare, no `verifier.` prefix) that may abort the run. Anything not
+    #: named here still runs and still records findings — it simply cannot block.
+    #: Empty means the default, which is all four blocking; a deployment that meant
+    #: "none may block" has to say so by naming none of them explicitly in config.
+    blocking_verifiers: tuple[str, ...] = ()
     budget_cents_allowed: int = 0
     max_coder_retries: int = 3
     parent_run_id: UUID | None = None
@@ -157,7 +178,18 @@ def _verifier_brief(state: FlowState) -> FlowState:
 
 
 class _Rejected(Exception):
-    """The change did not survive. Routed to compensation, not to a crash."""
+    """The change did not survive. Routed to compensation, not to a crash.
+
+    Carries the verifiers that actually caused the rejection. Recomputing them in the handler
+    is what produced a run whose record named the one verifier that was *not* permitted to
+    block it: the handler read `self._latest`, and the verifier fan-out leaves that holding
+    whichever branch finished last. The reason travels with the exception so it cannot be
+    re-derived from state that no longer describes the decision.
+    """
+
+    def __init__(self, reason: str, falsified_by: list[str] | None = None) -> None:
+        super().__init__(reason)
+        self.falsified_by = falsified_by or []
 
 
 @workflow.defn(name="DeliveryFlow")
@@ -201,6 +233,7 @@ class DeliveryFlow:
             run_id=params.run_id,
             root_run_id=root_run_id,
             parent_run_id=params.parent_run_id,
+            app_name=params.app_name,
             ticket=params.ticket,
             policy_commit=params.policy_commit,
             policy_bundle=params.policy_bundle,
@@ -230,8 +263,20 @@ class DeliveryFlow:
             state = await self._deliver(state, params)
             self._status = "succeeded"
         except _Rejected as rejected:
-            await self._emit("aborting", payload={"reason": str(rejected)})
-            state = await self._node_step("compensate", self._latest or state)
+            # The failing verifiers are named here, not left to the reader to infer from a
+            # count. `verifiers_completed` records "3 of 4 passed", which says a change was
+            # refused and destroys the reason — the half an approver and an auditor both need.
+            # The findings themselves go into the Compensate node's own record.
+            await self._emit(
+                "aborting",
+                payload={"reason": str(rejected), "falsified_by": rejected.falsified_by},
+            )
+            doomed = self._latest or state
+            # Carried onto the state because `verifications` cannot distinguish a review that
+            # stopped the change from one that merely objected, and Compensate writes the note
+            # a human reads first.
+            doomed.rejected_by = rejected.falsified_by
+            state = await self._node_step("compensate", doomed)
             await self._emit_cleanup(state)
             self._status = "rejected"
         except Exception as exc:
@@ -273,7 +318,10 @@ class DeliveryFlow:
         # ③ ⇄ ④. The feedback edge is the mechanism; retrying without it is repeated
         # guessing. Bounded, because an unbounded loop is an unbounded bill.
         for attempt in range(params.max_coder_retries + 1):
-            state.retry_count = attempt
+            # `push_attempt`, not `retry_count`: the Coder's inner loop owns that one and
+            # assigns it from 0 every time it runs, so anything set here would be overwritten
+            # before Push ever read it.
+            state.push_attempt = attempt
             state = await self._node_step("coder", state)
 
             # Pushed before it is graded, because CI cannot run on a branch that does not
@@ -333,25 +381,96 @@ class DeliveryFlow:
             )
 
         # Second and authoritative tiering stage — the first point at which a diff exists.
-        state.risk_tier = self._final_tier(state)
-        await self._emit("risk_tier_final", payload={"tier": state.risk_tier})
+        provisional = state.risk_tier
+        state.risk_tier, tier_reason = self._final_tier(state, params)
+        # Carried on the state, not only emitted. The Reporter posts to the ticket, where
+        # a bare "risk tier high" on a change the ticket called routine reads as the
+        # system being arbitrary.
+        state.risk_tier_reason = tier_reason
+        state.provisional_risk_tier = provisional
+        await self._emit(
+            "risk_tier_final",
+            payload={
+                "tier": state.risk_tier,
+                # Both, because "it was already high" and "the diff made it high" are
+                # different facts and only the pair shows which stage decided the gate.
+                "provisional": provisional,
+                "reason": tier_reason,
+                "files_changed": len(state.diff.files) if state.diff else 0,
+            },
+        )
 
         state = await self._verify(state)
-        if not all(v.passed for v in state.verifications):
-            raise _Rejected("a verifier falsified the change")
+
+        # An advisory verifier still ran, still recorded findings, and still reached the audit
+        # trail — it simply does not stop the change. Skipping it entirely would have saved a
+        # model call and destroyed the evidence, which is the wrong trade for a product whose
+        # value is the record.
+        blocking = set(params.blocking_verifiers) or set(_ALL_VERIFIER_NAMES)
+        falsified = [
+            v for v in state.verifications if not v.passed and v.verifier in blocking
+        ]
+        overridden = [
+            v.verifier for v in state.verifications if not v.passed and v.verifier not in blocking
+        ]
+        state.advisory_objections = overridden
+        if overridden:
+            # Named on its own row. A verifier that objected and was not allowed to stop the
+            # change is the single fact an approver most needs and would never infer from a
+            # count of how many passed.
+            await self._emit(
+                "verifier_overridden",
+                payload={
+                    "advisory": overridden,
+                    "detail": "these verifiers falsified the change and were not permitted to "
+                    "block it, because this application declares them advisory",
+                },
+            )
+        if falsified:
+            # Only the blocking ones. An advisory verifier that objected is on its own
+            # `verifier_overridden` row and did not cause this; naming it here would say the
+            # toggle failed to do the one thing it exists to do.
+            raise _Rejected(
+                "a verifier falsified the change", [v.verifier for v in falsified]
+            )
 
         state = await self._gate(state, params)
-        return await self._node_step("release", state)
+        state = await self._node_step("release", state)
 
-    def _final_tier(self, state: FlowState) -> RiskTier:
-        """Rules-first, over the actual diff.
+        # Invariant 11, and the row it exists for. `authorized` is claimed here and nowhere
+        # else in this flow, because a merge KuWarden performed under a policy it evaluated is
+        # the one effect it actually gated. A pull request left open is not an effect at all,
+        # so no row is written rather than a weaker one — `observed` would be a claim that we
+        # watched something happen, and nothing happened.
+        if state.merged_commit:
+            await self._emit(
+                "external_effect",
+                node_id="release",
+                payload={
+                    "effect": "merge",
+                    "commit": state.merged_commit,
+                    "branch": state.branch,
+                    "target": state.base_branch,
+                    "risk_tier": state.risk_tier,
+                    # What made it authorised rather than merely done.
+                    "anchor": state.ci_result.source if state.ci_result else "none",
+                },
+                control_mode="authorized",
+            )
+        return state
 
-        The rules are empty while the nodes are stubs. What is being fixed now is that the
-        result may only ever move upward, at both stages, by anything.
+    def _final_tier(self, state: FlowState, params: FlowInput) -> tuple[RiskTier, str]:
+        """Rules-first, over the actual diff — ADR 0002's authoritative second stage.
+
+        Returns the reason alongside the tier so the audit row can say *why* a change needs
+        two approvers rather than none. `raise_to` is what enforces invariant 5 here: a diff
+        that no rule escalates keeps the provisional tier, and one the rules call `low` can
+        never pull down a tier something else already raised.
         """
-        proposed: RiskTier = state.risk_tier
-        assert_not_lowered(state.risk_tier, proposed)
-        return raise_to(state.risk_tier, proposed)
+        proposed, reason = tier_for_diff(state.risk_tier, state.diff, params.risk_rules)
+        # The rules may only ever argue upward. `raise_to` is total rather than raising,
+        # because a rule returning the current tier is the ordinary case, not a defect.
+        return raise_to(state.risk_tier, proposed), reason
 
     async def _verify(self, state: FlowState) -> FlowState:
         """⑤ Fan-out in fresh context.
@@ -366,12 +485,37 @@ class DeliveryFlow:
         results = await asyncio.gather(
             *(self._node_step(v, brief, record=False) for v in VERIFIERS)
         )
-        for result in results:
+        for verifier_id, result in zip(VERIFIERS, results, strict=True):
             state.verifications = [*state.verifications, *result.verifications]
+            # Emitted here rather than by `_node_step`, which runs the fan-out with
+            # `record=False`. Iterating `VERIFIERS` rather than completion order keeps the
+            # sequence numbers fixed: `asyncio.gather` preserves argument order regardless of
+            # which model replied first, so a replay numbers these four events identically.
+            if result.notes:
+                await self._emit("verifier_verdict", node_id=verifier_id, payload=result.notes)
+            # Cleared here because `_node_step` left them for us. `result` is a redacted brief
+            # that is discarded after this loop, so this is belt and braces — but the rule
+            # "notes describe exactly one execution" should not depend on knowing that.
+            result.notes = {}
+        # Names, not a count. "3 of 4 passed" records that a change was refused and destroys
+        # the one fact a reader wants first — which review objected. The findings themselves
+        # ride the per-verifier `verifier_verdict` rows and the Compensate node's record.
+        falsified = [v.verifier for v in state.verifications if not v.passed]
         await self._emit(
             "verifiers_completed",
-            payload={"passed": sum(1 for v in state.verifications if v.passed)},
+            payload={
+                "passed": sum(1 for v in state.verifications if v.passed),
+                "of": len(VERIFIERS),
+                "falsified_by": falsified,
+            },
         )
+        # Restores the invariant the fan-out breaks. `_node_step` publishes every activity
+        # result to `self._latest`, so four verifiers running under `asyncio.gather` leave it
+        # holding whichever branch replied last — a redacted brief carrying that one
+        # verifier's finding and nothing else. Compensate is handed `self._latest`, so
+        # without this it writes a rejection note naming one arbitrary verifier and drops the
+        # other three findings from the permanent record.
+        self._latest = state
         return state
 
     def _run_id_checked(self) -> UUID:
@@ -394,6 +538,10 @@ class DeliveryFlow:
             return state
 
         self._status = "suspended"
+        # Recorded, not merely remembered. The approval endpoint refuses a decision unless the
+        # row says `suspended`, and the Workbench hides the approval panel — so a gate that
+        # suspended only in this object's memory was a gate nobody could pass.
+        await self._set_status("suspended")
 
         # Sent once, before suspending. Nobody is watching a dashboard for a run that may sit
         # here for a day; without this the gate is a queue with no doorbell. The email is only
@@ -417,6 +565,9 @@ class DeliveryFlow:
             or sum(1 for a in self._approvals if a.approved) >= needed
         )
         self._status = "running"
+        # Back to running the moment a decision arrives, so a second decision on the same run
+        # is refused rather than silently accepted.
+        await self._set_status("running")
 
         # What the approver was shown, not merely that they clicked approve.
         state.approvals = [
@@ -459,7 +610,21 @@ class DeliveryFlow:
             await self._emit("node_failed", node_id=node_id, payload=_failure(exc))
             raise
         if record:
-            await self._emit("node_completed", node_id=node_id)
+            # The node's own account of what it read and decided, into the permanent record.
+            # Empty for a node that writes none, which is the pre-notes behaviour.
+            await self._emit("node_completed", node_id=node_id, payload=result.notes)
+        # Drained only once they have been recorded. Notes belong to one execution: left in
+        # place they would ride into the next node and be emitted again under its id, and the
+        # Coder's four attempts would each inherit the previous attempt's account of itself.
+        #
+        # Draining them under `record=False` too is what silently deleted every verifier's
+        # findings. That flag means "the caller emits these", and the caller — `_verify` —
+        # guards on `if result.notes`, which by then was always empty. So `verifier_verdict`
+        # could never fire for any run, and the only reason a rejected change ever named a
+        # finding at all was Compensate reading whichever brief `_latest` happened to hold.
+        # An unrecorded node's notes belong to its caller, which must emit and clear them.
+        if record:
+            result.notes = {}
         return result
 
     async def _execute(self, node_id: str, state: FlowState) -> FlowState:
@@ -492,6 +657,11 @@ class DeliveryFlow:
                     # Same reasoning: the same prompt under the same cap truncates at
                     # the same place, and each attempt is minutes and a full charge.
                     "LLMOutputTruncated",
+                    # A 400 says the request as sent can never be served. Most often, in
+                    # practice, an account that cannot be billed — which Anthropic returns
+                    # as `invalid_request_error` rather than a 402, so it was being retried
+                    # as though a payment problem were transient.
+                    "LLMRequestRejected",
                 ],
             ),
         )
@@ -505,6 +675,14 @@ class DeliveryFlow:
         """
         if state.cleanup:
             await self._emit("compensated", node_id="compensate", payload={"detail": state.cleanup})
+
+    async def _set_status(self, status: str) -> None:
+        """Persist the run's coarse status. Not the audit trail — `flow_events` is that."""
+        await workflow.execute_activity(
+            record_run_status,
+            RunStatusChanged(run_id=self._run_id_checked(), status=status),
+            start_to_close_timeout=AUDIT_TIMEOUT,
+        )
 
     async def _emit(
         self,

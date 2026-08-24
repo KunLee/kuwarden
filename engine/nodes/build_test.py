@@ -30,8 +30,9 @@ retrying spends budget on something the Coder cannot fix.
 from __future__ import annotations
 
 from engine.adapters.ci import await_verdict
-from engine.adapters.factory import ci_adapter
+from engine.adapters.factory import ci_adapter, scm_adapter
 from engine.errors import SandboxInfrastructureError
+from engine.nodes import notes
 from engine.nodes.base import NodeContext, context, node
 from engine.policy.protected_paths import assert_not_protected
 from engine.sandbox import ResourceLimits
@@ -59,16 +60,58 @@ async def build_test(state: FlowState) -> FlowState:
         # a fabricated verdict is exactly what the reality-anchor rule exists to prevent.
         state.sandbox_result = CIResult(exit_code=0, source="sandbox")
         state.ci_result = state.sandbox_result
+        state.notes = notes.compose(
+            "Nothing was executed — there was nothing executable",
+            notes.fields(
+                "Why no verdict was produced",
+                [
+                    ("Proposed edits", len(state.proposed_edits)),
+                    ("Sandbox", "configured" if ctx.sandbox else "none configured"),
+                    ("Recorded as", "exit 0, source sandbox"),
+                    # The distinction this whole node exists to preserve, at the one point it
+                    # is easiest to lose.
+                    ("Meaning", "no tests ran; this is not evidence that any test passed"),
+                ],
+            ),
+        )
         return state
 
     # The workspace is rebuilt here rather than shared with the Coder.
     #
     # Coder and Build & Test are separate Temporal activities, and Temporal is free to run
     # them on different workers — a host temp directory would simply not be there. So the
-    # workspace is reconstructed from state that travelled through workflow history, which
-    # also means a replay produces the same tree as the original run.
+    # workspace is reconstructed, and it must be reconstructed *whole*.
+    #
+    # It used to be built from `proposed_edits` alone — the changed files and nothing else.
+    # That survived undetected for as long as `test_command` was `pytest -q` against a
+    # repository with no tests, because collecting nothing succeeds whatever the directory
+    # holds. The moment the sandbox ran a real toolchain it failed instantly and for the
+    # wrong reason: three files in an empty directory, and eslint exiting 2 with "couldn't
+    # find eslint.config.js" — which the flow reads as *the change is broken* and sends back
+    # to the Coder, who cannot possibly fix it.
+    #
+    # So the tree is re-read at the commit the Coder pinned, and the edits are laid over it.
+    # Pinned, not re-resolved: the same commit the Coder worked against, so a branch moving
+    # under the run cannot change what is graded, and a replay produces the same tree.
     settings = ctx.config.sandbox
-    files = {edit.path: edit.content for edit in state.proposed_edits}
+    if not state.base_commit:
+        raise SandboxInfrastructureError(
+            "build_test reached without a pinned base commit; the Coder sets it and every "
+            "grading run must execute against the tree the change was written for"
+        )
+    repo = ctx.config.primary
+    scm = scm_adapter(repo, ctx.broker, transport=ctx.transport)
+    tree = await scm.read_tree(repo.ref(), state.base_commit)
+
+    files: dict[str, str | bytes] = dict(tree.files)
+    for edit in state.proposed_edits:
+        if edit.deleted:
+            # Removed rather than written empty. A deleted path recreated as an empty file is
+            # a different change, and the suite would be exercising something the diff took
+            # away — while still resolving every import of it.
+            files.pop(edit.path, None)
+        else:
+            files[edit.path] = edit.content
 
     try:
         async with materialise(files) as workspace:
@@ -114,6 +157,50 @@ async def build_test(state: FlowState) -> FlowState:
     # nothing and delays the retry.
     if result.exit_code == 0:
         await _anchor_to_ci(ctx, state)
+
+    anchored = state.ci_result is not None and state.ci_result.is_external_anchor
+    state.notes = notes.compose(
+        f"Tests exited {result.exit_code} in the sandbox — "
+        + (
+            "anchored against the project's own pipeline"
+            if anchored
+            else "not anchored against an external pipeline"
+        ),
+        notes.fields(
+            "Sandbox run — ours, and therefore not an independent witness",
+            [
+                ("Command", " ".join(settings.test_command)),
+                ("Image", settings.toolchain_image),
+                ("Exit code", result.exit_code),
+                ("Duration", f"{result.duration_ms} ms"),
+                ("Limits hit", result.limits_hit or "none"),
+                ("Files materialised", len(files)),
+                ("Isolation", state.sandbox_isolation or "not probed"),
+                ("Isolation gaps", state.sandbox_gaps or "none"),
+            ],
+        ),
+        notes.fields(
+            "Invariant 3 — was the verdict read from an external system of record?",
+            [
+                ("CI section declared", "yes" if ctx.config.ci is not None else "no"),
+                ("Authoritative verdict", state.ci_result.source if state.ci_result else "none"),
+                (
+                    "Independent anchor",
+                    "yes"
+                    if anchored
+                    # The caveat is the whole point: a run whose CI was never consulted must
+                    # never read later like one whose CI passed.
+                    else "no — the sandbox verdict stands, and it is labelled as such",
+                ),
+                ("Pipeline URL", state.ci_result.url if state.ci_result else None),
+                ("Detail", state.ci_detail),
+            ],
+        ),
+        # Capped by `notes.text`. Test output is the single most useful thing here when a run
+        # loops, and it is also the single largest thing a node can produce.
+        notes.text("Test output — stdout", result.stdout, tail=True) if result.stdout else None,
+        notes.text("Test output — stderr", result.stderr, tail=True) if result.stderr else None,
+    )
     return state
 
 

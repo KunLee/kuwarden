@@ -52,6 +52,15 @@ class TicketAdapter(Protocol):
 
     async def comment(self, ref: TicketRef, body: str) -> None: ...
 
+    async def comments(self, ref: TicketRef) -> list[str]:
+        """Every comment body on the ticket, for callers that must not post twice.
+
+        A ticket API offers no idempotency token, so a caller whose activity retried cannot
+        tell a landed write from a lost one without reading back. Bodies rather than a richer
+        shape, because the only question asked of them is whether a marker is present.
+        """
+        ...
+
     async def transition(self, ref: TicketRef, state: str) -> None: ...
 
 
@@ -123,8 +132,15 @@ class BranchRef:
 
 @dataclass(frozen=True)
 class FileEdit:
+    """One path's new state in a push. `deleted` removes it; `content` is then empty.
+
+    Every adapter must honour `deleted` — dropping it would push a change that silently
+    leaves the removed file in place, which reads as a successful push of the wrong tree.
+    """
+
     path: str
     content: str
+    deleted: bool = False
 
 
 @dataclass(frozen=True)
@@ -286,3 +302,17 @@ class ScmAdapter(Protocol):
         title: str,
         description: str,
     ) -> PullRequest: ...
+
+    async def merge_pull_request(self, ref: RepoRef, number: str, commit: str) -> str:
+        """Merge an open pull request, and return the resulting commit on the target branch.
+
+        The control point of ADR 0004 model B, and the only method on this interface that
+        writes to a branch KuWarden does not own. It requires `SCM_MERGE`, which
+        `PRIVILEGED_KINDS` forbids any model-bearing node from holding (invariant 2) — so it
+        is reachable from a deterministic node and nowhere else.
+
+        `commit` is the head the caller graded, passed so the implementation can refuse if the
+        branch has moved since. Merging a revision nobody verified is the failure this
+        argument exists to prevent.
+        """
+        ...

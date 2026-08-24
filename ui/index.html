@@ -4,7 +4,26 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>ui</title>
+    <title>KuWarden Workbench</title>
+
+    <!--
+      IBM Plex — a face with engineering lineage rather than a neutral default, and one
+      superfamily covering both roles: Sans for the interface, Mono for the identifiers that
+      get compared rather than read.
+
+      OWED BEFORE THIS SHIPS: self-host these files. This product deploys into air-gapped
+      environments, where fonts.googleapis.com does not resolve — the page still renders,
+      because `--font-sans` and `--font-mono` both declare real fallback stacks, but it
+      renders in the system face and nobody is told why. A font served from a CDN is also a
+      request to a third party on every page load, which is its own conversation in a
+      sovereignty-focused product.
+    -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap"
+    />
   </head>
   <body>
     <div id="root"></div>

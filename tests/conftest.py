@@ -12,6 +12,7 @@ import asyncio
 import base64
 import json
 import uuid
+from pathlib import Path
 
 import httpx
 import pytest
@@ -34,6 +35,23 @@ load_dotenv()
 #: nobody can read is a control nobody exercises.
 _REGISTERED: list[uuid.UUID] = []
 
+#: Repositories no test application ever points at anything real.
+#:
+#: The safety net under `track_application`, which is opt-in and was therefore forgotten: five
+#: call sites created applications through the API and tracked none of them, leaving 27 rows in
+#: a developer's Workbench. Adding a sixth `track_application` call would have set the same
+#: trap for the seventh, so the sweep below keys on a property that is true *by construction*
+#: rather than on a call somebody has to remember.
+#:
+#: Matched on the *host*, not the full URL. Fixtures already use four distinct paths under two
+#: hosts, and a list of exact URLs is the same kind of thing as a list of tracked ids — correct
+#: until the next test, and silently wrong afterwards.
+#:
+#: Both hosts are safe to delete by. `example.invalid` is reserved by RFC 2606 and can never
+#: resolve; `acme` is the fixtures' stand-in organisation. Neither can name a repository an
+#: operator has actually registered.
+_FIXTURE_REPOS = ("https://example.invalid/%", "https://github.com/acme/%")
+
 
 def track_application(app_id: uuid.UUID) -> uuid.UUID:
     """Record an application row for teardown. Returns it, so it can wrap an insert."""
@@ -42,20 +60,33 @@ def track_application(app_id: uuid.UUID) -> uuid.UUID:
 
 
 async def _purge() -> None:
-    """Delete tracked applications and everything hanging off them.
+    """Delete test applications and everything hanging off them.
+
+    Two sources, deliberately. `_REGISTERED` is what the suite declared; the fixture sweep
+    catches what it forgot to. The sweep is the one that matters — the declared list has been
+    wrong at least once, and nothing about writing a new test makes it obvious that it must be
+    kept right.
 
     Ordered by foreign key: events, then runs, then the application's own rows. `flow_events`
     carries the append-only trigger from invariant 9, so it is disabled for exactly this
     statement and re-enabled in a `finally` — a teardown that left the audit table unprotected
     would be a worse bug than the one it is cleaning up after.
     """
-    if not _REGISTERED:
-        return
     from engine.db import connect
 
-    ids = list(_REGISTERED)
+    declared = list(_REGISTERED)
     _REGISTERED.clear()
     async with connect() as conn, conn.transaction():
+        swept = [
+            row["id"]
+            for row in await conn.fetch(
+                "SELECT id FROM app_registry WHERE repo_url LIKE ANY($1::text[])",
+                list(_FIXTURE_REPOS),
+            )
+        ]
+        ids = list({*declared, *swept})
+        if not ids:
+            return
         await conn.execute("ALTER TABLE flow_events DISABLE TRIGGER flow_events_no_update")
         try:
             await conn.execute(
@@ -156,6 +187,14 @@ class FakePlatform:
         self.ci_has_pipeline: bool = True
         self.ci_status: str = "completed"
         self.ci_conclusion: str = "success"
+        #: One conclusion per *commit*, for tests that need the pipeline to reject a
+        #: change and then accept the next one. Keyed on the SHA rather than popped from
+        #: a queue, because CI is polled repeatedly for the same commit and a queue would
+        #: advance on every poll instead of on every push.
+        self.ci_conclusions: list[str] | None = None
+        self._ci_seen: dict[str, str] = {}
+        #: Set by the `platform` fixture; the stub the nodes actually execute against.
+        self.sandbox: StubSandbox | None = None
         self.comments: list[str] = []
         self.labels: list[str] = ["kuwarden-auto"]
         #: The workflow state the fake ticket reports. Admission may require a specific
@@ -199,7 +238,27 @@ class FakePlatform:
             return self._messages(json.loads(request.content))
 
         if path.endswith("/comment"):
-            self.comments.append(json.loads(request.content)["body"]["content"][0]["content"][0]["text"])
+            if request.method == "GET":
+                # Read-back, for callers that must not post the same thing twice. Shaped as
+                # Jira's Atlassian Document Format so the adapter's own flattening is
+                # exercised rather than bypassed.
+                return httpx.Response(200, json={
+                    "comments": [
+                        {"body": {"content": [{"content": [{"text": body}]}]}}
+                        for body in self.comments
+                    ]
+                })
+            # Every text node, not just the first paragraph. A body that spans paragraphs
+            # was previously stored truncated, so a test could assert on a line the real
+            # ticket would have shown and the fake had silently dropped.
+            def _flatten(node: object) -> str:
+                if isinstance(node, dict):
+                    return str(node.get("text", "")) + "".join(
+                        _flatten(child) for child in node.get("content", []) or []
+                    )
+                return ""
+
+            self.comments.append(_flatten(json.loads(request.content)["body"]))
             return httpx.Response(201, json={})
         if "/issue/" in path:
             return httpx.Response(
@@ -311,9 +370,20 @@ class FakePlatform:
                 "html_url": "https://github.com/acme/payments-service/actions/runs/991",
                 "head_sha": head_sha,
                 "status": self.ci_status,
-                "conclusion": self.ci_conclusion if self.ci_status == "completed" else None,
+                "conclusion": self._conclusion_for(head_sha)
+                if self.ci_status == "completed"
+                else None,
             }
         ]
+
+    def _conclusion_for(self, head_sha: str) -> str:
+        """What the pipeline says about one commit, stably across repeated polls."""
+        if self.ci_conclusions is None:
+            return self.ci_conclusion
+        if head_sha not in self._ci_seen:
+            index = min(len(self._ci_seen), len(self.ci_conclusions) - 1)
+            self._ci_seen[head_sha] = self.ci_conclusions[index]
+        return self._ci_seen[head_sha]
 
     def _messages(self, body: dict[str, object]) -> httpx.Response:
         """The Anthropic Messages API, close enough to catch shape errors.
@@ -344,6 +414,25 @@ class FakePlatform:
             )
             return httpx.Response(200, json={
                 "id": "msg_verdict", "type": "message", "role": "assistant",
+                "model": body.get("model"),
+                "content": [{"type": "text", "text": payload}],
+                "stop_reason": "end_turn", "usage": usage,
+            })
+        if "choosing which files to read" in system:
+            # The Coder asks which files it needs before it asks for edits. Answering with
+            # the paths it is about to write keeps the flow tests exercising the real
+            # two-pass shape; answering with everything would hide a selection that
+            # silently omitted the file under test.
+            # Every path in the repository, and deliberately NOT via
+            # `coder_edits_factory`. That factory is a per-attempt sequence — break it,
+            # then fix it — and calling it here consumed one, so the inner loop under
+            # test silently received the wrong attempt's edits and every count was off
+            # by one.
+            payload = json.dumps(
+                {"reasoning": "need these", "files": sorted(self.repo_files)}
+            )
+            return httpx.Response(200, json={
+                "id": "msg_select", "type": "message", "role": "assistant",
                 "model": body.get("model"),
                 "content": [{"type": "text", "text": payload}],
                 "stop_reason": "end_turn", "usage": usage,
@@ -383,6 +472,9 @@ class StubSandbox:
 
     def __init__(self) -> None:
         self.calls: list[list[str]] = []
+        #: The workspace contents each exec saw, so a test can assert the sandbox was
+        #: handed a whole project rather than a handful of changed files.
+        self.workspaces: list[set[str]] = []
 
     async def capabilities(self) -> SandboxCapabilities:
         return SandboxCapabilities(
@@ -401,6 +493,14 @@ class StubSandbox:
         limits: ResourceLimits,
     ) -> ExecResult:
         self.calls.append(command)
+        root = Path(workspace.root)
+        self.workspaces.append(
+            {
+                q.relative_to(root).as_posix()
+                for q in root.rglob('*')
+                if q.is_file() and '.git' not in q.relative_to(root).parts
+            }
+        )
         return ExecResult(
             exit_code=0,
             stdout="",
@@ -419,6 +519,10 @@ def app_config() -> AppConfig:
 def platform(app_config: AppConfig) -> FakePlatform:
     """Binds the worker runtime for the duration of a test."""
     fake = FakePlatform()
+    # Held on the fake so a test can inspect what the sandbox was actually handed. The
+    # workspace is built inside the node and destroyed on exit, so there is no other
+    # moment at which its contents can be observed.
+    fake.sandbox = StubSandbox()
     RUNTIME.configure(
         app_config,
         broker=EnvCredentialBroker(
@@ -429,7 +533,7 @@ def platform(app_config: AppConfig) -> FakePlatform:
             }
         ),
         transport=fake.transport(),
-        sandbox=StubSandbox(),
+        sandbox=fake.sandbox,
     )
     return fake
 
@@ -440,6 +544,10 @@ def real_sandbox_platform(app_config: AppConfig) -> FakePlatform:
     from engine.sandbox.podman import PodmanSandbox
 
     fake = FakePlatform()
+    # Held on the fake so a test can inspect what the sandbox was actually handed. The
+    # workspace is built inside the node and destroyed on exit, so there is no other
+    # moment at which its contents can be observed.
+    fake.sandbox = StubSandbox()
     RUNTIME.configure(
         app_config,
         broker=EnvCredentialBroker(
