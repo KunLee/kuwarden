@@ -235,16 +235,28 @@ class AzureReposScm:
 
         onto = tip.commit if tip is not None else base.commit
         existing = await self._file_paths(ref, onto)
-        changes = [
-            {
-                # Azure DevOps rejects "add" for a path that exists and "edit" for one that
-                # does not, so the distinction has to be established before pushing.
-                "changeType": "edit" if edit.path.lstrip("/") in existing else "add",
-                "item": {"path": "/" + edit.path.lstrip("/")},
-                "newContent": {"content": edit.content, "contentType": "rawtext"},
-            }
-            for edit in edits
-        ]
+        changes: list[dict[str, Any]] = []
+        for edit in edits:
+            if edit.deleted:
+                # A delete carries no `newContent`; sending one is rejected. The path is not
+                # checked against `existing` because a deletion of something already absent is
+                # a bug worth hearing about from the API rather than silently dropping.
+                changes.append(
+                    {
+                        "changeType": "delete",
+                        "item": {"path": "/" + edit.path.lstrip("/")},
+                    }
+                )
+                continue
+            changes.append(
+                {
+                    # Azure DevOps rejects "add" for a path that exists and "edit" for one
+                    # that does not, so the distinction has to be established before pushing.
+                    "changeType": "edit" if edit.path.lstrip("/") in existing else "add",
+                    "item": {"path": "/" + edit.path.lstrip("/")},
+                    "newContent": {"content": edit.content, "contentType": "rawtext"},
+                }
+            )
 
         async with await self._client(ref, CredentialKind.SCM_WRITE_BRANCH) as client:
             result: Any = await client.post(
@@ -324,6 +336,24 @@ class AzureReposScm:
                 ],
             )
         return True
+
+    async def merge_pull_request(self, ref: RepoRef, number: str, commit: str) -> str:
+        """Not implemented, and refused rather than approximated.
+
+        Completing a pull request on Azure Repos is a PATCH that sets `status: completed` with
+        a `completionOptions` block, and its behaviour under branch policies differs from
+        GitHub's in ways this codebase has not tested against a real organisation. ADR 0004
+        model B is the control point: an implementation that merged under conditions nobody
+        verified would be the one bug in this file that produces an unverified commit on a
+        default branch while every audit row still reads correctly.
+
+        Auto-merge therefore stays a GitHub capability until this is written and tested.
+        """
+        raise AdapterError(
+            "merge_pull_request is not implemented for Azure Repos. Set "
+            "delivery.auto_merge.enabled: false for this application, or merge the pull "
+            "request by hand."
+        )
 
     async def open_pull_request(
         self,

@@ -93,6 +93,34 @@ async def record_event(event: EventRecorded) -> None:
         )
 
 
+@dataclass
+class RunStatusChanged:
+    run_id: UUID
+    status: str
+
+
+@activity.defn
+async def record_run_status(change: RunStatusChanged) -> None:
+    """Persist that a run is waiting for a human, or has stopped waiting.
+
+    `flow_runs.status` used to be written twice — `running` at the start and the final status
+    at the end — while suspension lived only in the workflow object's memory. Everything that
+    asks "is this run waiting for me" reads the column: the approval endpoint refuses a
+    decision unless it says `suspended`, and the Workbench hides the approval panel. So a gate
+    that suspended without recording it was a gate no human could pass.
+
+    Idempotent, and guarded on the current status: replay may run this again, and a run that
+    has since ended must not be dragged back to `suspended` by a late retry.
+    """
+    async with connect() as conn:
+        await conn.execute(
+            "UPDATE flow_runs SET status = $2 "
+            "WHERE id = $1 AND status IN ('running', 'suspended')",
+            change.run_id,
+            change.status,
+        )
+
+
 @activity.defn
 async def record_run_ended(ended: RunEnded) -> None:
     async with connect() as conn:

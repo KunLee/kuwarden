@@ -20,7 +20,7 @@ import yaml
 from engine.adapters.llm import Provider
 from engine.adapters.protocols import IntegrationModel, RepoRef, TicketRef
 from engine.errors import KuWardenError
-from engine.state import RiskTier
+from engine.state import RISK_TIER_ORDER, RiskTier
 
 
 class ConfigError(KuWardenError):
@@ -64,6 +64,32 @@ class TriggerConfig:
         return TicketRef(system=self.provider, project=self.project, id=ticket_id)
 
 
+#: The four angles, named once. `engine.flows.delivery.VERIFIERS` prefixes these with
+#: `verifier.`; keeping the bare names here is what lets configuration read naturally.
+ALL_VERIFIERS: tuple[str, ...] = ("correctness", "security", "test_evidence", "regression_risk")
+
+
+@dataclass(frozen=True)
+class VerificationConfig:
+    """Which verifiers may stop a change, and which only advise.
+
+    Every verifier always runs. Turning one off makes it **advisory**: it still reads the diff,
+    still records its findings, and still reaches the audit trail — it simply cannot abort the
+    run. Skipping it outright would save a model call and destroy the evidence, which for a
+    product whose value is the record is the wrong trade.
+
+    Default is every verifier blocking. A gate that arrives switched off is a gate nobody
+    decided to have.
+    """
+
+    #: Verifier ids — bare, without the `verifier.` prefix — that may block.
+    blocking: frozenset[str] = field(default_factory=lambda: frozenset(ALL_VERIFIERS))
+
+    def advisory(self) -> tuple[str, ...]:
+        """The ones that cannot block, in a stable order for the record."""
+        return tuple(sorted(set(ALL_VERIFIERS) - self.blocking))
+
+
 @dataclass(frozen=True)
 class RiskConfig:
     """Rules-first tiering. An LLM may raise a tier from here; it may never lower one."""
@@ -71,6 +97,9 @@ class RiskConfig:
     high_paths: list[str] = field(default_factory=list)
     medium_paths: list[str] = field(default_factory=list)
     high_labels: list[str] = field(default_factory=list)
+    #: Above this many changed files, one approver is required. Size is the cheapest honest
+    #: proxy for "somebody should look at this" — it needs no understanding of the change.
+    medium_changed_files: int | None = None
     #: Above this many changed files, the change stops being small whatever it touched.
     high_changed_files: int | None = None
 
@@ -90,15 +119,35 @@ class SandboxConfig:
     """
 
     #: Image reference. Dependencies are baked in; there is no egress to install any.
-    toolchain_image: str = "localhost/kuwarden-python312:1"
+    #:
+    #: **No default, deliberately.** This used to default to the Python image and
+    #: `test_command` to `pytest -q`, which meant an application that declared no `sandbox:`
+    #: block was graded by pytest whatever language it was written in. For a TypeScript
+    #: project that collects no tests, pytest exits 5 and the obvious workaround
+    #: (`test $? -le 5`) turns every change into a pass — a green Build & Test that verified
+    #: nothing, with nothing in the record saying so.
+    #:
+    #: That is invariant 11's failure aimed at the reality anchor: overstating what was
+    #: checked is manufacturing evidence, and the fix is the same one `control_mode` gets —
+    #: never inferred, never defaulted. An application that has not said how to verify a
+    #: change cannot have one verified.
+    toolchain_image: str
+    #: What Build & Test runs. Its exit code is the reality anchor -- ADR 0001. No default,
+    #: for the reason given on `toolchain_image`.
+    #:
+    #: Declared here, above the defaulted fields, because a dataclass requires it — which is
+    #: a useful accident: the two things an application must state about verification are the
+    #: first two things in this class.
+    test_command: list[str]
+    #: Limits below all have defaults. They are safe to guess in a way the two fields above
+    #: are not: too little memory fails loudly and identically for every change, whereas the
+    #: wrong test command passes quietly and means nothing.
     memory_mb: int = 2048
     cpus: float = 2.0
     pids: int = 256
     timeout_s: int = 600
     tmp_mb: int = 512
     require_full_isolation: bool = False
-    #: What Build & Test runs. Its exit code is the reality anchor -- ADR 0001.
-    test_command: list[str] = field(default_factory=lambda: ["pytest", "-q"])
 
 
 @dataclass(frozen=True)
@@ -152,16 +201,44 @@ class LLMConfig:
 
 
 @dataclass(frozen=True)
+class AutoMergeConfig:
+    """When KuWarden may merge its own pull request instead of leaving it for a human.
+
+    Only meaningful under `gated_merge`, which ADR 0004 defines as the model where KuWarden
+    *holds merge authority* — this is that authority being exercised rather than a new power.
+    Disabled unless declared, because "the agent may write to the default branch" is not a
+    setting anyone should acquire by upgrading.
+
+    `require_external_anchor` is the one to think hardest about. False means a change can
+    reach the default branch graded only by KuWarden's own sandbox — the same system that
+    wrote it. That is the arrangement this product exists to argue against, so it is a line
+    someone has to type.
+    """
+
+    enabled: bool = False
+    #: Merge only at or below this tier. `low` means no human approval was required anyway.
+    max_risk_tier: RiskTier = "low"
+    #: Above this many changed files, a human looks at it. None disables the check.
+    max_files_changed: int | None = None
+    #: Require `CIResult.source == "ci"` — a pipeline KuWarden does not control.
+    require_external_anchor: bool = True
+
+
+@dataclass(frozen=True)
 class AppConfig:
     name: str
     repos: list[RepoConfig]
     triggers: list[TriggerConfig]
     integration_model: IntegrationModel
+    #: Required, and required *here* rather than defaulted, because an application with no
+    #: sandbox declaration has no way to have a change verified — see `SandboxConfig`.
+    sandbox: SandboxConfig
+    auto_merge: AutoMergeConfig = field(default_factory=lambda: AutoMergeConfig())
     toolchain_id: str = "none"
     risk: RiskConfig = field(default_factory=RiskConfig)
     llm: LLMConfig | None = None
-    sandbox: SandboxConfig = field(default_factory=SandboxConfig)
     ci: CiConfig | None = None
+    verification: VerificationConfig = field(default_factory=VerificationConfig)
     budget_cents_per_run: int = 0
     max_coder_retries: int = 3
     default_risk_tier: RiskTier = "low"
@@ -220,6 +297,9 @@ def parse(text: str) -> AppConfig:
     except ValueError:
         raise ConfigError(f"unknown integration_model {declared!r}") from None
 
+    auto_merge = _auto_merge(delivery.get("auto_merge"), integration_model)
+    verification = _verification(raw.get("verification"))
+
     risk_raw = raw.get("risk") or {}
     budgets = raw.get("budgets") or {}
     llm = _llm(raw.get("llm"))
@@ -227,6 +307,8 @@ def parse(text: str) -> AppConfig:
     ci = _ci(raw.get("ci"))
 
     return AppConfig(
+        auto_merge=auto_merge,
+        verification=verification,
         name=name,
         repos=repos,
         triggers=triggers,
@@ -239,6 +321,7 @@ def parse(text: str) -> AppConfig:
             high_paths=[str(p) for p in risk_raw.get("high_paths", [])],
             medium_paths=[str(p) for p in risk_raw.get("medium_paths", [])],
             high_labels=[str(label) for label in risk_raw.get("high_labels", [])],
+            medium_changed_files=risk_raw.get("medium_changed_files"),
             high_changed_files=risk_raw.get("high_changed_files"),
         ),
         budget_cents_per_run=int(budgets.get("cents_per_run", 0)),
@@ -358,6 +441,77 @@ def _llm(raw: Any) -> LLMConfig | None:
     )
 
 
+def _verification(raw: Any) -> VerificationConfig:
+    """Parse `verification.verifiers`, refusing a name that is not a verifier.
+
+    A typo would otherwise disable nothing and read as though it had — the operator sees
+    `test_evidince: false` in their own file and believes the gate is off, or on, and is wrong
+    either way. Naming the four is cheap; guessing is not.
+    """
+    if raw is None:
+        return VerificationConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("verification must be a mapping")
+
+    declared = raw.get("verifiers")
+    if declared is None:
+        return VerificationConfig()
+    if not isinstance(declared, dict):
+        raise ConfigError("verification.verifiers must be a mapping of name to true/false")
+
+    unknown = set(declared) - set(ALL_VERIFIERS)
+    if unknown:
+        raise ConfigError(
+            f"unknown verifier(s) {', '.join(sorted(unknown))}; "
+            f"expected any of {', '.join(ALL_VERIFIERS)}"
+        )
+    # Absent means blocking. Only an explicit `false` turns one advisory, so a partial mapping
+    # cannot quietly disable the ones it forgot to mention.
+    blocking = {name for name in ALL_VERIFIERS if declared.get(name, True)}
+    return VerificationConfig(blocking=frozenset(blocking))
+
+
+def _auto_merge(raw: Any, model: IntegrationModel) -> AutoMergeConfig:
+    """Parse `delivery.auto_merge`, refusing combinations that would be a lie.
+
+    Declaring it under any model but `gated_merge` is an error rather than an ignored key:
+    ADR 0004 gives merge authority to model B alone, and a config that appears to grant it
+    under model C would describe a control the deployment does not have.
+    """
+    if raw is None:
+        return AutoMergeConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("delivery.auto_merge must be a mapping")
+
+    enabled = bool(raw.get("enabled", False))
+    if enabled and model is not IntegrationModel.GATED_MERGE:
+        raise ConfigError(
+            "delivery.auto_merge is only available under integration_model: gated_merge — "
+            f"this application declares {model.value}, where KuWarden holds no merge authority "
+            "(ADR 0004)"
+        )
+
+    tier = raw.get("max_risk_tier", "low")
+    if tier not in RISK_TIER_ORDER:
+        raise ConfigError(
+            f"unknown auto_merge.max_risk_tier {tier!r}; "
+            f"expected one of {', '.join(RISK_TIER_ORDER)}"
+        )
+
+    files = raw.get("max_files_changed")
+    if files is not None and (not isinstance(files, int) or files < 1):
+        raise ConfigError("auto_merge.max_files_changed must be a positive integer, or absent")
+
+    return AutoMergeConfig(
+        enabled=enabled,
+        max_risk_tier=tier,
+        max_files_changed=files,
+        # Defaults to True, so leaving it out keeps the anchor requirement rather than
+        # silently dropping it.
+        require_external_anchor=bool(raw.get("require_external_anchor", True)),
+    )
+
+
 def _ci(raw: Any) -> CiConfig | None:
     """Absent is legal: it means no independent anchor, which is stated rather than hidden."""
     if raw is None:
@@ -388,25 +542,47 @@ def _ci(raw: Any) -> CiConfig | None:
     )
 
 
+#: Said whenever an application has not declared how its changes are to be verified. One
+#: message, so the API, the worker and the CLI all refuse in the same words.
+_NO_TOOLCHAIN = (
+    "declares no {field}, so there is nothing to grade a change with. KuWarden will "
+    "not guess: it used to default to a Python image running `pytest -q`, which meant a "
+    "repository in any other language got a Build & Test verdict that had verified nothing. "
+    "Build an image from this application's own dependency manifest — `uv run python -m "
+    "engine.sandbox build-app --recipe <ecosystem> --name <app> --manifest <checkout>` — then "
+    "declare `sandbox.toolchain_image` and `sandbox.test_command`."
+)
+
+
 def _sandbox(raw: Any) -> SandboxConfig:
-    """Absent is legal and yields the defaults, which are the strict ones."""
+    """Parse the `sandbox:` block. Absent is an error, not a default.
+
+    Both `toolchain_image` and `test_command` must be stated. See `SandboxConfig` for why an
+    omitted one cannot be filled in: a guessed verdict is indistinguishable from a real one
+    in the record, which is the one property this product cannot afford to lose.
+    """
     if raw is None:
-        return SandboxConfig()
+        raise ConfigError(_NO_TOOLCHAIN.format(field="sandbox: section"))
     if not isinstance(raw, dict):
         raise ConfigError("sandbox must be a mapping")
 
     limits = raw.get("limits") or {}
     command = raw.get("test_command")
-    if command is not None and not isinstance(command, list):
+    if command is None:
+        raise ConfigError(_NO_TOOLCHAIN.format(field="sandbox.test_command"))
+    if not isinstance(command, list):
         raise ConfigError("sandbox.test_command must be a list of arguments, not a string")
+    image = raw.get("toolchain_image")
+    if not image:
+        raise ConfigError(_NO_TOOLCHAIN.format(field="sandbox.toolchain_image"))
 
     return SandboxConfig(
-        toolchain_image=str(raw.get("toolchain_image", SandboxConfig.toolchain_image)),
+        toolchain_image=str(image),
         memory_mb=int(limits.get("memory_mb", 2048)),
         cpus=float(limits.get("cpus", 2.0)),
         pids=int(limits.get("pids", 256)),
         timeout_s=int(limits.get("timeout_s", 600)),
         tmp_mb=int(limits.get("tmp_mb", 512)),
         require_full_isolation=bool(raw.get("require_full_isolation", False)),
-        test_command=[str(part) for part in (command or ["pytest", "-q"])],
+        test_command=[str(part) for part in command],
     )

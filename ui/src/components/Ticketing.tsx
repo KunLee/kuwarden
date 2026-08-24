@@ -31,6 +31,9 @@ export function Ticketing({ appId }: { appId: string }) {
   const [triggers, setTriggers] = useState<Trigger[]>([]);
   const [draft, setDraft] = useState<Draft>(EMPTY);
   const [error, setError] = useState<string | null>(null);
+  //: Non-null while amending an existing rule rather than declaring a new one. The form is
+  //: the same either way; what changes is whether identity fields may be touched.
+  const [editing, setEditing] = useState<string | null>(null);
 
   async function refresh() {
     try {
@@ -43,6 +46,37 @@ export function Ticketing({ appId }: { appId: string }) {
   useEffect(() => {
     void refresh();
   }, [appId]);
+
+  function edit(trigger: Trigger) {
+    setEditing(trigger.id);
+    const { id: _id, ...rest } = trigger;
+    setDraft({ ...rest });
+    setError(null);
+  }
+
+  function cancel() {
+    setEditing(null);
+    setDraft(EMPTY);
+    setError(null);
+  }
+
+  async function amend(triggerId: string) {
+    setError(null);
+    try {
+      // Only the admission rules. Provider, organisation and project decide which board this
+      // rule governs, and the server refuses to amend them for that reason.
+      await api.amendTrigger(appId, triggerId, {
+        label: draft.label || null,
+        ready_state: draft.ready_state || null,
+        max_story_points: draft.max_story_points,
+        story_points_field: draft.story_points_field || null,
+      });
+      cancel();
+      await refresh();
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e));
+    }
+  }
 
   async function declare() {
     setError(null);
@@ -76,6 +110,7 @@ export function Ticketing({ appId }: { appId: string }) {
         <Field label="Provider">
           <Select
             value={draft.provider}
+            disabled={editing !== null}
             onChange={(e) =>
               setDraft({ ...draft, provider: e.target.value as Draft["provider"] })
             }
@@ -92,6 +127,7 @@ export function Ticketing({ appId }: { appId: string }) {
                 value={draft.site ?? ""}
                 placeholder="https://acme.atlassian.net"
                 onChange={(e) => setDraft({ ...draft, site: e.target.value })}
+              disabled={editing !== null}
               />
             </Field>
             <Field
@@ -102,6 +138,7 @@ export function Ticketing({ appId }: { appId: string }) {
                 value={draft.account_email ?? ""}
                 placeholder="bot@acme.test"
                 onChange={(e) => setDraft({ ...draft, account_email: e.target.value })}
+              disabled={editing !== null}
               />
             </Field>
           </>
@@ -111,6 +148,7 @@ export function Ticketing({ appId }: { appId: string }) {
               value={draft.organisation ?? ""}
               placeholder="acme"
               onChange={(e) => setDraft({ ...draft, organisation: e.target.value })}
+            disabled={editing !== null}
             />
           </Field>
         )}
@@ -120,6 +158,7 @@ export function Ticketing({ appId }: { appId: string }) {
             value={draft.project}
             placeholder={isJira ? "PAY" : "Payments"}
             onChange={(e) => setDraft({ ...draft, project: e.target.value })}
+            disabled={editing !== null}
           />
         </Field>
 
@@ -179,10 +218,19 @@ export function Ticketing({ appId }: { appId: string }) {
         </div>
       )}
 
-      <div className="mt-4">
-        <Button variant="primary" onClick={declare} disabled={!canAdmin || !draft.project}>
-          Add trigger
-        </Button>
+      <div className="mt-4 flex items-center gap-3">
+        {editing ? (
+          <>
+            <Button variant="primary" onClick={() => amend(editing)} disabled={!canAdmin}>
+              Save changes
+            </Button>
+            <Button onClick={cancel}>Cancel</Button>
+          </>
+        ) : (
+          <Button variant="primary" onClick={declare} disabled={!canAdmin || !draft.project}>
+            Add trigger
+          </Button>
+        )}
       </div>
 
       {triggers.length > 0 && (
@@ -224,15 +272,27 @@ export function Ticketing({ appId }: { appId: string }) {
                 </td>
                 <td className="py-2 text-right">
                   {canAdmin && (
-                  <button
-                    onClick={async () => {
-                      await api.removeTrigger(appId, trigger.id);
-                      await refresh();
-                    }}
-                    className="text-xs text-red-600 hover:underline dark:text-red-400"
-                  >
-                    Remove
-                  </button>
+                    <span className="flex justify-end gap-3">
+                      {/* Amending beats delete-and-recreate: while no trigger exists the
+                          application accepts no work at all, and changing one field should
+                          not open that window. */}
+                      <button
+                        onClick={() => edit(trigger)}
+                        className="text-xs text-accent hover:underline"
+                      >
+                        Edit
+                      </button>
+                      <button
+                        onClick={async () => {
+                          await api.removeTrigger(appId, trigger.id);
+                          if (editing === trigger.id) cancel();
+                          await refresh();
+                        }}
+                        className="text-xs text-red-600 hover:underline dark:text-red-400"
+                      >
+                        Remove
+                      </button>
+                    </span>
                   )}
                 </td>
               </tr>

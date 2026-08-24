@@ -19,6 +19,7 @@ now returns 400. `output_config.format` does the job properly and validates.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from typing import Any
 
@@ -35,6 +36,7 @@ from engine.adapters.llm import (
     LLMError,
     LLMOutputTruncated,
     LLMRequest,
+    LLMRequestRejected,
     ModelRefusal,
     Provider,
     assert_may_call_llm,
@@ -43,6 +45,8 @@ from engine.adapters.llm import (
 #: Streaming above this, because a non-streaming request the SDK estimates will run past the
 #: HTTP timeout raises rather than completing. Nodes that produce a diff sit well above it.
 STREAM_ABOVE_MAX_TOKENS = 16_000
+
+log = logging.getLogger(__name__)
 
 
 class AnthropicLLM:
@@ -141,9 +145,20 @@ class AnthropicLLM:
             else:
                 message = await client.messages.create(**params)
         except Exception as exc:
-            # The provider's own message is not carried through: it can echo request content,
-            # and this exception reaches the audit trail. The class name is enough to act on.
+            # The provider's own message stays out of the *audit trail* — it can echo request
+            # content, and ticket text is hostile input by assumption — but it goes to the
+            # worker log, where an operator can read it and no permanent record quotes it.
             #
+            # Dropping it entirely was the earlier behaviour and made a 400 undiagnosable:
+            # "BadRequestError from the Anthropic API" is true of a malformed schema, an
+            # unsupported parameter, a context window overrun and an exhausted credit
+            # balance alike, and those call for four different actions. A failure whose cause
+            # cannot be recovered from anywhere is not an operable system.
+            log.warning(
+                "Anthropic API rejected a request (%s): %s",
+                type(exc).__name__,
+                exc,
+            )
             # Authentication is separated because it is the one failure a retry cannot fix.
             # Rate limits and 5xx genuinely are transient; a rejected key is not, and the
             # flow marks this type non-retryable so it fails in seconds rather than minutes.
@@ -152,7 +167,18 @@ class AnthropicLLM:
                     f"{type(exc).__name__} from the Anthropic API — the stored "
                     "llm.api_key was rejected. Replace it in the Workbench."
                 ) from None
-            raise LLMError(f"{type(exc).__name__} from the Anthropic API") from None
+            detail = (
+                " The provider's explanation is in the worker log — it is kept out of this "
+                "record because it can quote the request, and the request contains ticket "
+                "text."
+            )
+            if type(exc).__name__ == "BadRequestError":
+                raise LLMRequestRejected(
+                    f"BadRequestError from the Anthropic API.{detail} A 400 most often "
+                    "means the account cannot be billed, the prompt exceeded the context "
+                    "window, or a parameter is unsupported."
+                ) from None
+            raise LLMError(f"{type(exc).__name__} from the Anthropic API.{detail}") from None
 
         return _to_completion(message, expects_schema=request.schema is not None)
 

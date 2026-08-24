@@ -11,7 +11,18 @@ import { useNavigate, useParams } from "react-router-dom";
 import { api, ApiError } from "../api";
 import { useCan } from "../auth";
 import { Ticketing } from "../components/Ticketing";
-import { Banner, Button, Card, Field, Input, Select } from "../components/ui";
+import { Configuration } from "../components/Configuration";
+import { Verifiers } from "../components/Verifiers";
+import {
+  BackLink,
+  Banner,
+  Button,
+  Card,
+  ConfirmDialog,
+  Field,
+  Input,
+  Select,
+} from "../components/ui";
 import type { Application, CredentialState, ProbeResult } from "../types";
 
 /** What each credential is for, so an operator does not have to guess from the identifier. */
@@ -45,7 +56,10 @@ export function ApplicationDetail() {
   const [value, setValue] = useState("");
   // Which action is in flight, not merely whether one is. A shared boolean made every
   // button on the page announce itself as running the moment any one of them was clicked.
-  const [busy, setBusy] = useState<"store" | "run" | "check" | "probe" | "point" | null>(
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState<
+    "store" | "run" | "check" | "probe" | "point" | "delete" | null
+  >(
     null,
   );
   const [movingPoint, setMovingPoint] = useState(false);
@@ -148,12 +162,15 @@ export function ApplicationDetail() {
   }
 
   async function remove() {
-    if (!confirm(`Delete ${app?.name}? Its stored credentials are deleted with it.`)) return;
+    setBusy("delete");
     try {
       await api.deleteApplication(id);
       navigate("/applications");
     } catch (e) {
+      setConfirming(false);
       setMessage({ tone: "error", text: e instanceof ApiError ? e.message : String(e) });
+    } finally {
+      setBusy(null);
     }
   }
 
@@ -161,12 +178,30 @@ export function ApplicationDetail() {
 
   return (
     <div className="space-y-6">
+      {/* Named consequences, not a generic "are you sure". Deleting an application takes its
+          stored credentials with it, and that is the part somebody needs to read before
+          clicking rather than discover afterwards. */}
+      <ConfirmDialog
+        open={confirming}
+        onOpenChange={setConfirming}
+        title={`Delete ${app.name}?`}
+        confirmLabel="Delete application"
+        onConfirm={() => void remove()}
+        busy={busy === "delete"}
+      >
+        Its stored credentials are deleted with it and cannot be recovered — they were
+        encrypted to this application and are not readable anywhere else. Runs already recorded
+        against it stay in the audit trail.
+      </ConfirmDialog>
+
+      <BackLink to="/applications">All applications</BackLink>
+
       <Card
         title={app.name}
         description={app.repo_url}
         actions={
           canAdmin && (
-            <Button variant="danger" onClick={remove}>
+            <Button variant="danger" onClick={() => setConfirming(true)}>
               Delete
             </Button>
           )
@@ -340,6 +375,12 @@ export function ApplicationDetail() {
         </table>
       </Card>
 
+      {/* Before Connections: what this application *is* comes before whether its tokens
+          reach anything. */}
+      <Configuration appId={id} />
+
+      <Verifiers appId={id} />
+
       <Card
         title="Connections"
         description="Can the stored credentials actually reach each platform? Read-only, and each side is reported separately — a working SCM token with a broken ticket token is the most common half-configured state."
@@ -355,15 +396,25 @@ export function ApplicationDetail() {
           <table className="w-full text-sm">
             <tbody>
               {Object.entries(checks).map(([name, result]) => (
-                <tr key={name} className="border-t border-line first:border-0">
+                // `align-top` on every cell, not the default middle. `detail` runs to
+                // several lines for a fine-grained SCM token, and centring the short cells
+                // against that tall one leaves the label floating beside the middle of a
+                // paragraph it does not describe.
+                <tr key={name} className="border-t border-line first:border-0 align-top">
                   <td className="py-2 pr-4 font-medium capitalize">{name}</td>
-                  <td className="py-2 pr-4">
+                  <td className="py-2 pr-4 whitespace-nowrap">
                     <span className={result.ok ? "text-emerald-600" : "text-red-600"}>
                       {result.ok ? "● connected" : "● failed"}
                     </span>
                   </td>
-                  <td className="mono py-2 pr-4 text-xs text-muted">{result.target}</td>
-                  <td className="py-2 text-xs text-muted">{result.detail}</td>
+                  <td className="mono py-2 pr-4 text-xs break-all text-muted">
+                    {result.target}
+                  </td>
+                  {/* The long one. Given the remaining width so it wraps here rather than
+                      stretching the row's other columns apart. */}
+                  <td className="w-1/2 py-2 text-xs leading-relaxed text-muted">
+                    {result.detail}
+                  </td>
                 </tr>
               ))}
             </tbody>

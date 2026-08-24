@@ -315,8 +315,21 @@ class GitHubScm:
             if not base_tree:
                 raise AdapterError(f"commit {base.commit} has no tree")
 
-            tree_entries = []
+            tree_entries: list[dict[str, Any]] = []
             for edit in edits:
+                if edit.deleted:
+                    # A null `sha` against `base_tree` is how the trees API removes a path.
+                    # No blob is created — there is no content to store, and posting an empty
+                    # one would write an empty file rather than delete it.
+                    tree_entries.append(
+                        {
+                            "path": edit.path.lstrip("/"),
+                            "mode": "100644",
+                            "type": "blob",
+                            "sha": None,
+                        }
+                    )
+                    continue
                 blob: Any = await client.post(
                     f"{self._repo(ref)}/git/blobs",
                     json={
@@ -386,6 +399,37 @@ class GitHubScm:
         except NotFound:
             return False
         return True
+
+    async def merge_pull_request(self, ref: RepoRef, number: str, commit: str) -> str:
+        """PUT /repos/{org}/{repo}/pulls/{number}/merge — ADR 0004 model B's control point.
+
+        `sha` is sent, and it is the whole point of the call. GitHub refuses the merge with
+        409 if the pull request head has moved since that revision, which turns "merge what
+        was verified" from an assumption into something the platform enforces. Without it a
+        push landing between the verdict and the merge would be merged unverified, and every
+        record in the audit trail would still look correct.
+
+        Squash, because the branch is a history of the Coder's attempts (ADR 0007) and that
+        is not a history the default branch should inherit.
+        """
+        try:
+            async with await self._client(ref, CredentialKind.SCM_MERGE) as client:
+                merged: Any = await client.put(
+                    f"{self._repo(ref)}/pulls/{number}/merge",
+                    json={"sha": commit, "merge_method": "squash"},
+                )
+        except PermissionDenied as exc:
+            raise PermissionDenied(
+                f"{exc}\n\nThis needs Contents: Read and write on "
+                f"{ref.org}/{ref.repo}, and "
+                "the branch protection rules on the target branch must admit this account."
+            ) from None
+        if not isinstance(merged, dict) or not merged.get("merged"):
+            raise AdapterError(
+                f"pull request {number} was not merged: "
+                f"{merged.get('message') if isinstance(merged, dict) else merged!r}"
+            )
+        return str(merged.get("sha") or "")
 
     async def open_pull_request(
         self,

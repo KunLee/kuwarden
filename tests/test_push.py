@@ -69,11 +69,21 @@ async def test_the_first_push_creates_the_branch(platform: FakePlatform) -> None
 async def test_a_second_attempt_extends_the_branch_rather_than_replacing_it(
     platform: FakePlatform,
 ) -> None:
-    """The branch is a history of attempts. A force-push would erase the earlier one."""
+    """The branch is a history of attempts. A force-push would erase the earlier one.
+
+    `push_attempt`, not `retry_count`. This test used to set the latter and passed, while
+    production silently did not push at all: the flow set `retry_count` for the outer cycle,
+    the Coder's inner loop overwrote it from 0 on the very next node, and the commit message
+    — whose `kuwarden-attempt` trailer is the idempotency key — came out identical. The
+    adapter matched it against the branch tip and returned without pushing.
+
+    Setting the field by hand is what hid it. The test asserted the mechanism worked when
+    given a changed counter; nothing asserted the counter actually changed.
+    """
     state = await _push(_state())
     first = state.head_commit
 
-    state.retry_count = 1
+    state.push_attempt = 1
     state = await _push(state)
 
     assert state.head_commit != first
@@ -96,7 +106,7 @@ async def test_the_tree_of_every_attempt_is_built_from_the_pinned_base(
     Test graded — the two would disagree about what the change even is.
     """
     state = await _push(_state())
-    state.retry_count = 1
+    state.push_attempt = 1
     await _push(state)
 
     trees = [r for r in platform.requests if r.url.path.endswith("/git/trees")]
@@ -268,3 +278,55 @@ async def test_nothing_pushed_means_nothing_to_clean(platform: FakePlatform) -> 
 def _config() -> AppConfig:
     """The suite's application, parsed fresh — the fixture's copy is bound to its transport."""
     return parse(KUWARDEN_YAML)
+
+
+async def test_a_change_that_only_deletes_a_file_is_still_a_change(
+    platform: FakePlatform,
+) -> None:
+    """A removal is an edit, and Push must send it rather than refuse the run.
+
+    Push used to guard on `state.proposed_edits`, which carried only content-bearing entries:
+    `read_changes` read the git-computed diff — which does report deletions — and then dropped
+    anything failing `is_file()`. A change that only removed files therefore arrived carrying
+    nothing and was refused with "push reached with no proposed edits", indistinguishable from
+    the Coder having produced no change at all.
+    """
+    state = _state()
+    state.proposed_edits = [ProposedEdit(path="src/dead.py", content="", deleted=True)]
+    state.diff = Diff(files=[FileChange(path="src/dead.py", added=0, removed=12)])
+
+    pushed = await _push(state)
+
+    assert platform.branches[BRANCH] == pushed.head_commit, "the deletion reached origin"
+    trees = [
+        json.loads(r.content)
+        for r in platform.requests
+        if r.method == "POST" and r.url.path.endswith("/git/trees")
+    ]
+    assert trees, "a tree was written"
+    entry = next(e for e in trees[-1]["tree"] if e["path"] == "src/dead.py")
+    # A null sha against `base_tree` is how the trees API removes a path. An empty blob would
+    # push an emptied file, which is a different change and leaves its imports resolving.
+    assert entry["sha"] is None, "a deletion is a null sha, never an empty blob"
+    assert not any(
+        r.method == "POST" and r.url.path.endswith("/git/blobs") for r in platform.requests
+    ), "no blob is created for a file that is being removed"
+
+
+async def test_an_empty_diff_is_refused_by_name_rather_than_as_a_missing_edit(
+    platform: FakePlatform,
+) -> None:
+    """The run still fails, but the message names the cause instead of the symptom.
+
+    "push reached with no proposed edits" pointed a reader at Push, three nodes downstream of
+    a Coder that had been shown the wrong files and correctly declined to guess.
+    """
+    state = _state()
+    state.proposed_edits = []
+    state.diff = Diff(files=[])
+
+    with pytest.raises(AdapterError) as failure:
+        await _push(state)
+
+    assert "the Coder produced no change" in str(failure.value)
+    assert not platform.branches, "nothing was pushed"

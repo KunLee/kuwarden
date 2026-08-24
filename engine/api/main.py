@@ -16,6 +16,7 @@ refuse a declaration, and may not make one.
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import uuid
@@ -23,9 +24,11 @@ from typing import Annotated, Any, Literal
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from starlette.middleware.sessions import SessionMiddleware
+from temporalio.exceptions import WorkflowAlreadyStartedError
 
+from engine import config_store
 from engine.adapters.credentials import CredentialKind, Secret
 from engine.adapters.factory import scm_adapter, ticket_adapter
 from engine.adapters.protocols import IntegrationModel, validate_integration_model
@@ -42,11 +45,12 @@ from engine.api.auth import (
     session_signing_key,
     user_count,
 )
-from engine.config import ConfigError, RepoConfig, TriggerConfig, load
+from engine.config import ConfigError, RepoConfig, TriggerConfig, load, parse
 from engine.db import connect
 from engine.devenv import load_dotenv
 from engine.errors import AdapterError, KuWardenError
 from engine.evidence import RunNotFound, assemble
+from engine.state import RiskRules
 
 load_dotenv()
 
@@ -426,6 +430,210 @@ async def forget_credential(app_id: uuid.UUID, kind: str, _: Admin) -> None:
 # --- triggers ------------------------------------------------------------------------------
 
 
+class StoreConfig(BaseModel):
+    """One application's `kuwarden.yaml`, verbatim."""
+
+    yaml: str = Field(min_length=1, max_length=200_000)
+
+
+@app.get("/api/applications/{app_id}/config")
+async def read_config(app_id: uuid.UUID, _: Viewer) -> dict[str, Any]:
+    """The stored configuration, and what the worker would fall back to without one.
+
+    Readable by any viewer: unlike a credential, configuration is the thing an operator has to
+    be able to inspect to answer "why did that run behave that way". It holds no secrets by
+    design — that is why the schema has no credential fields anywhere.
+    """
+    async with connect() as conn:
+        row = await conn.fetchrow(
+            "SELECT yaml, updated_at, updated_by FROM app_config WHERE app_id = $1", app_id
+        )
+    if row is None:
+        return {
+            "stored": False,
+            "yaml": None,
+            "detail": (
+                "no stored configuration; runs for this application use the worker's own "
+                "KUWARDEN_CONFIG file, which serves one application at a time"
+            ),
+        }
+    return {
+        "stored": True,
+        "yaml": str(row["yaml"]),
+        "updated_at": row["updated_at"],
+        "updated_by": str(row["updated_by"]),
+    }
+
+
+@app.put("/api/applications/{app_id}/config")
+async def store_config(
+    app_id: uuid.UUID, body: StoreConfig, principal: Admin
+) -> dict[str, Any]:
+    """Store this application's configuration, after parsing it.
+
+    Parsed before it is written, never after. A configuration that only fails when a run picks
+    it up fails in the worker, minutes later, to somebody who did not make the change — and
+    the run is the expensive place to discover a typo.
+
+    The control point is checked against `app_registry` here too, so the disagreement is
+    reported to the person editing rather than to the next run.
+    """
+    try:
+        parsed = parse(body.yaml)
+    except ConfigError as exc:
+        raise HTTPException(422, f"this does not parse as a kuwarden.yaml: {exc}") from None
+
+    async with connect() as conn:
+        registered = await conn.fetchrow(
+            "SELECT name, integration_model FROM app_registry WHERE id = $1", app_id
+        )
+        if registered is None:
+            raise HTTPException(404, "no such application")
+
+        declared = IntegrationModel(str(registered["integration_model"]))
+        if parsed.integration_model is not declared:
+            raise HTTPException(
+                409,
+                f"this application's control point is {declared.value!r}, but the "
+                f"configuration declares {parsed.integration_model.value!r}. The registry is "
+                "authoritative — change the control point through the application page if "
+                "that is what you meant.",
+            )
+
+        await conn.execute(
+            "INSERT INTO app_config (app_id, yaml, updated_by) VALUES ($1,$2,$3) "
+            "ON CONFLICT (app_id) DO UPDATE SET yaml = EXCLUDED.yaml, "
+            "updated_by = EXCLUDED.updated_by, updated_at = now()",
+            app_id,
+            body.yaml,
+            principal.email,
+        )
+
+    # The worker caches on the row's timestamp, so this takes effect on the next run without
+    # a restart. Dropped here as well because the API and the worker may share a process in
+    # development.
+    config_store.forget(app_id)
+    return {"stored": True, "application": parsed.name}
+
+
+class SetVerifiers(BaseModel):
+    """Which verifiers may stop a change. Absent names keep their current setting."""
+
+    blocking: dict[str, bool] = Field(default_factory=dict)
+
+
+@app.get("/api/applications/{app_id}/verifiers")
+async def read_verifiers(app_id: uuid.UUID, _: Viewer) -> dict[str, Any]:
+    """Which of the four may block, and which only advise.
+
+    Readable by any viewer. Whether a gate is armed is exactly the kind of fact an operator
+    must be able to see without being able to change it.
+    """
+    from engine.config import ALL_VERIFIERS
+
+    try:
+        config = await config_store.resolve(app_id)
+    except (ConfigError, KuWardenError) as exc:
+        raise HTTPException(409, str(exc)) from None
+    blocking = config.verification.blocking
+    return {
+        "verifiers": [
+            {"name": name, "blocking": name in blocking} for name in ALL_VERIFIERS
+        ],
+        "advisory": list(config.verification.advisory()),
+    }
+
+
+@app.put("/api/applications/{app_id}/verifiers")
+async def set_verifiers(
+    app_id: uuid.UUID, body: SetVerifiers, principal: Admin
+) -> dict[str, Any]:
+    """Arm or disarm a verifier for this application.
+
+    Disarming makes it **advisory**: it still runs, still records its findings, and still
+    reaches the audit trail — it simply cannot abort the run. Skipping it outright would save
+    a model call and destroy the evidence, which for a product whose value is the record is
+    the wrong trade.
+
+    Written into the stored `kuwarden.yaml` rather than a column of its own, so there is one
+    representation of an application's configuration and one parser for it.
+    """
+    from engine.config import ALL_VERIFIERS
+
+    unknown = set(body.blocking) - set(ALL_VERIFIERS)
+    if unknown:
+        raise HTTPException(
+            422, f"unknown verifier(s) {', '.join(sorted(unknown))}"
+        )
+
+    async with connect() as conn:
+        row = await conn.fetchrow("SELECT yaml FROM app_config WHERE app_id = $1", app_id)
+        if row is None:
+            raise HTTPException(
+                409,
+                "this application has no stored configuration yet. Save its kuwarden.yaml "
+                "first, then arm or disarm its verifiers.",
+            )
+
+        current = parse(str(row["yaml"])).verification.blocking
+        wanted = {name: (body.blocking.get(name, name in current)) for name in ALL_VERIFIERS}
+
+        updated = _with_verifiers(str(row["yaml"]), wanted)
+        # Parsed before it is written, so a malformed rewrite fails for the person making the
+        # change rather than for the next run.
+        confirmed = parse(updated).verification
+        await conn.execute(
+            "UPDATE app_config SET yaml = $2, updated_at = now(), updated_by = $3 "
+            "WHERE app_id = $1",
+            app_id,
+            updated,
+            principal.email,
+        )
+
+    config_store.forget(app_id)
+    return {
+        "verifiers": [
+            {"name": n, "blocking": n in confirmed.blocking} for n in ALL_VERIFIERS
+        ],
+        "advisory": list(confirmed.advisory()),
+    }
+
+
+def _with_verifiers(yaml_text: str, wanted: dict[str, bool]) -> str:
+    """Rewrite the `verification:` block, leaving the rest of the file untouched.
+
+    A round-trip through a YAML loader would discard every comment in the file, and the
+    comments in a `kuwarden.yaml` carry the reasoning for the settings — which is most of what
+    makes the file reviewable. So the block is replaced textually and appended when absent.
+    """
+    nl = chr(10)
+    rendered = nl.join(f"    {name}: {str(value).lower()}" for name, value in wanted.items())
+    block = (
+        "verification:" + nl
+        + "  # Which verifiers may stop a change. `false` makes one **advisory**: it still" + nl
+        + "  # runs, still records its findings, and still reaches the audit trail — it" + nl
+        + "  # simply cannot abort the run. Managed from the application page." + nl
+        + "  verifiers:" + nl
+        + rendered + nl
+    )
+
+    lines = yaml_text.splitlines()
+    start = next((i for i, line in enumerate(lines) if line.rstrip() == "verification:"), None)
+    if start is None:
+        return yaml_text.rstrip(nl) + nl + nl + block
+
+    # Everything indented under the key, plus the comment lines immediately above it — those
+    # belong to the block being replaced, and leaving them would strand an explanation next to
+    # settings it no longer describes.
+    end = start + 1
+    while end < len(lines) and (not lines[end].strip() or lines[end].startswith((" ", "\t"))):
+        end += 1
+    head = start
+    while head > 0 and lines[head - 1].lstrip().startswith("#"):
+        head -= 1
+    return nl.join(lines[:head] + block.rstrip(nl).splitlines() + lines[end:]) + nl
+
+
 @app.get("/api/applications/{app_id}/triggers")
 async def list_triggers(app_id: uuid.UUID, _: Viewer) -> list[dict[str, Any]]:
     async with connect() as conn:
@@ -489,6 +697,69 @@ async def declare_trigger(
     return {"id": str(trigger_id)}
 
 
+class AmendTrigger(BaseModel):
+    """Change an existing trigger's admission rules.
+
+    Identity is not amendable. `provider`, `organisation` and `project` are what decide *which*
+    board a rule governs, and editing them in place would silently re-point an existing rule at
+    a different one — delete and declare instead, so the change is visible as two acts.
+
+    Only fields present in the request body are applied: `null` clears a rule, and omitting a
+    field leaves it alone. Without that distinction there is no way to express "stop requiring
+    a ready state", and unsetting one is exactly the amendment somebody will need.
+
+    `extra="forbid"` so an attempt to amend an identity field is refused by name. Pydantic's
+    default is to drop unknown keys, which would answer a request to re-point a rule at
+    another project with a cheerful 200 and no change made.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    label: str | None = None
+    ready_state: str | None = None
+    max_story_points: int | None = None
+    story_points_field: str | None = None
+
+
+@app.patch("/api/applications/{app_id}/triggers/{trigger_id}")
+async def amend_trigger(
+    app_id: uuid.UUID, trigger_id: uuid.UUID, body: AmendTrigger, _: Admin
+) -> dict[str, Any]:
+    """Amend the admission rules on a trigger that already exists.
+
+    Added because the alternative was delete-and-recreate, which is worse than clumsy: the
+    application has no ticketing at all in between, so `POST /runs` refuses and a service hook
+    404s for as long as the gap lasts. Changing one field should not open a window where the
+    application cannot accept work.
+    """
+    changes = body.model_dump(exclude_unset=True)
+    if not changes:
+        raise HTTPException(422, "no fields to change")
+
+    # Column names come from this endpoint's own allow-list and never from the request, so the
+    # assembled statement cannot be influenced by the body however it is shaped. Values stay
+    # parameterised.
+    amendable = ("label", "ready_state", "max_story_points", "story_points_field")
+    columns = [name for name in amendable if name in changes]
+    if not columns:
+        raise HTTPException(422, f"only {', '.join(amendable)} may be amended")
+
+    assignments = ", ".join(f"{name} = ${i}" for i, name in enumerate(columns, start=1))
+    values = [changes[name] for name in columns]
+    async with connect() as conn:
+        updated = await conn.fetchrow(
+            f"UPDATE app_triggers SET {assignments} "
+            f"WHERE id = ${len(columns) + 1} AND app_id = ${len(columns) + 2} "
+            "RETURNING id, provider, project, label, ready_state, max_story_points",
+            *values,
+            trigger_id,
+            app_id,
+        )
+    if updated is None:
+        raise HTTPException(404, "no such trigger for this application")
+    return dict(updated) | {"id": str(updated["id"])}
+
+
 @app.delete("/api/applications/{app_id}/triggers/{trigger_id}", status_code=204)
 async def remove_trigger(app_id: uuid.UUID, trigger_id: uuid.UUID, _: Admin) -> None:
     async with connect() as conn:
@@ -549,13 +820,57 @@ async def start_run(app_id: uuid.UUID, body: StartRun, principal: Approver) -> d
     try:
         from temporalio.client import Client
 
-        from engine.flows.delivery import FlowInput
-        from engine.state import Ticket
-        from engine.worker import TASK_QUEUE, namespace, target
+        from engine.worker import namespace, target
 
         client = await Client.connect(target(), namespace=namespace())
     except Exception as exc:  # noqa: BLE001 - Temporal being down is an operational fact
         raise HTTPException(503, f"the Flow Engine is unreachable: {exc}") from None
+
+    run_id, workflow_id = await _launch(
+        client,
+        app_id,
+        body.ticket_id,
+        chosen["provider"],
+        f"kuwarden-{uuid.uuid4()}",
+        app_name=str(app_row["name"]),
+    )
+    return {
+        "run_id": str(run_id),
+        "workflow_id": workflow_id,
+        "started_by": principal.email,
+    }
+
+
+async def _launch(
+    client: Any,
+    app_id: uuid.UUID,
+    ticket_id: str,
+    provider: str,
+    workflow_id: str,
+    *,
+    app_name: str = "",
+    reject_duplicate: bool = False,
+) -> tuple[uuid.UUID, str]:
+    """Start one DeliveryFlow. Shared by the manual button and the service hook.
+
+    `workflow_id` is the caller's, not generated here, because the two callers need different
+    guarantees from it. A human pressing the button twice means it twice, so the manual path
+    passes a fresh id. A service hook delivered twice means it once, so the hook derives an id
+    from the work item revision.
+
+    `reject_duplicate` is the other half of that, and it is not optional for the hook.
+    Temporal's default reuse policy is ALLOW_DUPLICATE, which only refuses an id while the
+    previous run is *open* — so a redelivery arriving after the run finished would start a
+    second one, which is precisely the case a retrying webhook produces. REJECT_DUPLICATE
+    refuses the id for good.
+    """
+    from temporalio.common import WorkflowIDReusePolicy
+
+    from engine.flows.delivery import FlowInput
+    from engine.state import Ticket
+    from engine.worker import TASK_QUEUE
+
+    risk_rules, blocking_verifiers = await _governing(app_id)
 
     run_id = uuid.uuid4()
     handle = await client.start_workflow(
@@ -565,19 +880,189 @@ async def start_run(app_id: uuid.UUID, body: StartRun, principal: Approver) -> d
             app_id=app_id,
             # Placeholder. Triage replaces this by reading the real ticket -- what is passed
             # here only identifies which ticket to fetch.
-            ticket=Ticket(id=body.ticket_id, system=chosen["provider"], title="", body=""),
+            ticket=Ticket(id=ticket_id, system=provider, title="", body=""),
             policy_commit=_policy_commit(),
             policy_bundle={"source": "not-loaded"},
             provisional_risk_tier="low",
+            # Checked in Triage against the kuwarden.yaml the worker loaded. A worker serves
+            # one application; without this a run for another reads the wrong repository.
+            app_name=app_name,
+            # Read once, here, and carried into the workflow as data. Workflow code may not
+            # touch the filesystem, and pinning the rules at start means editing
+            # kuwarden.yaml mid-run cannot retroactively change a tier already decided.
+            risk_rules=risk_rules,
+            blocking_verifiers=blocking_verifiers,
         ),
-        id=f"kuwarden-{run_id}",
+        id=workflow_id,
         task_queue=TASK_QUEUE,
+        id_reuse_policy=(
+            WorkflowIDReusePolicy.REJECT_DUPLICATE
+            if reject_duplicate
+            else WorkflowIDReusePolicy.ALLOW_DUPLICATE
+        ),
     )
-    return {
-        "run_id": str(run_id),
-        "workflow_id": handle.id,
-        "started_by": principal.email,
-    }
+    return run_id, handle.id
+
+
+# --- the service hook ------------------------------------------------------------------------
+#
+# The direction that did not exist before. KuWarden already *calls* Azure DevOps — it reads the
+# work item and posts the run summary back — and that outbound path proves nothing about this
+# one. A trigger needs Azure DevOps to call in, which needs an endpoint, a shared secret, and a
+# URL the service can reach.
+
+
+def _tags(revision: dict[str, Any]) -> set[str]:
+    """Tags on the work item *after* the update, lowercased.
+
+    Azure DevOps sends them as one semicolon-separated string — "bug; kuwarden-auto" — with
+    inconsistent spacing.
+    """
+    raw = str(revision.get("fields", {}).get("System.Tags") or "")
+    return {tag.strip().casefold() for tag in raw.split(";") if tag.strip()}
+
+
+@app.post("/api/applications/{app_id}/hooks/azure_devops")
+async def azure_devops_hook(
+    app_id: uuid.UUID, payload: Annotated[dict[str, Any], Body()], request: Request
+) -> dict[str, Any]:
+    """Start a run when a work item *transitions into* the ready state.
+
+    Reachable without a session, so the shared secret is the only thing between the internet
+    and an endpoint that spends model budget and writes code. Configured through
+    `KUWARDEN_WEBHOOK_SECRET`; absent, this endpoint refuses to work rather than accepting
+    anonymous calls.
+
+    **A transition, not a save.** Azure DevOps fires `workitem.updated` for every field change
+    — a reassignment, a typo fix, a tag. `resource.fields` carries only the fields that
+    actually changed, so the presence of `System.State` in it *is* the transition test; a save
+    that left the state alone never appears there. Admitting on activity rather than intent is
+    the design migration 006 was written to avoid.
+
+    Two hundred, not an error, for anything uninteresting. Azure DevOps retries a failed
+    delivery, and retrying a typo fix forever is noise that looks like a fault.
+    """
+    secret = os.environ.get("KUWARDEN_WEBHOOK_SECRET", "")
+    if not secret:
+        raise HTTPException(
+            503,
+            "KUWARDEN_WEBHOOK_SECRET is not set, so this endpoint cannot tell Azure DevOps "
+            "from anyone else who found the URL. Set it and restart the API.",
+        )
+    # compare_digest, not ==: string comparison returns early on the first wrong byte, which
+    # leaks the shared secret's prefix to anyone willing to time enough requests.
+    presented = request.headers.get("x-kuwarden-token", "")
+    if not hmac.compare_digest(presented, secret):
+        raise HTTPException(401, "bad or missing X-KuWarden-Token")
+
+    if str(payload.get("eventType") or "") != "workitem.updated":
+        return {"started": False, "reason": f"ignoring {payload.get('eventType')!r}"}
+
+    async with connect() as conn:
+        trigger = await conn.fetchrow(
+            "SELECT t.label, t.ready_state, a.name AS app_name "
+            "FROM app_triggers t JOIN app_registry a ON a.id = t.app_id "
+            "WHERE t.app_id = $1 AND t.provider = 'azure_devops'",
+            app_id,
+        )
+    if trigger is None:
+        raise HTTPException(404, "no azure_devops trigger is configured for this application")
+    if not trigger["ready_state"]:
+        # Fail closed. Without a ready state every state change qualifies, which is the
+        # save-driven trigger this design rejected — and it would spend real model budget
+        # discovering that at Triage, once per edit.
+        raise HTTPException(
+            409,
+            "this trigger has no ready_state, so there is no transition to fire on. Set one "
+            "in the Workbench before pointing a service hook here.",
+        )
+
+    resource = payload.get("resource") or {}
+    changed = resource.get("fields") or {}
+    state_change = changed.get("System.State") or {}
+    new_state = str(state_change.get("newValue") or "")
+    if not new_state:
+        return {"started": False, "reason": "not a state change"}
+    if new_state.casefold() != str(trigger["ready_state"]).casefold():
+        return {"started": False, "reason": f"moved to {new_state!r}, which does not admit"}
+
+    # Checked here only to avoid starting a run that Triage would refuse a moment later.
+    # Triage re-reads the real work item and enforces label, state and points itself, so this
+    # is a cheap filter and never the authority — a payload shape that changes under us costs
+    # a wasted run, not an ungoverned one.
+    label = str(trigger["label"] or "")
+    if label and label.casefold() not in _tags(resource.get("revision") or {}):
+        return {"started": False, "reason": f"does not carry the {label!r} tag"}
+
+    # `workItemId` first, then `revision.id`, and never `resource.id`. Those are three
+    # different numbers in the same payload: `resource.id` identifies the *update record*, so
+    # falling back to it starts a run against whichever ticket happens to share that number.
+    # Azure DevOps' own sample payload makes the trap concrete — `workItemId` is 0, which is
+    # falsy, `resource.id` is 2, and the work item is 5.
+    revision_block = resource.get("revision") or {}
+    work_item = resource.get("workItemId") or revision_block.get("id")
+    if not work_item:
+        raise HTTPException(422, "payload carried neither workItemId nor revision.id")
+    revision = resource.get("rev") or revision_block.get("rev") or 0
+
+    try:
+        from temporalio.client import Client
+
+        from engine.worker import namespace, target
+
+        client = await Client.connect(target(), namespace=namespace())
+    except Exception as exc:  # noqa: BLE001 - Temporal being down is an operational fact
+        raise HTTPException(503, f"the Flow Engine is unreachable: {exc}") from None
+
+    # Derived from the work item and the revision that moved it, so a redelivered event is
+    # the same id and Temporal rejects it. Idempotency is the server's job here: Azure DevOps
+    # retries on any non-2xx and gives no delivery id we could key on instead.
+    try:
+        run_id, workflow_id = await _launch(
+            client,
+            app_id,
+            str(work_item),
+            "azure_devops",
+            f"kuwarden-ado-{app_id}-{work_item}-r{revision}",
+            app_name=str(trigger["app_name"]),
+            # A redelivery must be a no-op even if the first run has already finished.
+            reject_duplicate=True,
+        )
+    except WorkflowAlreadyStartedError:
+        return {"started": False, "reason": "already started for this revision"}
+
+    return {"started": True, "run_id": str(run_id), "workflow_id": workflow_id}
+
+
+async def _governing(app_id: uuid.UUID) -> tuple[RiskRules, tuple[str, ...]]:
+    """The tiering rules and blocking verifiers that govern this application's runs.
+
+    Resolved from the *stored* configuration, not the worker's own file — ADR 0008. Reading
+    the file here would mean a second application's runs were tiered by the first one's rules,
+    which is the single-tenant behaviour per-application configuration exists to end.
+
+    Read once here and carried into `FlowInput` as data, because workflow code is deterministic
+    and may not consult configuration at all. Pinning them at start also means editing settings
+    mid-run cannot retroactively change a decision already recorded.
+
+    A configuration that cannot be resolved yields no tiering rules and every verifier
+    blocking — the strict answer in both directions. The inverse would let a malformed file
+    silently disarm the gate.
+    """
+    from engine.config import ALL_VERIFIERS
+
+    try:
+        config = await config_store.resolve(app_id)
+    except (ConfigError, KuWardenError, OSError):
+        return RiskRules(), ALL_VERIFIERS
+
+    rules = RiskRules(
+        high_paths=tuple(config.risk.high_paths),
+        medium_paths=tuple(config.risk.medium_paths),
+        medium_changed_files=config.risk.medium_changed_files,
+        high_changed_files=config.risk.high_changed_files,
+    )
+    return rules, tuple(sorted(config.verification.blocking))
 
 
 def _policy_commit() -> str:
@@ -633,9 +1118,12 @@ async def check_connections(app_id: uuid.UUID, _: Admin) -> dict[str, Any]:
 
 async def _check_scm(repo_url: str, store: EncryptedPostgresStore) -> dict[str, Any]:
     """Resolve the default branch. Proves the token, the repository, and that it has a commit."""
-    repo = _repo_config(repo_url)
-    adapter = scm_adapter(repo, store)
     try:
+        # Inside the try, so a stored URL that is not a repository URL is reported as a failed
+        # check like every other reason this can fail. The point of this endpoint is to name
+        # what is wrong with a half-configured application; a 500 names nothing.
+        repo = _repo_config(repo_url)
+        adapter = scm_adapter(repo, store)
         branch = await adapter.default_branch(repo.ref())
         # Read access is enough for every node up to and including the Coder, so a token
         # missing only the write grant produces a full model run — real tokens, real cost —
@@ -716,9 +1204,9 @@ async def probe(app_id: uuid.UUID, _: Admin) -> dict[str, Any]:
     if row is None:
         raise HTTPException(404, "no such application")
 
-    repo = _repo_config(str(row["repo_url"]))
     store = EncryptedPostgresStore(app_id)
     try:
+        repo = _repo_config(str(row["repo_url"]))
         capabilities = await scm_adapter(repo, store).probe(repo.ref())
     except (AdapterError, KuWardenError) as exc:
         raise HTTPException(400, f"probe failed: {exc}") from None
@@ -743,15 +1231,47 @@ def _repo_config(repo_url: str) -> RepoConfig:
     `.git` is stripped because the clone URL is what a platform's copy button hands you, and
     keeping it would register the repository as `sasagayo.git` — every subsequent API call
     then 404s, which reads like a bad token rather than a bad name.
+
+    Raises `ConfigError` naming the shape that was expected. A URL too short for the fields
+    being read used to fall off the end of the list as an `IndexError`, which reaches the
+    operator as a 500 with no body — the least actionable failure this endpoint can produce,
+    for the most obvious kind of mistake.
     """
-    parts = [part for part in repo_url.rstrip("/").split("/") if part]
-    if parts and parts[-1].endswith(".git"):
-        parts[-1] = parts[-1].removesuffix(".git")
+    # Split the scheme off rather than filtering it out by name, so a URL pasted without one
+    # parses identically. `rpartition` returns the whole string as the tail when there is no
+    # separator, which is exactly the wanted behaviour here.
+    _, _, authority = repo_url.strip().rstrip("/").rpartition("://")
+    segments = [segment for segment in authority.split("/") if segment]
+    if segments and segments[-1].endswith(".git"):
+        segments[-1] = segments[-1].removesuffix(".git")
+
     if "github.com" in repo_url:
-        return RepoConfig(name=parts[-1], provider="github", org=parts[-2], repo=parts[-1])
-    # https://dev.azure.com/{org}/{project}/_git/{repo}
+        # host / org / repo.
+        if len(segments) < 3:
+            raise ConfigError(
+                f"{repo_url!r} is not a GitHub repository URL; expected "
+                "https://github.com/<org>/<repo>"
+            )
+        return RepoConfig(
+            name=segments[-1], provider="github", org=segments[-2], repo=segments[-1]
+        )
+
+    # host / org / project / _git / repo.
+    #
+    # `_git` is required rather than assumed: without it, an organisation URL pasted by mistake
+    # parses into a plausible-looking RepoConfig built from the wrong segments, and the first
+    # sign of trouble is a 404 against a repository nobody named.
+    if len(segments) < 5 or segments[-2] != "_git":
+        raise ConfigError(
+            f"{repo_url!r} is not an Azure Repos URL; expected "
+            "https://dev.azure.com/<org>/<project>/_git/<repo>"
+        )
     return RepoConfig(
-        name=parts[-1], provider="azure_repos", org=parts[-4], project=parts[-3], repo=parts[-1]
+        name=segments[-1],
+        provider="azure_repos",
+        org=segments[-4],
+        project=segments[-3],
+        repo=segments[-1],
     )
 
 
@@ -760,10 +1280,24 @@ def _repo_config(repo_url: str) -> RepoConfig:
 
 @app.get("/api/runs")
 async def list_runs(_: Viewer, limit: int = 50) -> list[dict[str, Any]]:
+    """Every run, newest first, with enough context to identify one without opening it.
+
+    `app_name` is joined rather than resolved in the browser: the list is the place an
+    operator works out which run they are looking at, and a ticket id alone does not say
+    which application it belongs to once more than one is registered.
+
+    LEFT JOIN, not an inner join. `app_id` is NOT NULL with a foreign key, so today the row
+    is always there — but this list is a view onto the audit trail, and a run disappearing
+    from it because of a join is a failure mode worth spending a `COALESCE` to make
+    impossible.
+    """
     async with connect() as conn:
         rows = await conn.fetch(
-            "SELECT id, app_id, ticket_system, ticket_id, risk_tier, status, policy_commit, "
-            "created_at FROM flow_runs ORDER BY created_at DESC LIMIT $1",
+            "SELECT r.id, r.app_id, COALESCE(a.name, '(deleted)') AS app_name, "
+            "r.ticket_system, r.ticket_id, r.risk_tier, r.status, r.policy_commit, "
+            "r.created_at, r.ended_at "
+            "FROM flow_runs r LEFT JOIN app_registry a ON a.id = r.app_id "
+            "ORDER BY r.created_at DESC LIMIT $1",
             limit,
         )
     return [
@@ -824,7 +1358,18 @@ async def run_diagnostics(run_id: uuid.UUID, _: Viewer) -> list[dict[str, Any]]:
     except Exception as exc:  # noqa: BLE001 - Temporal being down is an operational fact
         raise HTTPException(503, f"the Flow Engine is unreachable: {exc}") from None
 
-    handle = client.get_workflow_handle(f"kuwarden-{run_id}")
+    # Read from the row, never rebuilt from the run id. The two are not interchangeable: a
+    # run started by the service hook is keyed on the work item and its revision, so
+    # reconstructing `kuwarden-{run_id}` looks up a workflow that never existed and reports a
+    # missing history for a run whose history is fine.
+    async with connect() as conn:
+        workflow_id = await conn.fetchval(
+            "SELECT workflow_id FROM flow_runs WHERE id = $1", run_id
+        )
+    if workflow_id is None:
+        raise HTTPException(404, "no such run")
+
+    handle = client.get_workflow_handle(workflow_id)
     scheduled: dict[int, str] = {}
     attempts: list[dict[str, Any]] = []
 
@@ -952,6 +1497,91 @@ async def decide(run_id: uuid.UUID, body: Decision, principal: Approver) -> dict
         raise HTTPException(503, f"the Flow Engine is unreachable: {exc}") from None
 
     return {"recorded": True, "approved": body.approved, "principal": principal.email}
+
+
+@app.post("/api/runs/{run_id}/terminate", status_code=202)
+async def terminate_run(run_id: uuid.UUID, principal: Admin) -> dict[str, Any]:
+    """Stop a run that is going nowhere, and say in the record who stopped it.
+
+    **Terminate, not cancel, and the difference is not cosmetic.** A Temporal cancellation is
+    delivered to the workflow as `asyncio.CancelledError`, which is a `BaseException` — the
+    flow's `except Exception` handler does not catch it, so compensation would not run and the
+    operator would be told cleanup had happened when it had not. Terminating is at least
+    honest about being abrupt, and the event below states plainly what was left behind.
+
+    **`admin`, not `approver`.** Rejecting a change at the gate is a judgment about the change
+    and belongs to an approver. Killing a run mid-flight is an operational act on the platform
+    — it can leave a branch on someone's remote — and is not a decision about the code.
+
+    The branch is deliberately *not* deleted here. This endpoint holds no SCM credential
+    (invariant 2 applies to the API as much as to the nodes), and a run stopped by a person is
+    exactly the case where somebody may want to look at what the agent produced before it
+    disappears. The row says the branch is still there so nobody has to guess.
+    """
+    async with connect() as conn:
+        row = await conn.fetchrow(
+            "SELECT status, workflow_id, ticket_id FROM flow_runs WHERE id = $1", run_id
+        )
+        if row is None:
+            raise HTTPException(404, f"no run {run_id}")
+        if row["status"] not in ("running", "suspended"):
+            raise HTTPException(409, f"this run is {row['status']}; there is nothing to stop")
+        # Read before terminating, so the record can name the branch that is being orphaned.
+        branch = await conn.fetchval(
+            "SELECT payload->>'branch' FROM flow_events "
+            "WHERE run_id = $1 AND kind = 'branch_pushed' ORDER BY seq DESC LIMIT 1",
+            run_id,
+        )
+        # The next sequence number, taken from the trail itself. The workflow assigns its own
+        # numbers and this row is written from outside it, so continuing the sequence is the
+        # only way the event lands in order rather than colliding with seq 1.
+        seq = int(await conn.fetchval(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM flow_events WHERE run_id = $1", run_id
+        ))
+
+    try:
+        from temporalio.client import Client
+
+        from engine.worker import namespace, target
+
+        client = await Client.connect(target(), namespace=namespace())
+        await client.get_workflow_handle(str(row["workflow_id"])).terminate(
+            reason=f"terminated from the Workbench by {principal.email}"
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 - Temporal being down is an operational fact
+        raise HTTPException(503, f"the Flow Engine is unreachable: {exc}") from None
+
+    async with connect() as conn:
+        # Written after the terminate succeeded, never before. A row saying a run was stopped
+        # while it carried on running is worse than no row.
+        await conn.execute(
+            "INSERT INTO flow_events (run_id, seq, kind, node_id, payload) "
+            "VALUES ($1, $2, 'run_terminated', NULL, $3) ON CONFLICT (run_id, seq) DO NOTHING",
+            run_id,
+            seq,
+            json.dumps(
+                {
+                    "principal": principal.email,
+                    "was": row["status"],
+                    "detail": "terminated from the Workbench; compensation did not run",
+                    # Named rather than implied. Somebody has to delete this by hand.
+                    "branch_left_behind": branch,
+                }
+            ),
+        )
+        await conn.execute(
+            "UPDATE flow_runs SET status = 'terminated', ended_at = now() "
+            "WHERE id = $1 AND status IN ('running', 'suspended')",
+            run_id,
+        )
+
+    return {
+        "terminated": True,
+        "principal": principal.email,
+        "branch_left_behind": branch,
+    }
 
 
 @app.get("/api/sandbox")

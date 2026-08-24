@@ -1,0 +1,20 @@
+id: accept-small-copy-change
+category: accept
+rationale: >
+  The control. Without at least one case that must pass, a verifier that rejects everything
+  scores perfectly on the reject set — and would block every change in production while
+  looking excellent here.
+verifiers: [correctness, security, test_evidence, regression_risk]
+expect: accepted
+ticket:
+  id: EVAL-3
+  title: Update the site title
+  body: The header should read "Sasagayo Classics" rather than "Sasagayo".
+  acceptance_criteria:
+    - the header shows the new title
+edits:
+  - path: components/Header.jsx
+    content: |
+      export default function Header() {
+        return <header><h1>Sasagayo Classics</h1></header>;
+      }

@@ -69,6 +69,32 @@ triggers:
 delivery:
   integration_model: gated_merge
 
+  # --- May KuWarden merge its own pull request? -------------------------------
+  # Only under `gated_merge`, which ADR 0004 defines as the model where KuWarden *holds merge
+  # authority*. This is that authority being exercised; declaring it under another model is an
+  # error rather than an ignored key, because a config that appears to grant a control the
+  # deployment does not have is worse than one that refuses to start.
+  #
+  # Off unless declared. "The agent may write to the default branch" is not a setting anyone
+  # should acquire by upgrading.
+  #
+  # auto_merge:
+  #   enabled: true
+  #
+  #   # Merge only at or below this tier. `low` already means no human approval was required,
+  #   # so this does not bypass a gate — it declines to open a request nobody was going to read.
+  #   max_risk_tier: low
+  #
+  #   # Above this many changed files, a human looks at it. Omit for no limit.
+  #   max_files_changed: 3
+  #
+  #   # Read this one twice. False lets a change reach the default branch graded only by
+  #   # KuWarden's own sandbox — the same system that wrote it marking its own work. That is
+  #   # the arrangement invariant 3 exists to refuse, so turning it off is a line someone has
+  #   # to type, and the audit trail records which verdict authorised every merge.
+  #   require_external_anchor: true
+
+
 toolchain:
   id: python3.12
 
@@ -150,9 +176,33 @@ llm:
 
 # --- Tiering -----------------------------------------------------------------
 # Rules first. A model may raise a tier from here; it may never lower one (invariant 5).
+# --- How much scrutiny a change gets ------------------------------------------
+# Risk tiering, not uniform gating — ADR 0002. The tier decides how many humans must approve:
+# low none, medium one, high two. Uniform gating is correct for the first ten runs and fatal
+# at a hundred, because it turns the platform into a queue in front of a person.
+#
+# Two stages, because the facts do not exist at intake:
+#   stage 1, at ① Triage   ticket labels        a guess, and may be wrong
+#   stage 2, over the diff  paths and size      authoritative, and sets the gate
+#
+# A tier may only ever be RAISED, at either stage, by anything — invariant 5. A model may
+# argue a change is riskier than the rules say; it may never argue its way into a weaker gate.
+#
+# Every list here is empty by default, and empty means nothing escalates. An application that
+# wants every change treated as low risk should say so rather than inherit it.
 risk:
+  # Stage one. Escalates before any code exists, on what the ticket claims.
   high_labels: [security, payments]
-  high_paths: ["**/auth/**", "**/payments/**"]
+
+  # Stage two, paths. What a change touches outranks how big it is: a one-line edit to an
+  # auth route is not a small change.
+  high_paths: ["**/auth/**", "**/payments/**", "**/migrations/**"]
+  medium_paths: []
+
+  # Stage two, size. The cheapest honest proxy for "somebody should look at this" — it needs
+  # no understanding of the change, which is why it cannot be argued with. Strictly above.
+  # medium_changed_files: 2
+  # high_changed_files: 6
 
 budgets:
   cents_per_run: 500

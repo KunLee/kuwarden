@@ -1,0 +1,68 @@
+# Toolchain recipe: Node 20, with one application's dependencies baked in.
+#
+# Unlike `python312`, this image is NOT generic and is not built by `python -m engine.sandbox
+# build`. It is built per application, by `build-app`, because of what it has to contain.
+#
+# `pytest` and `ruff` are tools: the same binaries verify any Python project. A JavaScript
+# project's gate is `next build` or `vite build` or `tsc`, and those do not run against tools
+# — they run against *that application's* dependency tree. So the image has to carry the
+# application's own `node_modules`, and an image carrying one application's dependencies has
+# no business being shipped as part of the platform.
+#
+# Why baked at all, rather than installed when the tests run: the sandbox has no egress (ADR
+# 0005 property 2). `npm ci` cannot reach a registry from inside it, and that is the property,
+# not an obstacle to route around. Here, at build time, there is a network — and the result is
+# a pinned, reviewable artefact rather than an unreviewed download executed next to the
+# customer's source.
+#
+# Rebuilding after a dependency change is deliberate friction, exactly as it is for
+# `python312`: it puts a human between "the application wants a package" and "the package is
+# present in the thing that grades agent output".
+
+# Pinned, and matched to the application's own CI. A toolchain that grades a change under a
+# different runtime than the pipeline is a reality anchor that disagrees with reality.
+FROM docker.io/library/node:20-slim
+
+# Installed at the filesystem ROOT, which is load-bearing and not a stylistic choice.
+#
+# The sandbox bind-mounts a fresh workspace over /workspace every run, so dependencies baked
+# in there are shadowed. The obvious workaround — install to /opt/deps and symlink it in from
+# the test command — is worse than it looks: the symlink is created inside the container but
+# lands in the *host* directory that git then reads to compute the diff, where /opt/deps does
+# not exist. `git add -A` fails with "unable to index file 'node_modules'" and the run dies
+# after the Coder, with an error that names neither the sandbox nor the cause.
+#
+# /node_modules avoids touching the workspace at all. Node's resolution algorithm walks every
+# ancestor directory looking for node_modules, so a require from /workspace/components finds
+# /node_modules without anything being written into the project.
+WORKDIR /
+
+# Both manifests are copied when both exist; `build-app` writes a stub lockfile when the
+# application has none, so this layer does not have to branch.
+COPY package.json package-lock.json* ./
+
+# `npm ci` when there is a real lockfile, `npm install` otherwise. `ci` is preferred for the
+# reason the application's own pipeline comment gives: a build that resolves different
+# dependencies than the one before it is a weak anchor, because a red run may mean nothing
+# changed in the code at all.
+RUN if [ -s package-lock.json ]; then npm ci --no-audit --no-fund; \
+    else npm install --no-audit --no-fund; fi
+
+# The sandbox runs with a read-only root filesystem and a writable /tmp, so anything wanting a
+# home directory gets one there. npm in particular will try to write a cache and fail loudly
+# without this.
+ENV HOME=/tmp \
+    NPM_CONFIG_CACHE=/tmp/.npm \
+    NPM_CONFIG_UPDATE_NOTIFIER=false \
+    NEXT_TELEMETRY_DISABLED=1
+
+# `npm run` puts ./node_modules/.bin on PATH relative to the working directory, which here is
+# the project and has no node_modules of its own. Adding the root one explicitly is what makes
+# `eslint` and `tsc` resolvable, and it is deterministic rather than relying on npm's own
+# ancestor walk.
+ENV PATH=/node_modules/.bin:$PATH
+
+# The application's config then needs nothing unusual — just the commands its pipeline runs:
+#
+#   test_command: [sh, -c, "npm run lint && npm run typecheck"]
+WORKDIR /workspace

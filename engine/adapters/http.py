@@ -110,6 +110,9 @@ class RestClient:
     async def post(self, url: str, *, json: Any, params: Mapping[str, str] | None = None) -> Any:
         return await self.request("POST", url, json=json, params=params)
 
+    async def put(self, url: str, *, json: Any, params: Mapping[str, str] | None = None) -> Any:
+        return await self.request("PUT", url, json=json, params=params)
+
     async def patch(self, url: str, *, json: Any, params: Mapping[str, str] | None = None) -> Any:
         return await self.request("PATCH", url, json=json, params=params)
 

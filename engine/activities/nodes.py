@@ -18,6 +18,7 @@ from uuid import UUID
 
 from temporalio import activity
 
+from engine import config_store
 from engine.adapters.credentials import (
     CredentialBroker,
     CredentialRequest,
@@ -68,37 +69,68 @@ class NodeRuntime:
 
     def configure(
         self,
-        config: AppConfig,
+        config: AppConfig | None = None,
         broker: CredentialBroker | None = None,
         transport: object | None = None,
         sandbox: Sandbox | None = None,
     ) -> None:
+        """Bind worker-wide facts.
+
+        `config` is optional. A worker serving many applications resolves configuration per
+        run and needs none of its own; passing one makes it the fallback for applications
+        that have no stored configuration yet.
+        """
         self._config = config
         if broker is not None:
             self._broker = broker
             self._explicit_broker = broker
         self._transport = transport
-        # Built once from configuration. Constructing it per node call would re-probe the
-        # host's capabilities on every step, which costs a container each time.
-        self._sandbox = sandbox or PodmanSandbox(
-            require_full_isolation=config.sandbox.require_full_isolation
-        )
+        # Kept only when a caller injected one — a test's stub. Otherwise the sandbox is built
+        # per context from the configuration that governs *that* run: `require_full_isolation`
+        # is a per-application declaration, and binding it once at startup meant an
+        # application asking for strict isolation silently ran under another's relaxed
+        # setting. A sandbox reporting a bound it is not applying is the failure ADR 0005 is
+        # written against.
+        self._sandbox = sandbox
 
-    def context(self, app_id: UUID | None = None) -> NodeContext:
+    @property
+    def configured_config(self) -> AppConfig | None:
+        """What this worker was started with, or what a test fixture injected.
+
+        The fallback for an application with no stored configuration. Exposed rather than read
+        from the file inside `config_store`, so a test that injects a config is not quietly
+        overridden by whatever `kuwarden.yaml` is in the working directory.
+        """
+        return self._config
+
+    def context(self, app_id: UUID | None = None, config: AppConfig | None = None) -> NodeContext:
         """Bind a node's context, resolving credentials for one application.
 
         When `app_id` is given the broker reads the encrypted store first and falls back to
         the environment. That order matters: the Workbench writes at runtime and the
         environment is fixed at process start, so a credential someone just entered must win
         over a stale variable that was exported months ago.
+
+        `config` is passed in rather than resolved here because resolving it reads the
+        database, and this is a synchronous call on the hot path of every node. `run_node`
+        awaits `config_store.resolve` and hands the answer down. Omitted, the worker's own
+        startup configuration is used — which is what every test does, and what a
+        single-application deployment did before per-application configuration existed.
         """
-        if self._config is None:
+        effective = config or self._config
+        if effective is None:
             raise RuntimeError("worker has no kuwarden.yaml loaded; call configure() first")
         return NodeContext(
-            config=self._config,
+            config=effective,
             broker=self._broker_for(app_id),
             transport=self._transport,  # type: ignore[arg-type]
-            sandbox=self._sandbox,
+            # Constructing this per context is cheap: the expensive part is probing the
+            # host's capabilities, and that result is cached for the process in
+            # `engine.sandbox.podman`.
+            sandbox=self._sandbox
+            or PodmanSandbox(
+                require_full_isolation=effective.sandbox.require_full_isolation
+            ),
         )
 
     def _broker_for(self, app_id: UUID | None) -> CredentialBroker:
@@ -176,7 +208,13 @@ async def run_node(params: NodeInput) -> FlowState:
     log.info("run %s | %s | started", run_id, params.node_id)
     started = time.monotonic()
     try:
-        with bound(RUNTIME.context(params.app_id)):
+        # Resolved per run, not per worker. Which application's configuration governs this
+        # node is the question a single-tenant worker could not answer — see
+        # engine/config_store.py.
+        config = await config_store.resolve(
+            params.app_id, fallback=RUNTIME.configured_config
+        )
+        with bound(RUNTIME.context(params.app_id, config=config)):
             result = await fn(params.state)
     except Exception as exc:
         # Logged and re-raised, never swallowed. Temporal decides whether this is retryable;

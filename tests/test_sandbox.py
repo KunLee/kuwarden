@@ -69,6 +69,26 @@ async def test_a_failing_command_is_a_failure_not_a_limit() -> None:
     assert not result.succeeded
 
 
+async def test_the_sandbox_cannot_see_a_credential_from_the_host_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Property 1, asserted against podman rather than against our own argv.
+
+    The variable is set in *this* process, which is the one that spawns podman — so a runtime
+    that forwarded the parent environment, or a `--env` added to the invocation, would both
+    show up here. `test_invariants.py` asserts the argv half of the same property without
+    needing a container runtime; this is the half that proves podman behaves as assumed.
+    """
+    monkeypatch.setenv("KUWARDEN_SCM_TOKEN", "ghp_hostonlytoken")
+
+    async with materialise({}) as workspace:
+        result = await SANDBOX.exec(workspace, IMAGE, ["env"], LIMITS)
+
+    assert result.exit_code == 0
+    assert "ghp_hostonlytoken" not in result.stdout
+    assert "KUWARDEN_SCM_TOKEN" not in result.stdout
+
+
 async def test_the_sandbox_has_no_network() -> None:
     """Property 2, and property 5 by construction: there is no remote to push to."""
     async with materialise({}) as workspace:
@@ -120,20 +140,29 @@ async def test_edits_survive_between_commands_but_containers_do_not() -> None:
 
 
 async def test_the_diff_comes_from_git_not_from_the_agent() -> None:
-    """An agent's account of what it changed is never a gate input."""
-    async with materialise({"src.py": "old\n"}) as workspace:
+    """An agent's account of what it changed is never a gate input.
+
+    A removal is included, as `None`. `changed_files` has always reported deletions — git
+    does — but `read_changes` dropped anything that failed `is_file()`, so a change that only
+    deleted files reached Push carrying nothing and was refused as though the Coder had
+    produced no change at all.
+    """
+    async with materialise({"src.py": "old\n", "gone.py": "remove me\n"}) as workspace:
         await SANDBOX.exec(
             workspace,
             IMAGE,
-            ["sh", "-c", "echo new > src.py; echo added > extra.py"],
+            ["sh", "-c", "echo new > src.py; echo added > extra.py; rm gone.py"],
             LIMITS,
         )
         changes = await changed_files(workspace)
         contents = await read_changes(workspace)
 
     paths = {change.path for change in changes}
-    assert paths == {"src.py", "extra.py"}
-    assert contents["extra.py"].strip() == "added"
+    assert paths == {"src.py", "extra.py", "gone.py"}
+    added = contents["extra.py"]
+    assert added is not None
+    assert added.strip() == "added"
+    assert contents["gone.py"] is None, "a deleted path is reported, as None"
 
 
 async def test_the_workspace_is_destroyed_on_exit() -> None:

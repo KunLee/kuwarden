@@ -52,22 +52,80 @@ def config_path() -> Path:
     return Path(os.environ.get(CONFIG_VARIABLE, DEFAULT_CONFIG))
 
 
+#: How much this worker will do at once.
+#:
+#: Bounded by default rather than unbounded, for the same reason the sandbox is: an agent loop
+#: will otherwise consume the machine it runs on. Nothing else in the system caps this — one
+#: task queue serves every application, and with auto-merge enabled an unbounded worker is an
+#: unbounded number of unattended merges.
+#:
+#: **This is backpressure, not rejection.** Temporal is a durable queue: work beyond the cap
+#: waits its turn and still runs, with a complete audit trail. Nothing is dropped, so the
+#: conservative default costs throughput and never a ticket.
+#:
+#: `ACTIVITIES` is the one that matters. Each concurrent activity can be a podman container
+#: plus a model call — at the 2 GiB sandbox limit, four of them is 8 GiB before the host's own
+#: needs. Workflow tasks are cheap by comparison: they replay decisions and touch nothing
+#: expensive, so throttling them hard only delays every run for no saving.
+MAX_ACTIVITIES_VARIABLE = "KUWARDEN_MAX_CONCURRENT_ACTIVITIES"
+MAX_WORKFLOW_TASKS_VARIABLE = "KUWARDEN_MAX_CONCURRENT_WORKFLOW_TASKS"
+DEFAULT_MAX_ACTIVITIES = 4
+DEFAULT_MAX_WORKFLOW_TASKS = 40
+
+
+def _positive_int(variable: str, default: int) -> int:
+    """Read a positive integer from the environment, or refuse to start.
+
+    A malformed limit is not defaulted quietly. Someone typing `KUWARDEN_MAX_CONCURRENT_
+    ACTIVITIES=four` has said what they want; silently running unbounded-ish at the default
+    would leave them believing a cap was applied that was not — the same class of error as a
+    sandbox reporting a limit it does not enforce.
+    """
+    raw = os.environ.get(variable)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ConfigError(f"{variable} must be a positive integer, got {raw!r}") from None
+    if value < 1:
+        raise ConfigError(f"{variable} must be at least 1, got {value}")
+    return value
+
+
+def limits() -> tuple[int, int]:
+    """(activities, workflow tasks) this worker will run concurrently."""
+    return (
+        _positive_int(MAX_ACTIVITIES_VARIABLE, DEFAULT_MAX_ACTIVITIES),
+        _positive_int(MAX_WORKFLOW_TASKS_VARIABLE, DEFAULT_MAX_WORKFLOW_TASKS),
+    )
+
+
 async def main() -> None:
     load_dotenv()
     logging.basicConfig(level=os.environ.get("KUWARDEN_LOG_LEVEL", "INFO"))
 
+    # No longer required. Configuration is resolved per run from the `app_config` table
+    # (ADR 0008), so a worker serving several applications has no business demanding one
+    # application's file at startup. A file that *is* present becomes the fallback for
+    # applications with nothing stored yet — which is how a single-application deployment
+    # keeps working while it migrates.
+    #
+    # Credentials are deliberately not passed here either. The broker is chosen per run from
+    # the `app_id` the trigger supplied — see `NodeRuntime._broker_for`.
     path = config_path()
-    if not path.is_file():
-        raise ConfigError(
-            f"no configuration at {path}. The worker needs the application's kuwarden.yaml; "
-            f"point {CONFIG_VARIABLE} at it, or run from a directory that contains one."
+    if path.is_file():
+        config = load(path)
+        RUNTIME.configure(config)
+        logging.info("fallback configuration %s loaded for %r", path, config.name)
+    else:
+        RUNTIME.configure()
+        logging.info(
+            "no %s file; every application must have configuration stored in the Workbench",
+            CONFIG_VARIABLE,
         )
-    config = load(path)
-    # Credentials are deliberately not passed here. The broker is chosen per run from the
-    # `app_id` the trigger supplied, so the Workbench's encrypted store is what resolves them
-    # — see `NodeRuntime._broker_for`.
-    RUNTIME.configure(config)
-    logging.info("loaded %s for application %r", path, config.name)
+
+    max_activities, max_workflow_tasks = limits()
 
     client = await Client.connect(target(), namespace=namespace())
     worker = Worker(
@@ -75,8 +133,20 @@ async def main() -> None:
         task_queue=TASK_QUEUE,
         workflows=[DeliveryFlow],
         activities=ALL,
+        max_concurrent_activities=max_activities,
+        max_concurrent_workflow_tasks=max_workflow_tasks,
     )
-    logging.info("worker ready on %s/%s queue=%s", target(), namespace(), TASK_QUEUE)
+    # Logged because the ceiling of a deployment is this number times the number of workers
+    # polling the queue, and an operator cannot work that out from a running process
+    # otherwise.
+    logging.info(
+        "worker ready on %s/%s queue=%s activities<=%d workflow_tasks<=%d",
+        target(),
+        namespace(),
+        TASK_QUEUE,
+        max_activities,
+        max_workflow_tasks,
+    )
     await worker.run()
 
 

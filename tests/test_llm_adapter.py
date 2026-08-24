@@ -7,13 +7,20 @@ than an obvious error — the failures you only find in production.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 
 from engine.adapters.credentials import EnvCredentialBroker
-from engine.adapters.llm import LLMError, LLMRequest, ModelRefusal, Provider
+from engine.adapters.llm import (
+    LLMError,
+    LLMRequest,
+    LLMRequestRejected,
+    ModelRefusal,
+    Provider,
+)
 from engine.adapters.llm.anthropic_api import AnthropicLLM
 from engine.adapters.llm.factory import llm_adapter
 from engine.config import ConfigError, parse
@@ -22,6 +29,9 @@ from engine.nodes.base import executing
 from tests.conftest import KUWARDEN_YAML
 
 BROKER = EnvCredentialBroker({"KUWARDEN_LLM_API_KEY": "sk-ant-fake"})
+REPO_ROOT = Path(__file__).resolve().parents[1]
+#: Read once, so the assertion below and the flow cannot drift apart unnoticed.
+NON_RETRYABLE = (REPO_ROOT / "engine" / "flows" / "delivery.py").read_text(encoding="utf-8")
 
 
 def _message(**overrides: Any) -> dict[str, Any]:
@@ -212,3 +222,46 @@ async def test_a_truncated_response_says_it_was_truncated() -> None:
     assert "max_tokens" in str(caught.value)
     assert "8192 output tokens" in str(caught.value)
     assert "not JSON" not in str(caught.value), "the symptom must not mask the cause"
+
+
+async def test_a_rejected_request_is_not_retried_and_says_where_the_reason_is() -> None:
+    """A 400 says the request as sent can never be served, so retrying it is pure delay.
+
+    The case that made this matter is not a malformed request at all: Anthropic returns an
+    exhausted credit balance as `invalid_request_error` — a 400, not a 402 — so the most
+    likely cause of a rejected request in practice was being retried as though a payment
+    problem were transient, three times, before failing.
+
+    The provider's own sentence stays out of the exception, because it can quote the request
+    and the request carries ticket text. It goes to the worker log instead, and the exception
+    says where. Discarding it entirely was the earlier behaviour, and it made every 400 read
+    identically whether the account was unpaid, the schema wrong, or the prompt too long.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "Your credit balance is too low to access the Anthropic API.",
+                },
+            },
+        )
+
+    adapter = AnthropicLLM("claude-sonnet-5", BROKER, transport=httpx.MockTransport(handler))
+    with executing(REGISTRY["planner"]), pytest.raises(LLMRequestRejected) as rejected:
+        await adapter.complete(LLMRequest(system="s", prompt="p"))
+
+    message = str(rejected.value)
+    assert "worker log" in message, "an operator has to be told where the reason is"
+    assert "cannot be billed" in message
+    # The classification is decorative unless the flow acts on it.
+    assert "LLMRequestRejected" in NON_RETRYABLE
+
+
+def test_the_flow_declares_a_rejected_request_non_retryable() -> None:
+    """Read from the flow source, so the two cannot drift apart silently."""
+    source = (REPO_ROOT / "engine" / "flows" / "delivery.py").read_text(encoding="utf-8")
+    assert '"LLMRequestRejected"' in source

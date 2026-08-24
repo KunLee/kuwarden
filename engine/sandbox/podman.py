@@ -127,8 +127,17 @@ class PodmanSandbox:
             ]
         )
 
+        # Named after the workspace it is executing, so an operator watching `podman ps` can
+        # tell the sandbox apart from everything else on the host. Podman otherwise invents a
+        # name like `vigilant_lichterman`, which says nothing about what is running or why.
+        #
+        # Cosmetic, but only until it is not: this container is the one place agent-written
+        # code executes, and "which of these is that" is the first question anyone asks when
+        # something is consuming the machine. `mkdtemp` already made the suffix unique per
+        # workspace, so two concurrent runs cannot collide on it.
         argv = [
             self._binary, "run", "--rm",
+            f"--name=kuwarden-sandbox-{root.name.removeprefix('kuwarden-ws-')}",
             # Property 2, and property 5 by construction.
             "--network=none",
             # Property 3: nothing but the mounted workspace survives, and root is read-only.

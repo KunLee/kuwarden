@@ -21,7 +21,11 @@ export type RunStatus =
   | "succeeded"
   | "rejected"
   | "failed"
-  | "aborted";
+  | "aborted"
+  // Stopped by a person, from the Workbench — the only status not written by the workflow.
+  // Distinct from `aborted`, which is the flow stopping itself on the evidence. Implies
+  // compensation did NOT run, so a branch may still exist on the remote.
+  | "terminated";
 
 export interface Application {
   id: string;
@@ -75,12 +79,16 @@ export interface Run {
   id: string;
   /** Which application this run belongs to — what a re-run needs. */
   app_id: string;
+  /** Joined from app_registry. `(deleted)` if the application is gone but the run remains. */
+  app_name: string;
   ticket_system: string;
   ticket_id: string;
   risk_tier: RiskTier;
   status: RunStatus;
   policy_commit: string;
   created_at: string;
+  /** Null while the run is still in flight. */
+  ended_at: string | null;
 }
 
 export interface RunEvent {
@@ -97,6 +105,39 @@ export interface RunEvent {
       nothing but the record. */
   payload: Record<string, unknown>;
   occurred_at: string;
+}
+
+/**
+ * A node's account of what it read, decided and produced — `engine.nodes.notes`.
+ *
+ * Carried in the `payload` of `node_completed` and `verifier_verdict`. Optional everywhere,
+ * because runs recorded before notes existed have none and must still render.
+ */
+export interface NoteSection {
+  title: string;
+  kind: "fields" | "checks" | "text";
+  /** `fields`: [label, value] pairs, already stringified engine-side. */
+  rows?: [string, string][] | NoteCheck[];
+  /** `text` only. */
+  body?: string;
+  /** Written by whoever filed the ticket, or returned by a model — never by KuWarden. */
+  untrusted?: boolean;
+  truncated?: boolean;
+  /** Which end of an over-long block was kept. Test output keeps the end. */
+  kept?: "start" | "end";
+  full_length?: number;
+}
+
+export interface NoteCheck {
+  label: string;
+  required: string;
+  found: string;
+  ok: boolean;
+}
+
+export interface Notes {
+  summary: string;
+  sections: NoteSection[];
 }
 
 /**
@@ -146,7 +187,12 @@ export interface Evidence {
     run_id: string;
     application: string | null;
     ticket: { system: string; id: string };
+    /** Authoritative — decided over the actual diff, after the Coder loop. */
     risk_tier: string;
+    /** What intake guessed from the ticket alone, before any code existed. */
+    provisional_risk_tier: string;
+    /** Which rule settled the authoritative tier, in the words the rule is written in. */
+    risk_tier_reason: string;
     status: string;
     policy_commit: string;
     policy_bundle: Record<string, unknown>;

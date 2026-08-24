@@ -6,8 +6,32 @@
  * is not smaller text, it is more air.
  */
 
+import * as Dialog from "@radix-ui/react-dialog";
+import * as RadixSwitch from "@radix-ui/react-switch";
 import type { ReactNode } from "react";
+import { Link } from "react-router-dom";
 import type { RiskTier, RunStatus } from "../types";
+
+/**
+ * Return navigation for a detail page.
+ *
+ * Detail pages are reached by clicking a row in a list, and the browser back button is the
+ * only other way out. That is fine until a page navigates on its own — registering an
+ * application, deleting one, starting a run — after which "back" lands somewhere the user did
+ * not come from. An explicit link to the list is the affordance that always means the same
+ * thing.
+ */
+export function BackLink({ to, children }: { to: string; children: ReactNode }) {
+  return (
+    <Link
+      to={to}
+      className="inline-flex items-center gap-1.5 text-sm text-muted transition-colors hover:text-accent"
+    >
+      <span aria-hidden="true">←</span>
+      {children}
+    </Link>
+  );
+}
 
 /** A panel. The only container in the Workbench — nesting them is a layout smell. */
 export function Card({
@@ -195,6 +219,11 @@ export function StatusBadge({ status }: { status: RunStatus }) {
     rejected: "bg-amber-500/12 text-amber-700 dark:text-amber-300",
     failed: "bg-red-500/12 text-red-700 dark:text-red-300",
     aborted: "bg-slate-500/10 text-slate-500 dark:text-slate-400",
+    // Deliberately not the same grey as `aborted`. A run the system stopped on the evidence
+    // and a run a person switched off are different facts, and the list view is where an
+    // operator scans for the second kind — those are the ones that may have left a branch
+    // behind, because terminating skips compensation.
+    terminated: "bg-stone-500/14 text-stone-700 dark:text-stone-300",
   };
   return <span className={`${badge} ${styles[status]}`}>{status}</span>;
 }
@@ -230,5 +259,116 @@ export function Banner({
     <div className={`rounded-xl border px-4 py-3 text-[13px] leading-relaxed ${styles}`}>
       {children}
     </div>
+  );
+}
+
+/**
+ * A destructive action, confirmed against what it will destroy.
+ *
+ * Replaces `window.confirm`. Two things a native dialog cannot do, and both matter in a
+ * console whose subject is deliberate action:
+ *
+ * **It can show the consequence.** "Delete sasagayo?" and "Delete sasagayo — its stored
+ * credentials go with it, and three runs reference it" are different questions. A browser
+ * confirm can only ask the first.
+ *
+ * **The destructive button is not the default.** Cancel holds focus on open and Enter
+ * dismisses. A dialog whose dangerous path is one keystroke from a distracted operator is a
+ * dialog that gets through by accident — the same reasoning as the approval gate, where
+ * "Reject is not styled as a lesser action".
+ *
+ * Radix supplies the focus trap, the escape and outside-click handling, the ARIA wiring and
+ * the portal. Those are the parts that are hard to get right and invisible when wrong.
+ */
+export function ConfirmDialog({
+  open,
+  onOpenChange,
+  title,
+  confirmLabel,
+  onConfirm,
+  busy,
+  children,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  title: string;
+  confirmLabel: string;
+  onConfirm: () => void;
+  busy?: boolean;
+  children: ReactNode;
+}) {
+  return (
+    <Dialog.Root open={open} onOpenChange={onOpenChange}>
+      <Dialog.Portal>
+        <Dialog.Overlay className="fixed inset-0 z-50 bg-ink/25 backdrop-blur-[2px]" />
+        <Dialog.Content
+          className="fixed left-1/2 top-1/2 z-50 w-[min(30rem,calc(100vw-2rem))] -translate-x-1/2 -translate-y-1/2 rounded-xl border border-line bg-surface p-5 shadow-lg"
+          // Focus lands on Cancel, not on the destructive control. Radix would otherwise
+          // focus the first tabbable element, and a dialog whose dangerous path is one
+          // keystroke away is one that gets through by accident.
+          onOpenAutoFocus={(event) => {
+            event.preventDefault();
+            const target = event.target as HTMLElement | null;
+            target?.querySelector<HTMLElement>("[data-cancel]")?.focus();
+          }}
+        >
+          <Dialog.Title className="text-title font-semibold">{title}</Dialog.Title>
+          <Dialog.Description asChild>
+            <div className="mt-2 text-body leading-relaxed text-muted">{children}</div>
+          </Dialog.Description>
+
+          <div className="mt-5 flex justify-end gap-2.5">
+            <Dialog.Close asChild>
+              <button
+                type="button"
+                data-cancel
+                className="rounded-lg border border-line px-3.5 py-2 text-meta font-medium transition hover:bg-canvas"
+              >
+                Cancel
+              </button>
+            </Dialog.Close>
+            <button
+              type="button"
+              onClick={onConfirm}
+              disabled={busy}
+              className="rounded-lg bg-danger px-3.5 py-2 text-meta font-medium text-surface transition hover:opacity-90 disabled:opacity-50"
+            >
+              {busy ? "Working…" : confirmLabel}
+            </button>
+          </div>
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
+  );
+}
+
+/**
+ * An on/off control.
+ *
+ * Radix rather than a styled `<button role="switch">`: it handles the roving focus, the
+ * Space/Enter semantics and the `aria-checked` state that a hand-rolled version gets subtly
+ * wrong — and gets wrong invisibly, because a mouse never exercises any of it.
+ */
+export function Switch({
+  checked,
+  onCheckedChange,
+  disabled,
+  label,
+}: {
+  checked: boolean;
+  onCheckedChange: (checked: boolean) => void;
+  disabled?: boolean;
+  label: string;
+}) {
+  return (
+    <RadixSwitch.Root
+      checked={checked}
+      onCheckedChange={onCheckedChange}
+      disabled={disabled}
+      aria-label={label}
+      className="relative h-6 w-11 shrink-0 rounded-full transition-colors data-[state=checked]:bg-accent data-[state=unchecked]:bg-line disabled:opacity-50"
+    >
+      <RadixSwitch.Thumb className="block size-5 translate-x-0.5 rounded-full bg-surface shadow-sm transition-transform will-change-transform data-[state=checked]:translate-x-[1.375rem]" />
+    </RadixSwitch.Root>
   );
 }
