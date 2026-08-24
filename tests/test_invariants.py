@@ -7,6 +7,7 @@ anyone noticing.
 from __future__ import annotations
 
 import re
+import uuid
 from pathlib import Path
 
 import pytest
@@ -14,11 +15,14 @@ import pytest
 from engine.adapters.credentials import PRIVILEGED_KINDS, CredentialKind, CredentialRequest
 from engine.adapters.llm import assert_may_call_llm
 from engine.errors import InvariantViolation, RiskTierLowered
-from engine.nodes import NODES, REGISTRY
+from engine.flows.delivery import _verifier_brief
+from engine.nodes import NODES, REGISTRY, repo_context, verifiers
 from engine.nodes.base import executing
 from engine.policy.protected_paths import DEFAULT_PROTECTED_PATHS, ProtectedPaths
 from engine.policy.tiering import assert_not_lowered, raise_to, required_approvals
-from engine.state import NodeClass
+from engine.sandbox import ResourceLimits, SandboxCapabilities, Workspace
+from engine.sandbox.podman import PodmanSandbox
+from engine.state import ChangePlan, FlowState, NodeClass, ProposedEdit, Ticket
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -255,4 +259,133 @@ def test_the_brief_is_an_allow_list_so_a_new_field_is_invisible_by_default() -> 
     declared = set(_FlowState.__dataclass_fields__)
     assert declared >= VERIFIER_MAY_SEE, "the allow-list names only real fields"
     # The ones that would defeat the purpose must never appear in it.
-    assert not (VERIFIER_MAY_SEE & {"plan", "retry_count", "verifications", "approvals"})
+    assert not (VERIFIER_MAY_SEE & {"plan", "retry_count", "verifications", "approvals", "notes"})
+
+
+def test_a_verifier_cannot_read_the_coders_reasoning_out_of_a_note() -> None:
+    """The allow-list working on a field added after it was written.
+
+    `notes` carries the Planner's full prompt and the Coder's per-attempt account of itself —
+    everything invariant 4 removes from `plan` and `retry_count`, in prose. A verifier that
+    could read it would be reading the author's reasoning through a different attribute, and
+    the redaction above would be decorative.
+
+    This passes because the brief is an allow-list, not because anyone remembered to add
+    `notes` to a deny-list. That is the property being tested.
+    """
+    import uuid as _uuid
+
+    from engine.flows.delivery import _verifier_brief
+    from engine.state import FlowState, Ticket
+
+    state = FlowState(
+        run_id=_uuid.uuid4(),
+        root_run_id=_uuid.uuid4(),
+        ticket=Ticket(id="PAY-1", system="jira", title="t", body="b"),
+        policy_commit="0" * 40,
+        policy_bundle={"pinned": True},
+        notes={"summary": "I tried three times and weakened a test", "sections": []},
+    )
+
+    assert _verifier_brief(state).notes == {}
+
+
+# --- invariant 12: the sandbox holds no credentials ---------------------------------------
+#
+# The companion test in `test_sandbox.py` runs a container and reads its environment, which is
+# the stronger evidence but needs podman and is skipped without it. This one asserts the same
+# property against the argv we construct, so it runs everywhere — including on a CI runner
+# with no container runtime. The regression it exists to catch is someone adding an `--env`
+# during a debugging session and leaving it there; that edit is invisible to every other test
+# in the suite.
+
+
+class _ArgvOnlyPodman(PodmanSandbox):
+    """A `PodmanSandbox` that records the argv it would have run, and runs nothing."""
+
+    def __init__(self) -> None:
+        super().__init__(require_full_isolation=False)
+        self.argv: list[str] = []
+
+    async def capabilities(self) -> SandboxCapabilities:
+        """Fixed, because probing runs a real container.
+
+        The argv is built identically whatever the host enforces, so answering "everything"
+        keeps this test independent of podman without weakening what it asserts.
+        """
+        return SandboxCapabilities(
+            cgroup_memory=True,
+            cgroup_cpu=True,
+            cgroup_pids=True,
+            rlimit_memory=True,
+            tmpfs_quota=True,
+        )
+
+    async def _run(self, argv: list[str], *, timeout_s: int) -> tuple[int, str, str]:
+        self.argv = argv
+        return 0, "", ""
+
+
+async def test_the_sandbox_is_never_invoked_with_a_forwarded_environment(
+    tmp_path: Path,
+) -> None:
+    """Exactly one `--env`, and it carries no credential.
+
+    `HOME` is required because the root filesystem is read-only, so the process needs
+    somewhere writable. Every other environment-bearing podman flag is a way for a host
+    token to reach code a ticket author influenced: `--env-host` forwards the lot, and
+    `--env-file` forwards whatever a path happens to contain.
+    """
+    sandbox = _ArgvOnlyPodman()
+
+    await sandbox.exec(Workspace(root=str(tmp_path)), "toolchain:test", ["true"], ResourceLimits())
+
+    forwarding = [arg for arg in sandbox.argv if arg.startswith(("--env", "-e"))]
+    assert forwarding == ["--env=HOME=/tmp"], (
+        "invariant 12: the sandbox holds no credentials. Adding an environment flag here "
+        "hands a host secret to code written by a model that read a ticket anyone can file."
+    )
+
+
+def test_a_verifier_sees_the_repository_but_still_not_the_coders_reasoning() -> None:
+    """The base tree is context; the Coder's thinking is not. Invariant 4 draws that line.
+
+    Verifiers used to see the diff and nothing else, and it made them reject valid work.
+    Asked to switch the site theme, the Coder set `data-theme="ocean"` and changed nothing
+    else — correctly, because `[data-theme="ocean"]` already existed in `globals.css`. Two
+    verifiers blocked it on "globals.css is not among the changed files, so there is no
+    evidence those tokens exist". Both reasoned soundly from what they had; neither could
+    open the file.
+
+    Reading the repository at a public commit is not seeing anyone's reasoning — it is what
+    any reviewer opening the pull request would have. What invariant 4 forbids is unchanged
+    and is asserted here alongside it, so a later widening cannot quietly take the plan too.
+    """
+    repository, _ = repo_context.render(
+        {
+            "app/globals.css": b'[data-theme="ocean"] { --bg: #123; }\n',
+            "app/layout.tsx": b"export default function Layout() {}\n",
+        },
+        "repository",
+    )
+
+    state = FlowState(
+        run_id=uuid.uuid4(),
+        root_run_id=uuid.uuid4(),
+        ticket=Ticket(id="PAY-1", system="jira", title="switch theme", body="."),
+        policy_commit="0" * 40,
+        policy_bundle={},
+        plan=ChangePlan(summary="SECRET PLAN", steps=["do not leak me"]),
+        retry_count=3,
+        proposed_edits=[ProposedEdit(path="app/layout.tsx", content="data-theme='ocean'")],
+    )
+
+    prompt = verifiers._prompt(_verifier_brief(state), repository)
+
+    assert '[data-theme="ocean"]' in prompt, (
+        "a verifier must be able to check whether something the change refers to exists"
+    )
+    assert "app/globals.css" in prompt
+    # The line that must not move.
+    assert "SECRET PLAN" not in prompt
+    assert "do not leak me" not in prompt

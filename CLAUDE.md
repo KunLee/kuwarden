@@ -52,7 +52,7 @@ it, a human must; **none** — not implemented at all.
 | 9 | **The audit trail is a tree and append-only.** Never `UPDATE` an audit row. | **machine** — the `flow_events_no_update` database trigger; `test_the_audit_trail_is_append_only` | [ADR 0003](docs/adr/0003-role-graph-and-traceability.md) |
 | 10 | **Agents never write `protected_paths`** — CI definitions, deploy manifests, IaC, `kuwarden.yaml`, `policy.yaml`. | **machine, but later than this wording implies** — the deny is on the diff in `push`, *before anything reaches origin*, and again in `build_test` before execution; both call one `assert_not_protected`. Still after the Coder has written the file into its own sandbox. 17 cases incl. drift against `policy.example.yaml`, plus the Push case | [ADR 0004](docs/adr/0004-delivery-integration-models.md), [ADR 0007](docs/adr/0007-push-before-verification.md) |
 | 11 | **`control_mode` is never inferred or defaulted.** `authorized` means KuWarden gated it; `observed` means we watched it happen. | **machine** — the `control_mode_exactly_on_effects` CHECK constraint, asserted in `test_walking_skeleton.py`. Note the ADR 0004 deviation: nullable + CHECK rather than `NOT NULL` | [ADR 0004](docs/adr/0004-delivery-integration-models.md) |
-| 12 | **The sandbox holds no credentials, has no egress, is ephemeral, is limited, and produces a diff — it never pushes.** | **partial** — egress, limits, ephemerality and the git-computed diff are each tested in `test_sandbox.py`. *"Holds no credentials" is implemented (podman forwards no host environment) and untested*, so an added `--env` would break it silently | [ADR 0005](docs/adr/0005-sandbox-contract.md) |
+| 12 | **The sandbox holds no credentials, has no egress, is ephemeral, is limited, and produces a diff — it never pushes.** | **machine** — egress, limits, ephemerality and the git-computed diff are each tested in `test_sandbox.py`. *"Holds no credentials"* is tested twice: `test_the_sandbox_cannot_see_a_credential_from_the_host_environment` sets a variable and reads the container's environment back (real podman, skipped without it), and `test_the_sandbox_is_never_invoked_with_a_forwarded_environment` in `test_invariants.py` asserts the argv carries no `--env` but `HOME` — the second needs no container runtime, so the clause stays enforced on a host or runner without podman | [ADR 0005](docs/adr/0005-sandbox-contract.md) |
 
 **Invariant 11 is the one with the worst failure mode.** Overstating what we authorised is
 manufacturing evidence. For a product whose value is evidence, that is worse than any missing
@@ -132,8 +132,8 @@ and docs. Terminology drift in this project has already caused one real design e
 ## Code conventions
 
 **Python** (engine, nodes, adapters)
-- 3.12+, full type annotations, `ruff` + `mypy --strict` — **run these yourself; there is
-  no CI in this repository yet.** See the note under *Security posture* below
+- 3.12+, full type annotations, `ruff` + `mypy --strict` — enforced on every PR by
+  `.github/workflows/ci.yml`. Run them locally anyway; CI is the backstop, not the loop
 - `async` by default; the engine is I/O-bound throughout
 - Dataclasses or Pydantic for anything crossing a boundary; no bare dicts in signatures
 - Errors: raise typed exceptions from `engine.errors`; never `except Exception: pass`
@@ -204,10 +204,15 @@ The last one is the only figure that shows KuWarden saved anyone any work.
 
 ## Security posture while developing
 
-- **Never commit a secret.** There is **no `.github/` directory and no pre-commit hook** — this
-  repository has no automated secret scanning of its own, and the only thing that has ever
-  caught a secret here was GitHub's own push protection, after the commit existed. Until that
-  is fixed, "never commit a secret" is a rule you enforce, not one the toolchain does.
+- **Never commit a secret.** Gitleaks runs over full history on every PR
+  (`.github/workflows/ci.yml`, config in `.gitleaks.toml`), so this is no longer a rule only
+  you enforce. **But note where in the sequence it fires:** CI scans after the commit has
+  reached GitHub, which for a real credential is already an incident requiring rotation. The
+  only thing that catches one earlier is `.githooks/pre-commit`, and that is **opt-in** —
+  git does not version `.git/hooks`, so it does nothing until you run
+  `git config core.hooksPath .githooks` once per clone. Advisory, therefore, not a control.
+  Do not describe this repository as having pre-commit secret scanning; it has pre-commit
+  secret scanning available.
 - Treat all ticket content as **hostile input**. It reaches a model, and anyone who can file a
   ticket can write it.
 - When adding a tool an agent can call, the default answer to "should this be allowed to
@@ -235,6 +240,6 @@ The last one is the only figure that shows KuWarden saved anyone any work.
 |---|---|
 | ~~The name~~ | **Resolved 2026-08-08.** Renamed KuFlow → KuWarden; [kuflow.com](https://kuflow.com) is an unrelated existing product in an adjacent category. Done before any package paths existed. |
 | `THREAT_MODEL.md` | Not written. Primary threats identified: prompt injection via ticket content, workflow-definition write escalation. |
-| `EVALUATION.md` | Not written. Blocks any claim that the verifier design works. |
+| `EVALUATION.md` | **Scaffolded 2026-08-23.** The harness runs (`evals/`), the set is three seed cases, and the results table is empty — so it still blocks any claim that the verifier design works. Owed: a baseline on the previous model, and a second row on the current one. |
 | `policy.yaml` schema + constraint evaluator | Not written. Until it exists, the constraints in `policy.example.yaml` are decorative. |
 | Workload identity (SPIFFE/SPIRE) | [ADR 0003](docs/adr/0003-role-graph-and-traceability.md) makes it a platform prerequisite. Not yet scoped. |

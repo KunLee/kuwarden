@@ -146,4 +146,4 @@ async def test_binary_files_are_listed_but_not_inlined(
 
     prompt = str(real_sandbox_platform.messages_requests[-1])
     assert "assets/logo.png" in prompt, "it must still appear in the listing"
-    assert "contents are not shown" in prompt, "and the model must be told it was omitted"
+    assert "binary or machine-generated" in prompt, "and the model is told why"

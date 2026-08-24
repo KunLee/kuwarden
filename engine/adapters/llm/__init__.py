@@ -42,6 +42,21 @@ class LLMOutputTruncated(LLMError):
     """
 
 
+class LLMRequestRejected(LLMError):
+    """The provider refused the request itself — an HTTP 400.
+
+    Non-retryable, because a 400 says the request as sent can never be served. Retrying
+    an identical request three times cannot change a malformed schema, an unsupported
+    parameter, a prompt past the context window, or an account that cannot be billed.
+
+    That last one is why this class exists rather than being folded into `LLMError`.
+    Anthropic returns an exhausted credit balance as `invalid_request_error` — a 400,
+    not a 402 — so the single most likely cause of a rejected request in practice was
+    being retried as though it were transient, and the run spent minutes discovering
+    what the first response already said.
+    """
+
+
 class ModelRefusal(LLMError):
     """The provider's safety classifiers declined the request.
 

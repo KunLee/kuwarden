@@ -139,6 +139,26 @@ class JiraTickets:
                 f"{API}/issue/{ref.id}/comment", json={"body": _adf_document(body)}
             )
 
+    async def comments(self, ref: TicketRef) -> list[str]:
+        """See `TicketAdapter.comments`.
+
+        Jira comment bodies are Atlassian Document Format, a nested tree rather than text, so
+        the plain text is collected out of it. Callers only ask whether a marker is present,
+        and a marker written by `comment` above arrives as a paragraph of plain text.
+        """
+
+        def _text(node: object) -> str:
+            if isinstance(node, dict):
+                return str(node.get("text", "")) + "".join(
+                    _text(child) for child in node.get("content", []) or []
+                )
+            return ""
+
+        async with await self._client(ref) as client:
+            payload: Any = await client.get(f"{API}/issue/{ref.id}/comment")
+        items = payload.get("comments") if isinstance(payload, dict) else None
+        return [_text(c.get("body")) for c in items or [] if isinstance(c, dict)]
+
     async def transition(self, ref: TicketRef, state: str) -> None:
         async with await self._client(ref) as client:
             available: Any = await client.get(f"{API}/issue/{ref.id}/transitions")

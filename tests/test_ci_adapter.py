@@ -33,7 +33,16 @@ class FailingSandbox:
     """A sandbox whose suite fails, so the CI wait can be shown *not* to happen."""
 
     async def capabilities(self) -> SandboxCapabilities:
-        return SandboxCapabilities()
+        # A host that enforces everything, so these tests exercise the CI wait rather than
+        # the weakened-isolation branch. The fields have no defaults on purpose: a sandbox
+        # that reports a limit it is not applying is the failure ADR 0005 is written against.
+        return SandboxCapabilities(
+            cgroup_memory=True,
+            cgroup_cpu=True,
+            cgroup_pids=True,
+            rlimit_memory=True,
+            tmpfs_quota=True,
+        )
 
     async def exec(
         self,

@@ -1,0 +1,37 @@
+#!/bin/sh
+# Scan staged content for secrets before the commit exists.
+#
+# NOT ACTIVE UNTIL YOU OPT IN. Git does not version .git/hooks, so this file does nothing
+# until someone runs, once per clone:
+#
+#     git config core.hooksPath .githooks
+#
+# That makes this advisory, not a control — CLAUDE.md says so, and it should keep saying so.
+# The CI secret-scanning job is the enforced half. The difference matters: CI catches a secret
+# after it has reached GitHub, which is already an incident requiring rotation. This catches
+# it while it is still only on your disk, which is not.
+#
+# Bypass with `git commit --no-verify` when you genuinely need to. That it is easy to bypass
+# is precisely why it is not the control.
+
+set -eu
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+    echo "pre-commit: gitleaks not on PATH — staged changes NOT scanned." >&2
+    echo "            install it (https://github.com/gitleaks/gitleaks) or commit knowingly." >&2
+    # Deliberately not a failure. A hook that blocks every commit on a machine without the
+    # tool gets disabled within a day, and a disabled hook protects nothing. Loud and
+    # permissive beats silent and absent.
+    exit 0
+fi
+
+# --staged scans what is about to be committed rather than the working tree, so a secret in an
+# unstaged scratch file does not block an unrelated commit.
+# --redact keeps the secret out of terminal scrollback, which is also somewhere it can live.
+if ! gitleaks git --staged --config .gitleaks.toml --redact --no-banner; then
+    echo >&2
+    echo "pre-commit: staged changes look like they contain a secret." >&2
+    echo "            If it is a real credential: remove it and rotate it — assume burned." >&2
+    echo "            If it is a false positive: add a narrow rule to .gitleaks.toml." >&2
+    exit 1
+fi

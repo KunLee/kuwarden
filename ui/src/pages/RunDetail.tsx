@@ -10,7 +10,15 @@
 import { useEffect, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { api, ApiError } from "../api";
-import { Banner, Button, Card, Empty, PageHeader } from "../components/ui";
+import {
+  BackLink,
+  Banner,
+  Button,
+  Card,
+  ConfirmDialog,
+  Empty,
+  PageHeader,
+} from "../components/ui";
 import { useCan } from "../auth";
 import { ApprovalGate } from "../components/ApprovalGate";
 import { FlowGraph } from "../components/FlowGraph";
@@ -23,11 +31,15 @@ export function RunDetail() {
   const { id = "" } = useParams();
   const navigate = useNavigate();
   const canApprove = useCan("approver");
+  // Terminating is an operational act on the platform, not a judgment about the change,
+  // so it is admin rather than approver. Rejecting at the gate is the approver's verb.
+  const canTerminate = useCan("admin");
   const [events, setEvents] = useState<RunEvent[]>([]);
   const [run, setRun] = useState<Run | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [live, setLive] = useState(false);
+  const [confirmKill, setConfirmKill] = useState(false);
 
   /**
    * Start the same ticket again.
@@ -37,6 +49,35 @@ export function RunDetail() {
    * a second record that can be compared with the first. Reusing the id would overwrite the
    * evidence of what went wrong, which is the one thing that must not happen.
    */
+  /**
+   * Stop a run that is going nowhere.
+   *
+   * Abrupt on purpose. The workflow is terminated rather than cancelled, because a Temporal
+   * cancellation arrives as a `BaseException` the flow does not catch — compensation would
+   * not run either way, and terminating is at least honest about it. The branch stays on the
+   * remote, and the server tells us its name so this can say so rather than let an operator
+   * discover it later.
+   */
+  async function terminate() {
+    if (!run) return;
+    setBusy(true);
+    setMessage(null);
+    try {
+      const result = await api.terminateRun(run.id);
+      setConfirmKill(false);
+      setMessage(
+        result.branch_left_behind
+          ? `Run stopped. Branch ${result.branch_left_behind} was not deleted — compensation does not run on a terminate, so remove it by hand if you do not want it.`
+          : "Run stopped. Nothing had been pushed, so there is no branch to clean up.",
+      );
+      setRun(await api.run(run.id));
+    } catch (e) {
+      setMessage(e instanceof ApiError ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function runAgain() {
     if (!run) return;
     setBusy(true);
@@ -101,6 +142,10 @@ export function RunDetail() {
 
   return (
     <div>
+      <div className="mb-6">
+        <BackLink to="/runs">All runs</BackLink>
+      </div>
+
       <PageHeader
         title="Audit trail"
         description="Append-only. What KuWarden authorised, what it merely observed, and what represents no external effect at all."
@@ -112,12 +157,16 @@ export function RunDetail() {
                 live
               </span>
             )}
-            {run &&
-          canApprove && (
-            <Button variant="primary" onClick={runAgain} disabled={busy}>
-              {busy ? "Starting…" : `Run ${run.ticket_id} again`}
-            </Button>
-          )}
+            {run && canTerminate && IN_FLIGHT.includes(run.status) && (
+              <Button variant="danger" onClick={() => setConfirmKill(true)} disabled={busy}>
+                Stop this run
+              </Button>
+            )}
+            {run && canApprove && (
+              <Button variant="primary" onClick={runAgain} disabled={busy}>
+                {busy ? "Starting…" : `Run ${run.ticket_id} again`}
+              </Button>
+            )}
           </div>
         }
       />
@@ -126,6 +175,28 @@ export function RunDetail() {
           <Banner tone="error">{message}</Banner>
         </div>
       )}
+
+      <ConfirmDialog
+        open={confirmKill}
+        onOpenChange={setConfirmKill}
+        title={`Stop run ${run?.ticket_id ?? ""}?`}
+        confirmLabel={busy ? "Stopping…" : "Stop the run"}
+        onConfirm={terminate}
+        busy={busy}
+      >
+        {/* Says what will be left behind rather than only what will stop. An operator who
+            learns about the orphaned branch afterwards has already lost the chance to
+            decide. */}
+        <p>
+          The flow stops immediately and cleanup does <strong>not</strong> run, so any branch
+          this run pushed stays on the remote for you to inspect or delete.
+        </p>
+        <p className="mt-3">
+          The audit trail is append-only: everything recorded so far is kept, and a
+          <span className="mono"> run_terminated </span>
+          row is added naming you.
+        </p>
+      </ConfirmDialog>
       {run && (
         <div className="mb-6">
           <ApprovalGate runId={id} status={run.status} />
@@ -148,7 +219,11 @@ export function RunDetail() {
       {events.length === 0 ? (
         <Empty>No events recorded for this run.</Empty>
       ) : (
-        <table className="w-full text-sm">
+        // Wrapped, the way the shared `Table` primitive is. Payload text — a CI detail
+        // sentence, a branch name, a failure message — has no width bound of its own, and an
+        // unwrapped table widens the card and then the page rather than scrolling itself.
+        <div className="overflow-x-auto">
+        <table className="w-full min-w-[40rem] text-sm">
           <thead className="text-xs text-muted">
             <tr className="border-b border-line">
               <th className="pb-2 text-left font-medium">#</th>
@@ -233,6 +308,7 @@ export function RunDetail() {
             ))}
           </tbody>
         </table>
+        </div>
       )}
       </Card>
     </div>

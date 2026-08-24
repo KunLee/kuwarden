@@ -22,10 +22,10 @@ from temporalio.worker import Worker
 
 from engine.activities import ALL as ACTIVITIES
 from engine.db import connect, migrate
-from engine.flows.delivery import ApprovalSignal, DeliveryFlow, FlowInput
+from engine.flows.delivery import VERIFIERS, ApprovalSignal, DeliveryFlow, FlowInput
 from engine.state import Ticket
 from engine.worker import namespace, target
-from tests.conftest import FakePlatform, track_application
+from tests.conftest import KUWARDEN_YAML, FakePlatform, track_application
 
 pytestmark = pytest.mark.asyncio
 
@@ -39,8 +39,20 @@ async def _client() -> Client:
         pytest.skip(f"Temporal unavailable at {target()}: {exc}")
 
 
+def _app_name(app_id: uuid.UUID) -> str:
+    return f"test-app-{app_id.hex[:8]}"
+
+
 async def _register_app() -> uuid.UUID:
+    """Register the application, and store its configuration under the same name.
+
+    Storing it matters: the worker resolves configuration per application now, and Triage
+    refuses a run whose application does not match the configuration it was handed. Registering
+    without storing would leave the run governed by whatever `kuwarden.yaml` the worker started
+    with — which is the single-tenant behaviour this exists to replace.
+    """
     app_id = uuid.uuid4()
+    name = _app_name(app_id)
     async with connect() as conn:
         await migrate(conn)
         await conn.execute(
@@ -49,8 +61,13 @@ async def _register_app() -> uuid.UUID:
             VALUES ($1, $2, $3, 'gated_deployment')
             """,
             app_id,
-            f"test-app-{app_id.hex[:8]}",
+            name,
             "https://example.invalid/test-app",
+        )
+        await conn.execute(
+            "INSERT INTO app_config (app_id, yaml, updated_by) VALUES ($1,$2,'walking-skeleton')",
+            app_id,
+            KUWARDEN_YAML.replace("name: payments-service", f"name: {name}"),
         )
     # Tracked so the session teardown removes it. Without this the developer's Workbench
     # fills with test-app rows that outlive the run that made them.
@@ -97,7 +114,8 @@ async def test_low_tier_runs_without_a_human(platform: FakePlatform) -> None:
         client,
         FlowInput(
             run_id=run_id,
-            app_id=await _register_app(),
+            app_id=(_app := await _register_app()),
+            app_name=_app_name(_app),
             ticket=_ticket(),
             policy_commit="0" * 40,
             policy_bundle={"source": "test"},
@@ -117,7 +135,8 @@ async def test_high_tier_suspends_until_two_humans_approve(platform: FakePlatfor
         client,
         FlowInput(
             run_id=run_id,
-            app_id=await _register_app(),
+            app_id=(_app := await _register_app()),
+            app_name=_app_name(_app),
             ticket=_ticket(),
             policy_commit="1" * 40,
             policy_bundle={"source": "test"},
@@ -141,7 +160,8 @@ async def test_one_rejection_aborts_the_run(platform: FakePlatform) -> None:
         client,
         FlowInput(
             run_id=run_id,
-            app_id=await _register_app(),
+            app_id=(_app := await _register_app()),
+            app_name=_app_name(_app),
             ticket=_ticket(),
             policy_commit="2" * 40,
             policy_bundle={},
@@ -166,7 +186,8 @@ async def test_the_audit_tree_lands_in_postgres(platform: FakePlatform) -> None:
         client,
         FlowInput(
             run_id=run_id,
-            app_id=await _register_app(),
+            app_id=(_app := await _register_app()),
+            app_name=_app_name(_app),
             ticket=_ticket(),
             policy_commit="3" * 40,
             policy_bundle={"pinned": True},
@@ -201,7 +222,8 @@ async def test_the_audit_trail_is_append_only(platform: FakePlatform) -> None:
         client,
         FlowInput(
             run_id=run_id,
-            app_id=await _register_app(),
+            app_id=(_app := await _register_app()),
+            app_name=_app_name(_app),
             ticket=_ticket(),
             policy_commit="4" * 40,
             policy_bundle={},
@@ -225,7 +247,8 @@ async def test_the_policy_pin_is_immutable(platform: FakePlatform) -> None:
         client,
         FlowInput(
             run_id=run_id,
-            app_id=await _register_app(),
+            app_id=(_app := await _register_app()),
+            app_name=_app_name(_app),
             ticket=_ticket(),
             policy_commit="5" * 40,
             policy_bundle={},
@@ -256,7 +279,8 @@ async def test_a_run_survives_the_worker_dying(platform: FakePlatform) -> None:
     queue = f"skeleton-crash-{run_id}"
     params = FlowInput(
         run_id=run_id,
-        app_id=await _register_app(),
+        app_id=(_app := await _register_app()),
+            app_name=_app_name(_app),
         ticket=_ticket(),
         policy_commit="6" * 40,
         policy_bundle={},
@@ -303,7 +327,8 @@ async def test_ticket_to_pull_request_end_to_end(platform: FakePlatform) -> None
         client,
         FlowInput(
             run_id=run_id,
-            app_id=await _register_app(),
+            app_id=(_app := await _register_app()),
+            app_name=_app_name(_app),
             ticket=_ticket(),
             policy_commit="7" * 40,
             policy_bundle={"pinned": True},
@@ -352,6 +377,77 @@ async def test_ticket_to_pull_request_end_to_end(platform: FakePlatform) -> None
     assert f"kuwarden-run-id: {run_id}" in pushed["message"]
 
 
+async def test_each_node_records_what_it_read_and_decided(platform: FakePlatform) -> None:
+    """The run record says *what happened*, not only *that* something did.
+
+    Before notes, `node_completed` carried an empty payload: the trail could show that Triage
+    admitted a ticket and never which rule it was admitted under, what the ticket said, or what
+    the model was sent. For a product whose claim is the audit trail, that is the gap that
+    matters most — a record nobody can act on is a record in name only.
+    """
+    client = await _client()
+    run_id = uuid.uuid4()
+    result = await _run(
+        client,
+        FlowInput(
+            run_id=run_id,
+            app_id=(_app := await _register_app()),
+            app_name=_app_name(_app),
+            ticket=_ticket(),
+            policy_commit="7" * 40,
+            policy_bundle={"pinned": True},
+            provisional_risk_tier="low",
+        ),
+        approvals=[],
+    )
+    assert result.status == "succeeded"
+
+    async with connect() as conn:
+        rows = await conn.fetch(
+            "SELECT node_id, payload FROM flow_events "
+            "WHERE run_id = $1 AND kind = 'node_completed' ORDER BY seq",
+            run_id,
+        )
+    recorded = {row["node_id"]: json.loads(row["payload"]) for row in rows}
+
+    # Every node that ran wrote an account of itself. A node added later with none is a hole
+    # in the record, and this is what notices.
+    assert {"triage", "push", "build_test", "release", "reporter"} <= set(recorded)
+    assert all(note["summary"] for note in recorded.values()), "a summary, not an empty payload"
+
+    triage = recorded["triage"]
+    titles = {section["title"]: section for section in triage["sections"]}
+
+    # The rule, and what was measured against it — the specific thing the trail could not say
+    # before. "Admitted" alone cannot be re-checked by a reader who disputes the rule.
+    admission = titles["Admission control"]
+    assert admission["kind"] == "checks"
+    assert {row["label"] for row in admission["rows"]} == {
+        "Required label",
+        "Ready state",
+        "Story points",
+    }
+    assert all(row["ok"] for row in admission["rows"])
+    assert any(row["required"] for row in admission["rows"]), "the rule, not only the verdict"
+
+    # The ticket **as read from the tracker**, not as handed to the run. Triage re-fetches, and
+    # the record must show what it fetched: a caller who supplied one body while the tracker
+    # held another would otherwise leave a trail agreeing with the caller. Same principle as
+    # invariant 3 — the record follows the external system of record, not the claim about it.
+    body = titles["Ticket body — untrusted input"]
+    assert body["body"] == "Return 200", "what the tracker returned"
+    assert _ticket().body not in body["body"], "not what the run was started with"
+
+    # Marked as somebody else's words. This text reaches a model and reaches the Workbench; a
+    # reader must never be in doubt about who wrote it.
+    assert body["untrusted"] is True
+
+    # Notes belong to one execution. Left undrained they would ride onto the next node's state
+    # and be re-emitted under its id, so the Planner's record would open with Triage's summary.
+    assert recorded["push"]["summary"] != triage["summary"]
+    assert "Admission control" not in {s["title"] for s in recorded["push"]["sections"]}
+
+
 async def test_a_ticket_outside_declared_scope_is_refused(platform: FakePlatform) -> None:
     """Admission control at intake, not discovery three nodes later."""
     platform.labels = ["backend"]  # missing the kuwarden-auto label the app requires
@@ -363,7 +459,8 @@ async def test_a_ticket_outside_declared_scope_is_refused(platform: FakePlatform
             client,
             FlowInput(
                 run_id=run_id,
-                app_id=await _register_app(),
+                app_id=(_app := await _register_app()),
+            app_name=_app_name(_app),
                 ticket=_ticket(),
                 policy_commit="8" * 40,
                 policy_bundle={},
@@ -408,7 +505,8 @@ async def test_a_ticket_not_in_the_ready_state_is_refused(platform: FakePlatform
             client,
             FlowInput(
                 run_id=uuid.uuid4(),
-                app_id=await _register_app(),
+                app_id=(_app := await _register_app()),
+            app_name=_app_name(_app),
                 ticket=_ticket(),
                 policy_commit="b" * 40,
                 policy_bundle={},
@@ -441,7 +539,8 @@ async def test_a_blocking_verifier_stops_the_change_and_cleans_up(
         client,
         FlowInput(
             run_id=run_id,
-            app_id=await _register_app(),
+            app_id=(_app := await _register_app()),
+            app_name=_app_name(_app),
             ticket=_ticket(),
             policy_commit="c" * 40,
             policy_bundle={},
@@ -482,7 +581,8 @@ async def test_weakened_sandbox_isolation_is_recorded_in_the_audit_trail(
         client,
         FlowInput(
             run_id=run_id,
-            app_id=await _register_app(),
+            app_id=(_app := await _register_app()),
+            app_name=_app_name(_app),
             ticket=_ticket(),
             policy_commit="a" * 40,
             policy_bundle={},
@@ -504,3 +604,338 @@ async def test_weakened_sandbox_isolation_is_recorded_in_the_audit_trail(
         # Self-describing: the record names what was missing, so interpreting it later does
         # not require the host still existing to re-probe.
         assert payload["gaps"], "a degraded record must say what was not enforced"
+
+
+async def test_a_suspended_run_is_recorded_as_suspended_where_the_workbench_reads_it(
+    platform: FakePlatform,
+) -> None:
+    """The seam neither half of the suite was covering.
+
+    Suspension used to live only in the workflow object's memory. Everything a human touches
+    reads `flow_runs.status`: the approval endpoint refuses a decision unless it says
+    `suspended`, and the Workbench hides the approval panel outright. So a `high` run reached
+    the gate, emitted `gate_reached`, and became unapprovable — while the approval endpoint's
+    own tests passed against a row inserted by hand, and the walking skeleton passed by
+    signalling Temporal directly.
+
+    This asserts the two halves meet: a real run, at a real gate, with the column a real
+    operator's browser would read.
+    """
+    client = await _client()
+    run_id = uuid.uuid4()
+    app_id = await _register_app()
+
+    async with Worker(
+        client,
+        task_queue=f"skeleton-{run_id}",
+        workflows=[DeliveryFlow],
+        activities=ACTIVITIES,
+    ):
+        handle = await client.start_workflow(
+            DeliveryFlow.run,
+            FlowInput(
+                run_id=run_id,
+                app_id=app_id,
+                app_name=_app_name(app_id),
+                ticket=_ticket(),
+                policy_commit="7" * 40,
+                policy_bundle={"source": "test"},
+                provisional_risk_tier="high",
+            ),
+            id=f"kuwarden-{run_id}",
+            task_queue=f"skeleton-{run_id}",
+        )
+
+        # Wait for the gate rather than sleeping a fixed amount: the run does real work first,
+        # and a fixed wait is either flaky or slow.
+        async def _suspended() -> bool:
+            async with connect() as conn:
+                return bool(
+                    await conn.fetchval(
+                        "SELECT 1 FROM flow_runs WHERE id = $1 AND status = 'suspended'", run_id
+                    )
+                )
+
+        for _ in range(120):
+            if await _suspended():
+                break
+            await asyncio.sleep(0.5)
+        else:
+            async with connect() as conn:
+                actual = await conn.fetchval("SELECT status FROM flow_runs WHERE id = $1", run_id)
+            raise AssertionError(
+                f"run reached the gate but the column a human reads says {actual!r}; "
+                "the approval endpoint would refuse and the Workbench would hide the panel"
+            )
+
+        # And released again on a decision, so a second one is refused rather than accepted.
+        await handle.signal(
+            DeliveryFlow.approve,
+            ApprovalSignal(principal="human.a", approved=True, evidence_digest="sha256:a"),
+        )
+        await handle.signal(
+            DeliveryFlow.approve,
+            ApprovalSignal(principal="human.b", approved=True, evidence_digest="sha256:b"),
+        )
+        result = await handle.result()
+
+    assert result.status == "succeeded"
+    async with connect() as conn:
+        final = await conn.fetchval("SELECT status FROM flow_runs WHERE id = $1", run_id)
+    assert final == "succeeded", "a released run must not be left marked suspended"
+
+
+async def test_a_rejection_names_the_verifiers_that_blocked_it_not_an_advisory_one(
+    platform: FakePlatform,
+) -> None:
+    """The record must name the reviews that actually stopped the change.
+
+    The bug this covers: `aborting` recomputed the failing verifiers from `self._latest`,
+    which the fan-out leaves holding whichever of the four activities replied last. A real
+    run rejected by `correctness`, `security` and `regression_risk` therefore recorded
+    `falsified_by: ["test_evidence"]` — the one verifier the operator had deliberately
+    disarmed, and the only one that could not have caused it. Compensate, handed the same
+    state, wrote a note saying the same thing and dropped the other three findings.
+
+    Naming the disarmed verifier as the cause is the worst version of this: it says the
+    toggle failed to do the one thing it exists to do, which would send an operator looking
+    for a bug in the control rather than at the three reviews that objected.
+    """
+    platform.verifier_blocks = True
+    platform.verifier_findings = ["src/app.py: subtract() returns a + b"]
+    client = await _client()
+    run_id = uuid.uuid4()
+
+    result = await _run(
+        client,
+        FlowInput(
+            run_id=run_id,
+            app_id=(_app := await _register_app()),
+            app_name=_app_name(_app),
+            ticket=_ticket(),
+            policy_commit="c" * 40,
+            policy_bundle={},
+            provisional_risk_tier="low",
+            # Every verifier objects; only three of them are permitted to stop the change.
+            blocking_verifiers=("correctness", "security", "regression_risk"),
+        ),
+        approvals=[],
+    )
+    assert result.status == "rejected"
+
+    async with connect() as conn:
+        rows = await conn.fetch(
+            "SELECT kind, payload FROM flow_events WHERE run_id = $1 ORDER BY seq", run_id
+        )
+    by_kind = {r["kind"]: json.loads(r["payload"] or "{}") for r in rows}
+
+    assert by_kind["verifier_overridden"]["advisory"] == ["test_evidence"]
+    assert sorted(by_kind["aborting"]["falsified_by"]) == [
+        "correctness",
+        "regression_risk",
+        "security",
+    ]
+    assert "test_evidence" not in by_kind["aborting"]["falsified_by"], (
+        "an advisory verifier cannot be the reason a run was rejected"
+    )
+
+    # The second half of the same bug. Compensate is handed `self._latest`, so it saw one
+    # verifier's finding and named it as the cause.
+    compensate = [
+        json.loads(r["payload"] or "{}")
+        for r in rows
+        if r["kind"] == "node_completed" and "Rejected by" in str(r["payload"])
+    ]
+    assert compensate, "compensation must record why the change was rejected"
+    assert "test_evidence" not in compensate[0]["summary"]
+
+
+async def test_every_verifier_records_its_own_findings(platform: FakePlatform) -> None:
+    """Each verifier's reasoning reaches the permanent record under its own name.
+
+    This never happened. `_node_step` drained `result.notes` unconditionally, including for
+    the fan-out it runs with `record=False` — where the flag means "the caller emits these".
+    `_verify` guarded on `if result.notes`, which was therefore always empty, so
+    `verifier_verdict` could not fire for any run that has ever executed.
+
+    The consequence was silent and total: a rejected change recorded the *names* of the
+    verifiers that falsified it and destroyed every one of their reasons. What an operator
+    saw instead was one arbitrary verifier's findings, surviving only because `self._latest`
+    happened to hold that branch's brief.
+    """
+    platform.verifier_blocks = True
+    platform.verifier_findings = ["src/app.py: subtract() returns a + b"]
+    client = await _client()
+    run_id = uuid.uuid4()
+
+    await _run(
+        client,
+        FlowInput(
+            run_id=run_id,
+            app_id=(_app := await _register_app()),
+            app_name=_app_name(_app),
+            ticket=_ticket(),
+            policy_commit="c" * 40,
+            policy_bundle={},
+            provisional_risk_tier="low",
+        ),
+        approvals=[],
+    )
+
+    async with connect() as conn:
+        verdicts = await conn.fetch(
+            "SELECT node_id, payload FROM flow_events "
+            "WHERE run_id = $1 AND kind = 'verifier_verdict' ORDER BY seq",
+            run_id,
+        )
+    assert [r["node_id"] for r in verdicts] == list(VERIFIERS), (
+        "every verifier writes its own row, in a replay-stable order"
+    )
+    # Not merely present — carrying the finding, which is the thing that was being lost.
+    for row in verdicts:
+        assert "subtract() returns a + b" in str(row["payload"])
+
+
+async def test_a_second_pass_of_the_build_cycle_pushes_a_new_commit(
+    platform: FakePlatform,
+) -> None:
+    """The ③⇄④ cycle must actually reach origin on every pass, not just the first.
+
+    The bug this covers had no visible symptom and a green test suite. `test_push.py` set
+    `retry_count` by hand and proved the adapter extends a branch when the counter changes —
+    but nothing proved the counter changed. It did not: the flow assigned it for the outer
+    cycle and the Coder's inner loop, which runs immediately afterwards and counts its own
+    attempts from 0, overwrote it before Push ever read it.
+
+    So the second pass produced a byte-identical commit message, whose `kuwarden-attempt`
+    trailer is the SCM adapters' idempotency key. The adapter matched it against the branch
+    tip, concluded the push had already landed, and returned the existing branch. The run then
+    read CI back for the *previous* commit, got the previous failure, and looped — grading the
+    first attempt's code until the retry budget ran out, while Push's own record said it had
+    pushed the new files.
+
+    Driven end to end for that reason. Only the real flow puts the two loops in the same room.
+    """
+    # Fail CI on the first pass so the flow re-enters the Coder, then pass on the second.
+    platform.ci_conclusions = ["failure", "success"]
+    client = await _client()
+    run_id = uuid.uuid4()
+
+    await _run(
+        client,
+        FlowInput(
+            run_id=run_id,
+            app_id=(_app := await _register_app()),
+            app_name=_app_name(_app),
+            ticket=_ticket(),
+            policy_commit="c" * 40,
+            policy_bundle={},
+            provisional_risk_tier="low",
+        ),
+        approvals=[],
+    )
+
+    async with connect() as conn:
+        pushed = await conn.fetch(
+            "SELECT payload FROM flow_events WHERE run_id = $1 AND kind = 'branch_pushed' "
+            "ORDER BY seq",
+            run_id,
+        )
+    commits = [json.loads(r["payload"])["commit"] for r in pushed]
+    assert len(commits) == 2, "each pass of the cycle pushes"
+    assert commits[0] != commits[1], (
+        "the second pass must reach origin — an identical commit means the adapter "
+        "deduplicated it and the new code was silently discarded"
+    )
+
+
+async def test_build_and_test_grades_the_whole_project_not_just_the_diff(
+    platform: FakePlatform,
+) -> None:
+    """The sandbox must be handed the repository, with the change laid over it.
+
+    Build & Test used to materialise `proposed_edits` alone — the changed files and nothing
+    else. That is invisible for as long as `test_command` cannot tell the difference: pytest
+    against a repository with no tests collects nothing and succeeds whatever the directory
+    holds, which is exactly what the walking skeleton runs.
+
+    The moment a real toolchain runs there it fails instantly and for a reason that has
+    nothing to do with the change — three files in an empty directory, and eslint exiting 2
+    with "couldn't find eslint.config.js". The flow reads that as *the change is broken*, and
+    sends it back to a Coder who cannot possibly fix it.
+    """
+    client = await _client()
+    run_id = uuid.uuid4()
+
+    await _run(
+        client,
+        FlowInput(
+            run_id=run_id,
+            app_id=(_app := await _register_app()),
+            app_name=_app_name(_app),
+            ticket=_ticket(),
+            policy_commit="c" * 40,
+            policy_bundle={},
+            provisional_risk_tier="low",
+        ),
+        approvals=[],
+    )
+
+    assert platform.sandbox is not None
+    assert platform.sandbox.workspaces, "the sandbox ran at least once"
+    graded = platform.sandbox.workspaces[-1]
+
+    # Present in the repository but untouched by the change. A grader that cannot see these
+    # is not grading the project — it is grading a directory that has never existed.
+    for untouched in ("README.md", "tests/test_app.py"):
+        assert untouched in graded, (
+            f"{untouched} is in the repository and was not edited; Build & Test must still "
+            "see it, or the toolchain has no project to run against"
+        )
+
+    # And the change itself is laid over the tree, not merely alongside it.
+    assert "src/app.py" in graded
+
+
+async def test_the_ticket_is_told_it_was_picked_up_before_any_work_happens(
+    platform: FakePlatform,
+) -> None:
+    """A ticket goes quiet the moment it is handed over, and that silence reads as failure.
+
+    Somebody moves a ticket into the ready state and then sees nothing for several minutes.
+    The natural responses are to save it again — which does nothing, because admission is a
+    state *transition* — or to conclude the integration is broken. This is the acknowledgement
+    that closes that gap, and it is posted from Triage, before the Planner has run.
+
+    Posted once, and that is the part with teeth. Activities retry and a ticket API has no
+    idempotency token, so the comment carries a marker naming the run and existing comments
+    are read back first. Without it a retried Triage leaves the ticket saying "picked up"
+    twice, which is precisely the external-mutation failure CLAUDE.md names.
+    """
+    client = await _client()
+    run_id = uuid.uuid4()
+
+    await _run(
+        client,
+        FlowInput(
+            run_id=run_id,
+            app_id=(_app := await _register_app()),
+            app_name=_app_name(_app),
+            ticket=_ticket(),
+            policy_commit="c" * 40,
+            policy_bundle={},
+            provisional_risk_tier="low",
+        ),
+        approvals=[],
+    )
+
+    acknowledgements = [c for c in platform.comments if "picked this up" in c]
+    assert len(acknowledgements) == 1, (
+        "exactly one acknowledgement per run — a retried Triage must find its own marker"
+    )
+    body = acknowledgements[0]
+    assert str(run_id) in body, "the reader needs the run to follow it"
+    assert "/runs/" in body, "and a link to open it"
+    # A board is readable by more people than the Workbench. This says that a run started and
+    # where to look; it must not become a channel for the change's contents.
+    assert "def " not in body, "no source, no diff, no findings on the ticket"

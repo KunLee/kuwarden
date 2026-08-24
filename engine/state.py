@@ -93,10 +93,39 @@ class ProposedEdit:
     Engine pushes, under a separate identity (ADR 0005 §3, property 5). Release therefore
     needs the content, and needs it to be exactly what Build & Test inspected rather than
     something regenerated a step later.
+
+    A removal is an edit. `deleted` carries it with an empty `content`, because the
+    alternative — a change that only removes files having nothing to represent it — made a
+    legitimate deletion indistinguishable from the Coder having done nothing at all.
     """
 
     path: str
     content: str
+    deleted: bool = False
+
+
+@dataclass(frozen=True)
+class RiskRules:
+    """The tiering rules, as data the workflow can be given rather than config it must read.
+
+    ADR 0002 splits tiering into two stages, and the second one runs in workflow code — which
+    is deterministic and may not touch the filesystem. Passing the rules in `FlowInput` means
+    a replay re-derives the same tier from the same inputs, and a rule edited mid-run cannot
+    retroactively change a decision already recorded.
+
+    Empty everywhere is legal and means "no rule escalates". That is the honest default: an
+    application that wants every change treated as low risk should have said so, not inherited
+    it from a list nobody filled in.
+    """
+
+    #: Globs that make a change `high` whatever else is true — authn, payments, migrations.
+    high_paths: tuple[str, ...] = ()
+    #: Globs that make a change `medium`.
+    medium_paths: tuple[str, ...] = ()
+    #: Above this many changed files, one human looks at it.
+    medium_changed_files: int | None = None
+    #: Above this many changed files, the change stops being small whatever it touched.
+    high_changed_files: int | None = None
 
 
 @dataclass(frozen=True)
@@ -197,6 +226,12 @@ class FlowState:
     schema_version: int = SCHEMA_VERSION
     parent_run_id: UUID | None = None
 
+    #: The registered application this run is for, as the Workbench knows it. Carried so a
+    #: node can check it against the configuration it was handed — a worker serves exactly one
+    #: application's `kuwarden.yaml`, and without this nothing would notice a mismatch. Empty
+    #: means the run predates the check, which is treated as "cannot verify", not as "fine".
+    app_name: str = ""
+
     risk_tier: RiskTier = "low"
     # Kept apart from `risk_tier` so the escalation is visible in the audit record rather
     # than only its result. Tiering happens twice and the second is authoritative.
@@ -237,15 +272,69 @@ class FlowState:
     sast_result: SASTResult | None = None
     coverage: float | None = None
     verifications: list[Verification] = field(default_factory=list)
+    #: Which rule settled the authoritative tier, in the words the rule is written in — e.g.
+    #: "app/layout.tsx matches high_paths '**/layout.*'".
+    #:
+    #: Carried rather than left in the audit event because the people most confused by an
+    #: escalation are the ones reading the *ticket*, not the trail. A change described as a
+    #: theme switch arriving as "risk tier high, two approvers required" reads as the system
+    #: being arbitrary unless the sentence that decided it travels with the number.
+    risk_tier_reason: str = ""
+    #: Verifiers that falsified the change and were not permitted to block it. Empty on a run
+    #: where every verifier that objected was allowed to stop it — which is not the same as a
+    #: run where nothing objected, and the difference belongs in the report.
+    advisory_objections: list[str] = field(default_factory=list)
+    #: The verifiers that actually stopped the change — the falsifying ones the application
+    #: permits to block. Set by the flow immediately before compensation and empty for every
+    #: other abort (a node failure, an approver's rejection), where claiming a verifier caused
+    #: it would be worse than saying nothing.
+    #:
+    #: Needed because `verifications` cannot answer the question on its own: an advisory
+    #: verifier's falsification looks identical to a blocking one there, and naming a disarmed
+    #: verifier as the cause of a rejection is the one wrong answer that sends a reader
+    #: looking for a fault in the control instead of at the reviews that objected.
+    rejected_by: list[str] = field(default_factory=list)
     approvals: list[Approval] = field(default_factory=list)
 
     # Divided among child runs, never duplicated. Without this, fan-out later becomes an
     # unbounded billing event — ADR 0002.
     budget_cents_allowed: int = 0
     budget_cents_spent: int = 0
+    #: How many times the *Coder's own loop* retried inside one activity, after reading a
+    #: failing test run. Written by the Coder, redacted from verifiers (invariant 4).
     retry_count: int = 0
+    #: Which pass of the ③⇄④ cycle this is — Coder, Push, Build & Test, and back.
+    #:
+    #: Separate from `retry_count` because the two loops are different, and sharing one field
+    #: silently broke pushing. The Coder's inner loop assigns from 0 on every invocation, so
+    #: it overwrote whatever the outer loop had set — and since `retry_count` is the
+    #: `kuwarden-attempt` trailer, and that trailer is the SCM adapters' idempotency key, the
+    #: second pass produced a byte-identical commit message. The adapter matched it against
+    #: the branch tip, concluded the push had already landed, and returned without pushing.
+    #:
+    #: The run then read CI back for the *previous* commit, got the same failure, and looped —
+    #: grading the first attempt's code until the retry budget ran out, while Push's own record
+    #: claimed it had pushed the new files.
+    push_attempt: int = 0
     # What compensation did, or could not do. Carried on the state so the flow can put it
     # in the audit trail: a cleanup that silently failed leaves a branch on someone's
     # remote with nothing anywhere saying why.
+    #: Set by Release when KuWarden merged the pull request itself — ADR 0004 model B. The
+    #: flow reads it to emit the `external_effect` row carrying `control_mode="authorized"`,
+    #: so this field is the only thing that turns a merge into a claim of authority. None
+    #: means no merge was performed, never "we did not check".
+    merged_commit: str | None = None
     cleanup: str | None = None
     artifacts: list[Artifact] = field(default_factory=list)
+
+    # What the executing node read, decided and produced — see `engine.nodes.notes`. Written by
+    # the node, drained by the flow into `node_completed`, and cleared before the next node
+    # runs: notes describe one execution, and carrying them forward would attribute one node's
+    # reasoning to the next one's record.
+    #
+    # Not in `VERIFIER_MAY_SEE`, so the brief clears it. A verifier reading the Planner's prompt
+    # out of a note would defeat invariant 4 as thoroughly as reading `plan` directly.
+    #
+    # Never contains a credential. The rest of `FlowState` excludes secrets by construction;
+    # this field is free-form, so the rule has to be stated rather than enforced by shape.
+    notes: dict[str, Any] = field(default_factory=dict)

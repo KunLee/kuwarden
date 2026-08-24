@@ -67,7 +67,11 @@ export function ApprovalGate({ runId, status }: { runId: string; status: string 
       title="This run is waiting for a decision"
       description="Your approval is recorded against the evidence below, identified by its digest. If the run produces new evidence before you decide, the decision is refused and you are shown the current document."
     >
-      <div className="grid gap-5">
+      {/* `min-w-0` on the children, not decoration. Grid items default to `min-width: auto`,
+          which refuses to shrink below the intrinsic width of their content — so the evidence
+          document's long JSON lines widen the item, the card, and then the page, and the
+          `overflow-auto` on the <pre> never gets the chance to scroll. */}
+      <div className="grid gap-5 [&>*]:min-w-0">
         {done !== null ? (
           <Banner tone={done ? "ok" : "warn"}>
             Recorded. This run was {done ? "approved" : "rejected"}.
@@ -88,9 +92,22 @@ export function ApprovalGate({ runId, status }: { runId: string; status: string 
               </Banner>
             )}
 
-            <dl className="grid gap-x-8 gap-y-3 text-[13px] sm:grid-cols-2">
+            <dl className="grid min-w-0 gap-x-8 gap-y-3 text-[13px] sm:grid-cols-2 [&>*]:min-w-0">
               <Fact label="Ticket" value={`${doc.ticket.system} ${doc.ticket.id}`} />
-              <Fact label="Risk tier" value={doc.risk_tier} />
+              {/* The reason, not just the tier. An approver asked for a second signature
+                  on a change the ticket described as routine needs to know what raised
+                  it — and until this was added the page showed the tier intake guessed
+                  before any code existed, which could be two levels below the one the
+                  gate was actually enforcing. */}
+              <Fact
+                label="Risk tier"
+                value={
+                  doc.provisional_risk_tier &&
+                  doc.provisional_risk_tier !== doc.risk_tier
+                    ? `${doc.risk_tier} — raised from ${doc.provisional_risk_tier}: ${doc.risk_tier_reason}`
+                    : doc.risk_tier
+                }
+              />
               <Fact
                 label="Tests"
                 value={
@@ -104,7 +121,7 @@ export function ApprovalGate({ runId, status }: { runId: string; status: string 
               <Fact label="Policy pinned at" value={doc.policy_commit} mono />
             </dl>
 
-            <details className="rounded-xl border border-line px-4 py-3">
+            <details className="min-w-0 rounded-xl border border-line px-4 py-3">
               <summary className="cursor-pointer text-[13px] font-medium">
                 The full evidence document ({doc.events.length} events)
               </summary>
@@ -154,7 +171,9 @@ function Fact({ label, value, mono }: { label: string; value: string; mono?: boo
   return (
     <div>
       <dt className="text-xs text-muted">{label}</dt>
-      <dd className={mono ? "mono mt-0.5 text-xs" : "mt-0.5"}>{value}</dd>
+      {/* break-all: values like `unpinned:no-policy-loader` and a 40-char SHA have no
+          spaces to wrap at, so without this they push their grid cell wider than the page. */}
+      <dd className={mono ? "mono mt-0.5 break-all text-xs" : "mt-0.5 break-words"}>{value}</dd>
     </div>
   );
 }

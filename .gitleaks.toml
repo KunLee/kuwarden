@@ -1,0 +1,26 @@
+# Secret scanning configuration.
+#
+# Read alongside CLAUDE.md's security posture section. Until this existed, the only thing that
+# had ever caught a secret in this repository was GitHub's own push protection — after the
+# commit already existed. This narrows that window; it does not close it. See the note there
+# about what the pre-commit hook does and does not guarantee.
+
+# The upstream rule set, extended rather than replaced. Maintaining our own list of what a
+# credential looks like would be a worse version of somebody else's full-time job.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Paths that cannot meaningfully contain a credential"
+
+# Dependency lockfiles. These are content hashes and resolved versions by construction, and
+# they are long enough and random-looking enough to trip entropy heuristics.
+#
+# Deliberately short. Allowlisting `tests/` or `docs/` would be the easy way to a quiet
+# scanner and the direct route to a decorative one — a fake token in a test is still worth
+# looking at, because the way a real one gets committed is somebody pasting it where a fake
+# one lived.
+paths = [
+  '''uv\.lock$''',
+  '''(^|/)package-lock\.json$''',
+]
