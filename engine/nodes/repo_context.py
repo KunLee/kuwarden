@@ -1,5 +1,8 @@
 """The one way a repository is rendered into a prompt.
 
+The decision, its three prior failures and its known weaknesses are in
+[ADR 0010](../../docs/adr/0010-context-assembly.md).
+
 Extracted so the Coder and the verifiers show a model the *same* repository under the same
 rules. Two implementations would drift — one inlining lockfiles the other withheld, one
 treating a file as binary that the other decoded — and a verifier disagreeing with the Coder
@@ -20,6 +23,7 @@ resolver run and the sandbox has no network.
 There is deliberately no size cap. A cap does not choose *less* context, it chooses an
 arbitrary subset — and the alphabetical one this replaced sent `app/admin/` to a ticket about
 `components/Header.tsx`, then failed three nodes downstream with a message naming neither.
+What replaced it is selection *by the model*, expanded along the import graph; see the ADR.
 """
 
 from __future__ import annotations
