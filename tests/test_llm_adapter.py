@@ -265,3 +265,124 @@ def test_the_flow_declares_a_rejected_request_non_retryable() -> None:
     """Read from the flow source, so the two cannot drift apart silently."""
     source = (REPO_ROOT / "engine" / "flows" / "delivery.py").read_text(encoding="utf-8")
     assert '"LLMRequestRejected"' in source
+
+
+async def test_a_cacheable_prefix_is_sent_as_a_marked_first_block() -> None:
+    """Caching is a *prefix* mechanism, so what is marked must come first and be stable.
+
+    The provider reuses everything up to the marker, and only if it is byte-identical between
+    calls. Concatenating the repository with the ticket and the previous attempt's failure —
+    which is what the prompt did before this — means the reusable part is never at the front
+    and nothing is ever a hit.
+    """
+    seen: list[httpx.Request] = []
+    adapter = _adapter(_message(), seen)
+
+    with executing(REGISTRY["planner"]):
+        await adapter.complete(
+            LLMRequest(system="s", prompt="the variable tail", cacheable_prefix="the stable part")
+        )
+
+    content = json.loads(seen[0].content)["messages"][0]["content"]
+    assert isinstance(content, list), "two blocks, not one concatenated string"
+    assert content[0]["text"] == "the stable part"
+    assert content[0]["cache_control"] == {"type": "ephemeral"}
+    assert content[1]["text"] == "the variable tail"
+    assert "cache_control" not in content[1], "only the prefix is reusable"
+
+
+async def test_a_prefix_with_no_tail_yet_does_not_send_an_empty_block() -> None:
+    """The Coder's first attempt, which had no previous failure to report.
+
+    Its tail is empty, and the API rejects a text block containing no text. Every run would
+    have died at the Coder with a 400 — which the flow classifies non-retryable, so the run
+    would not have recovered — and it would have died before writing the cache entry the
+    later attempts were the whole reason for.
+    """
+    seen: list[httpx.Request] = []
+    adapter = _adapter(_message(), seen)
+
+    with executing(REGISTRY["planner"]):
+        await adapter.complete(
+            LLMRequest(system="s", prompt="", cacheable_prefix="the stable part")
+        )
+
+    content = json.loads(seen[0].content)["messages"][0]["content"]
+    assert isinstance(content, list)
+    assert len(content) == 1, "an empty tail is no block at all, not a block containing ''"
+    assert content[0]["cache_control"] == {"type": "ephemeral"}
+
+
+async def test_a_short_prefix_is_still_marked_rather_than_second_guessed() -> None:
+    """The adapter does not apply a size threshold of its own, and must not grow one back.
+
+    A `MIN_CACHEABLE_BYTES` constant lived here briefly. Below the provider's minimum a marker
+    is silently ignored and *not charged*, so withholding it saves nothing — and the minimum
+    is model-dependent and not monotonic (512 tokens on Opus 5, 1024 on Sonnet 5, 4096 on
+    Haiku 4.5), so any constant declines to mark blocks that would have cached on the models
+    with a lower threshold. The provider applies its own threshold for free.
+    """
+    seen: list[httpx.Request] = []
+    adapter = _adapter(_message(), seen)
+
+    with executing(REGISTRY["planner"]):
+        await adapter.complete(
+            LLMRequest(system="s", prompt="tail", cacheable_prefix="tiny")
+        )
+
+    content = json.loads(seen[0].content)["messages"][0]["content"]
+    assert isinstance(content, list), "marked regardless of size; the provider decides"
+    assert content[0]["cache_control"] == {"type": "ephemeral"}
+
+
+async def test_without_a_prefix_the_request_shape_is_unchanged() -> None:
+    """A prompt too short to cache must not pay for a cache entry.
+
+    A write costs more than an ordinary input token, so marking a small prompt is a surcharge
+    with no offsetting read. Callers that pass nothing get exactly the shape they had before
+    caching existed.
+    """
+    seen: list[httpx.Request] = []
+    adapter = _adapter(_message(), seen)
+
+    with executing(REGISTRY["planner"]):
+        await adapter.complete(LLMRequest(system="s", prompt="short"))
+
+    assert json.loads(seen[0].content)["messages"][0]["content"] == "short"
+
+
+async def test_cache_accounting_is_carried_back_from_the_provider() -> None:
+    """A cache that never hits looks exactly like one that works, except on the invoice.
+
+    Writes cost more than ordinary input tokens and reads cost a fraction, so "every call
+    wrote, none read" is *worse* than not caching. The numbers are recorded per node so the
+    two cases can be told apart from the run's own record rather than from a bill.
+    """
+    seen: list[httpx.Request] = []
+    adapter = _adapter(
+        _message(usage={
+            "input_tokens": 40,
+            "output_tokens": 20,
+            "cache_creation_input_tokens": 9_000,
+            "cache_read_input_tokens": 0,
+        }),
+        seen,
+    )
+
+    with executing(REGISTRY["planner"]):
+        completion = await adapter.complete(LLMRequest(system="s", prompt="p"))
+
+    assert completion.cache_write_tokens == 9_000
+    assert completion.cache_read_tokens == 0
+
+
+async def test_a_response_without_cache_fields_is_not_an_error() -> None:
+    """Absent on any deployment that does not cache, and on every fixture predating it."""
+    seen: list[httpx.Request] = []
+    adapter = _adapter(_message(), seen)
+
+    with executing(REGISTRY["planner"]):
+        completion = await adapter.complete(LLMRequest(system="s", prompt="p"))
+
+    assert completion.cache_write_tokens == 0
+    assert completion.cache_read_tokens == 0

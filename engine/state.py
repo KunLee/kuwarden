@@ -299,7 +299,14 @@ class FlowState:
     # Divided among child runs, never duplicated. Without this, fan-out later becomes an
     # unbounded billing event — ADR 0002.
     budget_cents_allowed: int = 0
-    budget_cents_spent: int = 0
+    #: Estimated spend so far, in micro-cents — see `engine.policy.pricing`. Micro rather
+    #: than whole cents because the previous integer-cent counter floored every call to at
+    #: least one cent, which made a 123,000-token call and a 10,000-token call identical
+    #: and hid the only number worth watching.
+    #:
+    #: `None` means at least one call used a model nobody has priced. Not zero: an
+    #: unmeasured cost must never read as a free one.
+    spend_micro_cents: int | None = 0
     #: How many times the *Coder's own loop* retried inside one activity, after reading a
     #: failing test run. Written by the Coder, redacted from verifiers (invariant 4).
     retry_count: int = 0

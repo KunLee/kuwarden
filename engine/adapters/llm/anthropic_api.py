@@ -126,7 +126,7 @@ class AnthropicLLM:
             "model": self._model,
             "max_tokens": request.max_tokens,
             "system": request.system,
-            "messages": [{"role": "user", "content": request.prompt}],
+            "messages": [{"role": "user", "content": _content(request)}],
             # Adaptive rather than a token budget: `budget_tokens` returns 400 on current
             # models, and the model calibrates depth better than a fixed ceiling did.
             "thinking": {"type": "adaptive"},
@@ -183,6 +183,40 @@ class AnthropicLLM:
         return _to_completion(message, expects_schema=request.schema is not None)
 
 
+def _content(request: LLMRequest) -> Any:
+    """The user turn, as one block or as a cacheable prefix followed by the rest.
+
+    A single string when the caller marked nothing — the shape every call used before caching
+    existed.
+
+    Otherwise the prefix carries `cache_control` and the variable tail follows it. The provider
+    caches a *prefix*, so the marker only pays if everything before it is byte-identical
+    between calls; that is why the repository context is separated from the ticket and the
+    previous attempt's failure rather than interleaved with them.
+
+    A supplied prefix is always marked, with no size test here. Below the provider's minimum
+    a marker is silently ignored and not charged, and the minimum is model-dependent and not
+    monotonic — so a client-side threshold can only decline to cache something that would
+    have worked. The provider applies its own for free.
+    """
+    if not request.cacheable_prefix:
+        return request.prompt
+
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": request.cacheable_prefix,
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
+    # Only when there is a tail. The Coder's first attempt has no previous failure to report,
+    # so its tail is empty — and the API rejects an empty text block, which would have failed
+    # every run at the Coder with a 400 that this adapter classifies as non-retryable.
+    if request.prompt:
+        blocks.append({"type": "text", "text": request.prompt})
+    return blocks
+
+
 def _to_completion(message: Any, *, expects_schema: bool) -> Completion:
     # Before content, always. A refusal carries an empty content array.
     if message.stop_reason == "refusal":
@@ -222,11 +256,17 @@ def _to_completion(message: Any, *, expects_schema: bool) -> Completion:
             raise LLMError(f"schema was requested but the response was a {type(candidate)}")
         parsed = candidate
 
+    # `getattr` with a default rather than direct access: the cache fields are absent from
+    # a response that used no caching, and from every recorded fixture written before caching
+    # existed. A KeyError here would turn "this deployment does not cache" into a failed run.
+    usage = message.usage
     return Completion(
         text=text,
         parsed=parsed,
-        input_tokens=message.usage.input_tokens,
-        output_tokens=message.usage.output_tokens,
+        input_tokens=usage.input_tokens,
+        output_tokens=usage.output_tokens,
         model=message.model,
         stop_reason=message.stop_reason,
+        cache_write_tokens=getattr(usage, "cache_creation_input_tokens", None) or 0,
+        cache_read_tokens=getattr(usage, "cache_read_input_tokens", None) or 0,
     )

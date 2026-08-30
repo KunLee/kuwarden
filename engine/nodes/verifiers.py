@@ -30,6 +30,7 @@ from engine.config import ConfigError
 from engine.nodes import notes
 from engine.nodes.base import context, node
 from engine.nodes.repo_context import closure, dependents, render
+from engine.policy.pricing import accrue, as_text, micro_cents
 from engine.policy.test_evidence import evaluate
 from engine.state import FlowState, NodeClass, Verification
 
@@ -168,7 +169,8 @@ def _prompt(state: FlowState, repository: str = "", extra: str = "") -> str:
     if repository:
         # After the diff, deliberately. The change is what is under review; the tree is
         # context for judging it, and leading with the whole project buries the thing
-        # actually being asked about.
+        # actually being asked about. It led briefly, for a prompt cache that cannot work
+        # here — ADR 0011.
         parts.append(
             "<repository_before_this_change>\n"
             "The project at the commit this change was made against. Use it to check whether "
@@ -257,6 +259,10 @@ async def _judge(
                 [
                     ("Angle", verifier_id),
                     ("Changed files", len(state.proposed_edits)),
+                    # Expected to be zero: this path marks no prefix on purpose. Recorded
+                    # anyway, so the zero is visibly deliberate rather than missing.
+                    ("Cache written", completion.cache_write_tokens),
+                    ("Cache read", completion.cache_read_tokens),
                     # Named, because "the verifier could not see the file it was asked
                     # about" is the difference between a verdict and a guess, and it has
                     # already produced two rejections of valid changes.
@@ -288,6 +294,11 @@ async def _judge(
     try:
         completion = await adapter.complete(
             LLMRequest(
+                # No cacheable prefix, and that is a conclusion rather than an omission: the
+                # provider caches a prefix rendered `tools`, `system`, `messages`, and each
+                # verifier's `system` carries its own angle — so the four diverge before any
+                # marker is reached. One call per verifier per pass, so a marked block would
+                # be written and never read. ADR 0011 has the argument and the rejected fix.
                 system=system,
                 prompt=prompt,
                 max_tokens=settings.max_tokens,
@@ -326,6 +337,15 @@ async def _judge(
             ],
         )
 
+    # Accrued onto the brief, which starts at zero because `spend_micro_cents` is not in
+    # `VERIFIER_MAY_SEE` and so is absent by construction. `_verify` sums the four back
+    # into the run's total — a verifier never sees the run's running spend, which would
+    # be a channel between verifiers that invariant 4 exists to close.
+    #
+    # Only on this path. A refusal or an unreachable model returns above, having spent
+    # nothing worth counting, and both of those already block.
+    state.spend_micro_cents = accrue(state.spend_micro_cents, completion.model, completion)
+
     parsed = completion.parsed or {}
     findings = [str(f) for f in parsed.get("findings", []) if str(f).strip()]
     blocks = bool(parsed.get("blocks"))
@@ -341,6 +361,16 @@ async def _judge(
             ("Effort", settings.effort),
             ("Input tokens", completion.input_tokens),
             ("Output tokens", completion.output_tokens),
+            # Counted at last. The verifiers are four of a run's six model calls and the
+            # bulk of its input, and until now they contributed nothing to the run's spend
+            # — a total that omitted the majority of the cost, presented as the total.
+            ("Estimated cost of this call", as_text(micro_cents(
+                completion.model,
+                input_tokens=completion.input_tokens,
+                output_tokens=completion.output_tokens,
+                cache_write_tokens=completion.cache_write_tokens,
+                cache_read_tokens=completion.cache_read_tokens,
+            ))),
         ],
     )
 

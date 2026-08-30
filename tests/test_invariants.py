@@ -232,7 +232,7 @@ def test_a_verifier_never_sees_the_coders_reasoning() -> None:
         plan=ChangePlan(summary="how I decided to do it", steps=["step"]),
         diff=Diff(files=[FileChange(path="src/app.py", added=1, removed=0)]),
         retry_count=3,
-        budget_cents_spent=99,
+        spend_micro_cents=99_000_000,
         verifications=[Verification(verifier="security", passed=False)],
     )
 
@@ -242,7 +242,10 @@ def test_a_verifier_never_sees_the_coders_reasoning() -> None:
     assert brief.plan is None, "the Coder's plan is reasoning about this change"
     assert brief.retry_count == 0, "retry_count *is* prior attempts"
     assert brief.verifications == [], "a fan-out, not a vote"
-    assert brief.budget_cents_spent == 0
+    # Not the run's spend either. A verifier that could see it would learn how much work
+    # preceded it — a weak channel, but a channel, and the allow-list is meant to close
+    # all of them rather than the obvious ones.
+    assert brief.spend_micro_cents == 0
 
     # What a verifier legitimately needs: the ask, the change, the evidence, the lineage.
     assert brief.ticket == state.ticket

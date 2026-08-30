@@ -41,7 +41,9 @@ def test_every_text_file_reaches_the_model_however_many_there_are() -> None:
     """
     body = ("x = 1\n" * 400).encode()
     files = {f"src/module_{i:03}.py": body for i in range(60)}
-    prompt, assembly = _prompt(_state(), files, None)
+    cacheable, tail, assembly = _prompt(_state(), files, None)
+    # Split for prompt caching, joined here: what the model saw is both halves.
+    prompt = cacheable + "\n\n" + tail
 
     assert assembly["listed"] == 60
     assert assembly["shown"] == 60, "every text file is sent, whatever the total size"
@@ -57,7 +59,9 @@ def test_binary_files_are_still_listed_rather_than_inlined() -> None:
     cannot silently swallow the source file a ticket names.
     """
     files = {"logo.png": b"\x89PNG\r\n\x00\x1a\n" + b"\x00" * 64, "app.py": b"x = 1\n"}
-    prompt, assembly = _prompt(_state(), files, None)
+    cacheable, tail, assembly = _prompt(_state(), files, None)
+    # Split for prompt caching, joined here: what the model saw is both halves.
+    prompt = cacheable + "\n\n" + tail
 
     assert assembly["shown"] == 1
     assert assembly["omitted"] == 1
@@ -128,7 +132,9 @@ def test_a_lockfile_is_listed_but_never_inlined() -> None:
         "package-lock.json": b'{"lockfileVersion": 3}\n' + b'{"x":1}\n' * 5000,
         "src/app.ts": b"export const x = 1;\n",
     }
-    prompt, assembly = _prompt(_state(), files, None)
+    cacheable, tail, assembly = _prompt(_state(), files, None)
+    # Split for prompt caching, joined here: what the model saw is both halves.
+    prompt = cacheable + "\n\n" + tail
 
     assert assembly["shown"] == 2
     assert assembly["omitted"] == 1

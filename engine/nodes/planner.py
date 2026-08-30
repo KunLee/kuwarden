@@ -19,6 +19,7 @@ from engine.adapters.llm.factory import llm_adapter
 from engine.config import ConfigError
 from engine.nodes import notes
 from engine.nodes.base import context, node
+from engine.policy.pricing import accrue, as_text, micro_cents
 from engine.state import ChangePlan, FlowState, NodeClass
 
 PLAN_SCHEMA = {
@@ -84,8 +85,9 @@ async def planner(state: FlowState) -> FlowState:
     )
     # Spend is tracked on the state so the budget ceiling means something before the run
     # rather than after the invoice.
-    cost = _estimate_cents(completion.input_tokens, completion.output_tokens)
-    state.budget_cents_spent += cost
+    state.spend_micro_cents = accrue(
+        state.spend_micro_cents, completion.model, completion
+    )
 
     steps = "\n".join(f"{i}. {s}" for i, s in enumerate(state.plan.steps, 1)) or "(no steps)"
     state.notes = notes.compose(
@@ -102,10 +104,15 @@ async def planner(state: FlowState) -> FlowState:
                 ("Input tokens", completion.input_tokens),
                 ("Output tokens", completion.output_tokens),
                 ("Schema enforced", "yes — a plan that fails validation is not a plan"),
-                ("Estimated cost", f"{cost} cents"),
+                ("Estimated cost of this call", as_text(micro_cents(
+                    completion.model,
+                    input_tokens=completion.input_tokens,
+                    output_tokens=completion.output_tokens,
+                ))),
                 (
                     "Run spend so far",
-                    f"{state.budget_cents_spent} of {state.budget_cents_allowed} cents",
+                    f"{as_text(state.spend_micro_cents)} of "
+                    f"{state.budget_cents_allowed} cents allowed",
                 ),
             ],
         ),
@@ -133,11 +140,3 @@ async def planner(state: FlowState) -> FlowState:
     )
     return state
 
-
-def _estimate_cents(input_tokens: int, output_tokens: int) -> int:
-    """Deliberately crude, and deliberately not per-model.
-
-    Real per-model rates belong with the model ids in docs/reference/models.md, behind the
-    same review date. A wrong number here would be a number nobody re-checks.
-    """
-    return max(1, (input_tokens + output_tokens * 5) // 100_000)
