@@ -38,6 +38,7 @@ from engine.adapters.scm.tree import (
     excluded,
     finish,
 )
+from engine.adapters.scm.tree_cache import cached
 from engine.errors import AdapterError, NotFound, PermissionDenied
 
 API_VERSION = "2022-11-28"
@@ -213,6 +214,18 @@ class GitHubScm:
     async def read_tree(
         self, ref: RepoRef, commit: str, limits: TreeLimits | None = None
     ) -> RepoTree:
+        """Every file at `commit`, cached per worker — see `tree_cache`.
+
+        A commit is content-addressed, so the result cannot go stale. One run asks six
+        times for the same tree — Coder, Build & Test, and once per verifier — and each
+        ask is N+1 requests.
+        """
+        bounds = limits or TreeLimits()
+        return await cached(
+            ref, commit, bounds, lambda: self._read_tree(ref, commit, bounds)
+        )
+
+    async def _read_tree(self, ref: RepoRef, commit: str, bounds: TreeLimits) -> RepoTree:
         """Every file at `commit`, via the Git Data API.
 
         One call lists the tree; one call per blob fetches content. That is N+1 requests,
@@ -220,8 +233,6 @@ class GitHubScm:
         would have to unpack and offers no way to skip excluded paths before downloading
         them.
         """
-        bounds = limits or TreeLimits()
-
         async with await self._client(ref, CredentialKind.SCM_READ) as client:
             listing: Any = await client.get(
                 f"{self._repo(ref)}/git/trees/{commit}", params={"recursive": "1"}

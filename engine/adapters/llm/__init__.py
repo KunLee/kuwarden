@@ -90,6 +90,14 @@ class Completion:
     #: What actually served the request, which is not always what was asked for.
     model: str
     stop_reason: str
+    #: Prompt-cache accounting, straight from the provider. Recorded rather than inferred
+    #: because caching is the one optimisation whose failure is invisible: a cache that never
+    #: hits looks exactly like a cache that is working, except on the invoice. A write costs
+    #: more than an ordinary input token and a read costs a fraction of one, so a run where
+    #: every call wrote and none read is *worse* than no caching at all — and that is the
+    #: expected outcome for calls issued in parallel, which the verifier fan-out does.
+    cache_write_tokens: int = 0
+    cache_read_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -104,6 +112,19 @@ class LLMRequest:
 
     system: str
     prompt: str
+    #: A stable prefix placed before `prompt` and marked cacheable.
+    #:
+    #: Split out rather than concatenated because the provider caches a *prefix*: everything
+    #: up to the marker is reusable only if it is byte-identical and comes first. The
+    #: repository context qualifies — it is the largest part of the prompt and identical
+    #: across the Coder's four attempts and across all four verifiers. The ticket, the plan
+    #: and the previous attempt's failure do not, and putting them first would mean nothing
+    #: was ever reusable.
+    #:
+    #: `None` sends a single unmarked block, which is what every caller did before caching
+    #: existed and remains correct for short prompts — a cache write below the provider's
+    #: minimum is refused, and one that is never read is a surcharge.
+    cacheable_prefix: str | None = None
     max_tokens: int = 8192
     #: Vendor-neutral depth hint. Providers map it onto whatever they actually support.
     effort: str = "high"

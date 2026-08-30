@@ -12,6 +12,7 @@ import asyncio
 import base64
 import json
 import uuid
+from collections.abc import Iterator
 from pathlib import Path
 
 import httpx
@@ -19,6 +20,7 @@ import pytest
 
 from engine.activities.nodes import RUNTIME
 from engine.adapters.credentials import EnvCredentialBroker
+from engine.adapters.scm import tree_cache
 from engine.config import AppConfig, parse
 from engine.devenv import load_dotenv
 from engine.sandbox import ExecResult, ResourceLimits, SandboxCapabilities, Workspace
@@ -100,6 +102,20 @@ async def _purge() -> None:
         await conn.execute("DELETE FROM app_credentials WHERE app_id = ANY($1::uuid[])", ids)
         await conn.execute("DELETE FROM app_triggers WHERE app_id = ANY($1::uuid[])", ids)
         await conn.execute("DELETE FROM app_registry WHERE id = ANY($1::uuid[])", ids)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_cached_trees() -> Iterator[None]:
+    """A tree cached by one test must never be served to the next.
+
+    `tree_cache` is keyed on a commit, which is content-addressed and therefore needs no
+    invalidation in production — but tests reuse commit ids like `c0ffee12` across fixtures
+    with deliberately different contents, so without this a test asserting that an excluded
+    path was never downloaded passes on a tree some earlier test fetched.
+    """
+    tree_cache.forget()
+    yield
+    tree_cache.forget()
 
 
 @pytest.fixture(scope="session", autouse=True)

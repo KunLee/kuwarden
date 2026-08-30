@@ -30,6 +30,7 @@ from engine.adapters.protocols import (
     TreeLimits,
 )
 from engine.adapters.scm.tree import check_file_count, check_file_size, excluded, finish
+from engine.adapters.scm.tree_cache import cached
 from engine.errors import AdapterError
 
 API_VERSION = "7.1"
@@ -135,12 +136,23 @@ class AzureReposScm:
     async def read_tree(
         self, ref: RepoRef, commit: str, limits: TreeLimits | None = None
     ) -> RepoTree:
+        """Every file at `commit`, cached per worker — see `tree_cache`.
+
+        A commit is content-addressed, so the result cannot go stale. One run asks six
+        times for the same tree — Coder, Build & Test, and once per verifier — and each
+        ask is N+1 requests.
+        """
+        bounds = limits or TreeLimits()
+        return await cached(
+            ref, commit, bounds, lambda: self._read_tree(ref, commit, bounds)
+        )
+
+    async def _read_tree(self, ref: RepoRef, commit: str, bounds: TreeLimits) -> RepoTree:
         """Every file at `commit`, via the Items API.
 
         Azure Repos returns content inline when asked, so this is one listing call plus one
         content call per file -- the same N+1 shape as GitHub, bounded the same way.
         """
-        bounds = limits or TreeLimits()
         version = {
             "versionDescriptor.version": commit,
             "versionDescriptor.versionType": "commit",

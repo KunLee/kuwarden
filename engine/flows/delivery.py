@@ -35,6 +35,8 @@ with workflow.unsafe.imports_passed_through():
     from engine.activities.nodes import NodeInput, run_node
     from engine.activities.notify import GateNotice, notify_gate_reached
     from engine.config import ALL_VERIFIERS as _ALL_VERIFIER_NAMES
+    from engine.policy.pricing import LAST_REVIEWED as PRICING_REVIEWED
+    from engine.policy.pricing import as_text, combine
     from engine.policy.tiering import raise_to, required_approvals, tier_for_diff
     from engine.state import (
         SCHEMA_VERSION,
@@ -485,6 +487,12 @@ class DeliveryFlow:
         results = await asyncio.gather(
             *(self._node_step(v, brief, record=False) for v in VERIFIERS)
         )
+        # Spend, summed back in. Each verifier accrues onto its own redacted brief — it
+        # never sees the run's running total, which would be a channel between verifiers
+        # that invariant 4 exists to close — so the four totals are added here.
+        state.spend_micro_cents = combine(
+            state.spend_micro_cents, *(r.spend_micro_cents for r in results)
+        )
         for verifier_id, result in zip(VERIFIERS, results, strict=True):
             state.verifications = [*state.verifications, *result.verifications]
             # Emitted here rather than by `_node_step`, which runs the fan-out with
@@ -708,6 +716,25 @@ class DeliveryFlow:
 
     async def _finish(self) -> None:
         assert self._run_id is not None
+        # What the run cost, on its own record, on every path — succeeded, rejected, failed or
+        # terminated. Per-node figures already sit in each node's notes; this is the one row
+        # that makes two runs comparable, which is the whole reason to have it: "did selecting
+        # context actually save anything" and "is the cache reading or only writing" are
+        # questions about the difference between runs, and a number only in a node's notes has
+        # to be summed by hand across six of them to answer either.
+        #
+        # `None` is reported as unknown rather than as zero. A run that used a model nobody
+        # priced cost something; reporting it as free is the failure this project argues about
+        # everywhere else, applied to money.
+        spend = self._latest.spend_micro_cents if self._latest is not None else 0
+        await self._emit(
+            "run_cost",
+            payload={
+                "micro_cents": spend,
+                "readable": as_text(spend),
+                "rates_last_reviewed": PRICING_REVIEWED,
+            },
+        )
         await workflow.execute_activity(
             record_run_ended,
             RunEnded(run_id=self._run_id, status=self._status),
