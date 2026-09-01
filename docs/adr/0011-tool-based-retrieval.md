@@ -146,6 +146,29 @@ What the measurement must show before this is Accepted:
   practice and the bounded-selection middle option becomes the right answer instead of the
   full tool loop.
 
+### The measurement, taken
+
+*2026-08-30, run `521065f3` on the reference application.*
+
+```
+Coder, outer attempt 1   input 1,433   cache written 19,194   cache read 57,582
+Coder, outer attempt 2   input   492   cache written 18,656   cache read 18,656
+run_cost                 72.79 cents
+```
+
+**The Coder's sequential attempts read the cache.** 57,582 tokens served from it against 1,433
+charged at the ordinary input rate, in a node whose first attempt wrote 19,194 — three reads of
+one write, which is the inner loop doing exactly what this ADR assumed it could not be trusted
+to do without checking.
+
+Both conditions are therefore met: the verifier half was closed by the prefix rule above, and
+the Coder half is measured. The bounded-selection fallback is no longer the required answer.
+
+**The status is still `Proposed`.** Accepting is one-way, and the remaining work — the
+`LLMAdapter` conversation contract, the four tools, the shared confinement each of them needs,
+the `grep` timeout, the loop cap — has not been done. What has changed is that nothing blocks
+starting it.
+
 ## Consequences
 
 **The `LLMAdapter` contract has to grow.** `LLMRequest` is deliberately single-shot —

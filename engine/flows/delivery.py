@@ -23,12 +23,15 @@ from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
     from engine.activities.audit import (
+        ChangedFile,
         EventRecorded,
         RunEnded,
+        RunFiles,
         RunStarted,
         RunStatusChanged,
         record_event,
         record_run_ended,
+        record_run_files,
         record_run_started,
         record_run_status,
     )
@@ -334,6 +337,10 @@ class DeliveryFlow:
             # No `control_mode`. It belongs to `external_effect` events, which name one of the
             # three control points in ADR 0004; a branch push is not one of them, and calling
             # it `authorized` would widen a word whose whole value is that it is narrow.
+            # git's numstat, not the model's account of what it wrote — invariant 3 applied
+            # to the index. `diff` is optional on the state and empty here would mean the push
+            # was deduplicated, which is a real case and not an error.
+            changed = list(state.diff.files) if state.diff else []
             await self._emit(
                 "branch_pushed",
                 node_id="push",
@@ -342,7 +349,30 @@ class DeliveryFlow:
                     "commit": state.head_commit,
                     "base": state.base_commit,
                     "attempt": attempt,
+                    # Structured, on the event that already records the push. The Push node's
+                    # notes say the same thing in prose for a human; this is the form the
+                    # evidence graph reads, so nothing has to parse a section title out of
+                    # someone's presentation layer.
+                    "files": [
+                        {"path": f.path, "added": f.added, "removed": f.removed}
+                        for f in changed
+                    ],
                 },
+            )
+            # And the index that makes the reverse question answerable — ADR 0012. Separate
+            # from the event because `flow_events` is the record and this is a view over it:
+            # the event keeps every push, the index keeps the latest.
+            await workflow.execute_activity(
+                record_run_files,
+                RunFiles(
+                    run_id=self._run_id_checked(),
+                    attempt=attempt,
+                    files=[
+                        ChangedFile(path=f.path, added=f.added, removed=f.removed)
+                        for f in changed
+                    ],
+                ),
+                start_to_close_timeout=AUDIT_TIMEOUT,
             )
 
             state = await self._node_step("build_test", state)
@@ -515,6 +545,24 @@ class DeliveryFlow:
                 "passed": sum(1 for v in state.verifications if v.passed),
                 "of": len(VERIFIERS),
                 "falsified_by": falsified,
+                # The findings themselves, structured, on the row the evidence document
+                # reads. They are also in each `verifier_verdict`'s notes, and that is not
+                # duplication for its own sake: those are prose written for someone already
+                # reading one verifier, while an approver needs all of them, before deciding,
+                # without knowing which node to open.
+                #
+                # This exists because of ticket 50. `correctness` returned *passes* and wrote,
+                # in its findings, that the change did not do what the ticket asked. Nothing
+                # carried that sentence to the gate, the approver saw "3 of 4 passed", and the
+                # change shipped without implementing the feature.
+                "verifications": [
+                    {
+                        "verifier": v.verifier,
+                        "blocks": not v.passed,
+                        "findings": list(v.findings),
+                    }
+                    for v in state.verifications
+                ],
             },
         )
         # Restores the invariant the fan-out breaks. `_node_step` publishes every activity

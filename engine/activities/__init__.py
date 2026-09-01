@@ -13,6 +13,7 @@ from typing import Any
 from engine.activities.audit import (
     record_event,
     record_run_ended,
+    record_run_files,
     record_run_started,
     record_run_status,
 )
@@ -27,6 +28,7 @@ ALL: Sequence[Callable[..., Any]] = [
     record_run_status,
     record_event,
     record_run_ended,
+    record_run_files,
     notify_gate_reached,
 ]
 
@@ -35,6 +37,7 @@ __all__ = [
     "notify_gate_reached",
     "record_event",
     "record_run_ended",
+    "record_run_files",
     "record_run_started",
     "record_run_status",
     "run_node",

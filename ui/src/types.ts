@@ -174,6 +174,54 @@ export interface User extends Principal {
 }
 
 /**
+ * One ticket's evidence graph — ADR 0012. Recorded facts, never inferred: every node is a row
+ * and every edge is a foreign key, a commit trailer, or git's own numstat.
+ */
+export interface TicketGraph {
+  run_id: string;
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+  node_count: number;
+  edge_count: number;
+}
+
+export interface GraphNode {
+  id: string;
+  kind: "ticket" | "run" | "file";
+  label: string;
+  /** `run` only. */
+  status: string;
+  /** `run` only. The work-item revision a service hook launched it for, when it was one. */
+  revision: string | null;
+  /** `run` only. Every push, in order; the first carries the base it branched from. */
+  pushes: { commit: string; base: string; attempt: number }[];
+  /** `run` only. True for the run being viewed. */
+  self: boolean;
+}
+
+/** One run that changed a given file — the reverse query behind ADR 0012. */
+export interface FileRun {
+  run_id: string;
+  path: string;
+  added: number;
+  removed: number;
+  ticket_system: string;
+  ticket_id: string;
+  status: string;
+  app_name: string;
+  created_at: string;
+}
+
+export interface GraphEdge {
+  from: string;
+  to: string;
+  kind: "asked" | "spawned" | "changed";
+  /** `changed` only, from git. */
+  added?: number;
+  removed?: number;
+}
+
+/**
  * The evidence document an approver decides against, and the digest that binds them to it.
  *
  * `digest` is opaque here on purpose — the UI never recomputes it. Two implementations of
@@ -200,6 +248,12 @@ export interface Evidence {
     /** Empty when no verdict was recorded. `source` says who ran the tests, not just that they ran. */
     tests: { exit_code?: number; source?: string; duration_ms?: number; url?: string | null };
     sandbox_isolation: { state?: string; gaps?: string[] };
+    /**
+     * What each verifier wrote, not how many passed. A passing verdict is not an empty one —
+     * ticket 50 shipped with `correctness` passing and its own findings saying the feature
+     * was not implemented.
+     */
+    verifications: { verifier: string; blocks: boolean; findings: string[] }[];
     /** Everything about this evidence that is weaker than it looks. Rendered above the controls. */
     caveats: string[];
     events: RunEvent[];

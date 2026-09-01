@@ -37,6 +37,7 @@ from re-deriving the answer from scratch.
 | [0009](0009-two-approval-levels.md) | Two approval levels: business authorisation and code review | Accepted | When the same person performs both — two levels done by one human is ceremony, and the second should be removed |
 | [0010](0010-context-assembly.md) | The model chooses its own context, and the record says what it saw | Accepted | On the repository map, on tool-based retrieval, and once prompt caching is measured |
 | [0011](0011-tool-based-retrieval.md) | The Coder reads the repository with tools, not with a prompt | **Proposed** | Blocked until prompt caching is measured on real runs — without it a 20-turn tool loop costs more than sending the whole repository |
+| [0012](0012-evidence-graph.md) | The evidence graph is recorded, never derived | Accepted | On recursive-CTE performance, on the first child run, and whenever AI-derived data is proposed — the question is whether the output is retrieval or evidence |
 
 ## Conventions
 

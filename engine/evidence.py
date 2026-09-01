@@ -32,7 +32,9 @@ from engine.errors import KuWardenError
 
 #: Bumped when the shape of the assembled document changes. It is part of the digest input,
 #: so a format change cannot make an old digest accidentally match a new document.
-EVIDENCE_SCHEMA = 1
+#:
+#: 2 — verifier findings and the advisory override. See `_caveats`.
+EVIDENCE_SCHEMA = 2
 
 
 class RunNotFound(KuWardenError):
@@ -103,6 +105,11 @@ async def assemble(run_id: UUID) -> Evidence:
 
     verdict = payload_of("build_test_verdict")
     isolation = payload_of("sandbox_isolation")
+    # What the verifiers actually wrote, not how many of them passed. A count is the one
+    # summary that cannot be acted on: three verifiers can pass while recording, between
+    # them, the reason the change does not work.
+    verifications = payload_of("verifiers_completed").get("verifications") or []
+    overridden = payload_of("verifier_overridden")
 
     # The tier from the trail, falling back to the column only when final tiering has not run.
     #
@@ -137,14 +144,23 @@ async def assemble(run_id: UUID) -> Evidence:
         "started_at": run["created_at"].isoformat(),
         "tests": verdict,
         "sandbox_isolation": isolation,
-        "caveats": _caveats(run["policy_commit"], verdict, isolation),
+        # Every finding, named by the verifier that wrote it and by whether it blocked. A
+        # passing verdict is not an empty one, and the difference is the approver's to weigh.
+        "verifications": verifications,
+        "caveats": _caveats(
+            run["policy_commit"], verdict, isolation, verifications, overridden
+        ),
         "events": rows,
     }
     return Evidence(run_id=run_id, digest=digest_of(document), document=document)
 
 
 def _caveats(
-    policy_commit: str, verdict: dict[str, Any], isolation: dict[str, Any]
+    policy_commit: str,
+    verdict: dict[str, Any],
+    isolation: dict[str, Any],
+    verifications: list[dict[str, Any]] | None = None,
+    overridden: dict[str, Any] | None = None,
 ) -> list[str]:
     """Everything about this evidence that is weaker than it looks.
 
@@ -153,6 +169,27 @@ def _caveats(
     approver did not see is not a caveat — it is a disclaimer written for the wrong audience.
     """
     caveats: list[str] = []
+
+    # First, because it is the strongest thing on the page: a review that refused this change
+    # and was configured not to be able to stop it. Recorded as a count until ticket 50, where
+    # the disarmed verifier was the only one that objected.
+    for name in (overridden or {}).get("advisory") or []:
+        caveats.append(
+            f"{name} falsified this change and was not permitted to block it, because this "
+            "application declares it advisory. Its findings are on this page and were not "
+            "acted on by the gate."
+        )
+
+    # Then the findings of the verifiers that *passed*. This is the case ticket 50 shipped
+    # through: `correctness` returned a passing verdict and wrote, in the same breath, that
+    # the change did not do what the ticket asked. A verdict is a judgement; the findings are
+    # what it was a judgement about, and only one of the two reached the approver.
+    quiet = sum(len(v.get("findings") or []) for v in (verifications or []) if not v.get("blocks"))
+    if quiet:
+        caveats.append(
+            f"{quiet} finding(s) were recorded by verifiers that did NOT block this change. "
+            "A passing verdict is not an empty one — read them before approving."
+        )
 
     if verdict and verdict.get("source") != "ci":
         # The reason is appended rather than replacing the sentence. "No CI verdict" and "the

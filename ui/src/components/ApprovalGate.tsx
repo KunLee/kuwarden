@@ -9,6 +9,13 @@
  * is rendered before the approver can reach a control. A qualification placed below the fold
  * is a qualification written for the record rather than for the reader.
  *
+ * **So do the verifier findings, including the ones from verifiers that passed.** This page
+ * used to show a count — "3 of 4 passed" — and nothing else. On ticket 50 that count was
+ * true, the change shipped, and it did not implement the feature: `correctness` had returned
+ * a passing verdict while writing, in its findings, exactly what was missing. A verdict is a
+ * judgement; the findings are what it was a judgement about, and only one of the two was
+ * reaching the person deciding.
+ *
  * **The digest is submitted with the decision.** It binds the approval to the exact document
  * rendered here; the API recomputes it and refuses if the run has moved on. That turns
  * "approved run X" into "approved these facts about run X" — ADR 0003 §6.
@@ -90,6 +97,41 @@ export function ApprovalGate({ runId, status }: { runId: string; status: string 
                   ))}
                 </ul>
               </Banner>
+            )}
+
+            {/* Above the controls, with the caveats, and never collapsed. A finding the
+                approver has to expand is a finding they will not read. */}
+            {doc.verifications?.some((v) => v.findings.length > 0) && (
+              <Card title="What the verifiers wrote">
+                <ul className="grid gap-4">
+                  {doc.verifications
+                    .filter((v) => v.findings.length > 0)
+                    /* Blocking first: the review that refused this change is the one to
+                       read before the ones that did not. */
+                    .sort((a, b) => Number(b.blocks) - Number(a.blocks))
+                    .map((v) => (
+                      <li key={v.verifier} className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="text-[13px] font-semibold">{v.verifier}</span>
+                          <span
+                            className={`inline-flex rounded-lg px-2.5 py-1 text-[12px] font-medium ${
+                              v.blocks
+                                ? "bg-red-500/12 text-red-700 dark:text-red-300"
+                                : "bg-slate-500/10 text-slate-600 dark:text-slate-300"
+                            }`}
+                          >
+                            {v.blocks ? "blocks" : "passes"}
+                          </span>
+                        </div>
+                        <ul className="mt-2 list-disc space-y-2 pl-5 text-[13px] leading-relaxed text-slate-600 dark:text-slate-300">
+                          {v.findings.map((finding) => (
+                            <li key={finding}>{finding}</li>
+                          ))}
+                        </ul>
+                      </li>
+                    ))}
+                </ul>
+              </Card>
             )}
 
             <dl className="grid min-w-0 gap-x-8 gap-y-3 text-[13px] sm:grid-cols-2 [&>*]:min-w-0">

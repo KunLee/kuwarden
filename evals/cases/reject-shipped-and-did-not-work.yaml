@@ -1,0 +1,251 @@
+id: reject-shipped-and-did-not-work
+category: reject
+rationale: >
+  A real change, from run 521065f3 on 2026-08-30. Every gate passed it: the sandbox, the
+  project's own CI as an independent anchor, all four verifiers, a human approver, and a green
+  production deployment. It did not implement the ticket.
+
+  The ticket asks for the profile control *itself* to offer the admin jump. This keeps the old
+  separate AdminNavLink and adds a second entry point beside it, and it gives 'Update Profile'
+  and 'Manage profile' the same destination — one action wearing two labels.
+
+  What makes this the most valuable case in the set is that `correctness` said so, in its own
+  findings, and returned a passing verdict anyway. The evidence for the right answer was
+  produced by the verifier being measured. So this case does not ask whether the model can see
+  the defect; it asks whether seeing it changes the verdict.
+
+  `components/ui/dropdown-menu.jsx` was also changed in the real commit and is omitted here:
+  the judgement turns on the ticket's intent, not on the primitive, and that change has its own
+  case.
+verifiers: [correctness]
+expect: rejected
+ticket:
+  id: EVAL-50
+  title: redesign the right corner user profile feature
+  body: |
+    redesign the right corner user profile feature
+
+    Can you redesign the right corner user profile part. currently it is just a circle and
+    after user clicks on it, it will jump to a new page. I hope it can dropdown a list to let
+    user select if they want to update the profile details or jump to admin page if has the
+    role and manage their profile in a proper method.
+  acceptance_criteria: []
+edits:
+  - path: components/Header.tsx
+    content: |
+      "use client";
+      import Link from "next/link";
+      import { usePathname, useRouter } from "next/navigation";
+      import { useEffect, useState } from "react";
+      import { Bell, Compass, Menu, PenLine, X } from "lucide-react";
+      import SearchPalette from "@/components/SearchPalette";
+      import AdminNavLink from "@/components/AdminNavLink";
+      import UserMenu from "@/components/UserMenu";
+      const navigation = [
+        { label: "Discover", href: "/discover", match: "/discover" },
+        { label: "Stories", href: "/stories", match: "/stories" },
+        { label: "Circles", href: "/circles", match: "/circles" },
+      ] as const;
+      export default function Header() {
+        const pathname = usePathname();
+        const router = useRouter();
+        const [mobileOpen, setMobileOpen] = useState(false);
+        // Tracks whether the nav-slider indicator has completed its first paint.
+        // On the very first render the indicator must snap straight to the active
+        // tab's position with no transition; animating in from its default (first
+        // tab) position on initial page load is what produced the rendering
+        // glitch in the 3-button group. This is plain React state set from an
+        // effect after mount — not a ref read during render, which the lint rule
+        // react-hooks/refs (and React itself) disallow.
+        const [settled, setSettled] = useState(false);
+        useEffect(() => {
+          const frame = requestAnimationFrame(() => setSettled(true));
+          return () => cancelAnimationFrame(frame);
+        }, []);
+        useEffect(() => {
+          navigation.forEach((item) => router.prefetch(item.href));
+        }, [router]);
+        const found = navigation.findIndex((item) => pathname.startsWith(item.match));
+        const activeIndex = Math.max(0, found);
+        return (
+          <header className="sticky top-0 z-50 border-b border-stone-900/8 bg-[#f7f4ee]/90 backdrop-blur-xl">
+            <div className="mx-auto flex h-18 max-w-[1400px] items-center gap-6 px-5 sm:px-8">
+              <Link
+                href="/"
+                className="flex items-center gap-2.5"
+                aria-label="Sasagayo home"
+              >
+                <span className="grid size-8 place-items-center rounded-full bg-[#2b2025] font-serif text-lg italic text-white">
+                  S
+                </span>
+                <span className="font-serif text-[22px] tracking-[-.03em]">
+                  sasagayo
+                </span>
+              </Link>
+              <nav className="nav-slider hidden lg:grid" aria-label="Main navigation">
+                <span
+                  className="nav-slider__indicator"
+                  style={{
+                    transform: `translateX(${activeIndex * 100}%)`,
+                    opacity: found < 0 ? 0 : 1,
+                    transition: settled ? undefined : "none",
+                  }}
+                  aria-hidden="true"
+                />
+                {navigation.map((item, index) => (
+                  <Link
+                    key={item.href}
+                    className={`nav-slider__item ${activeIndex === index && found >= 0 ? "is-active" : ""}`}
+                    href={item.href}
+                    prefetch={true}
+                  >
+                    {index === 0 && <Compass className="size-3.5" />}
+                    {item.label}
+                  </Link>
+                ))}
+              </nav>
+              <SearchPalette />
+              <div className="flex items-center gap-2">
+                <AdminNavLink />
+                <Link
+                  href="/activity"
+                  className="icon-button hidden sm:grid"
+                  aria-label="Activity"
+                >
+                  <Bell className="size-4" />
+                </Link>
+                <Link
+                  href="/compose"
+                  className="hidden h-10 items-center gap-2 rounded-full bg-[#a74735] px-4 text-xs font-semibold text-white shadow-sm transition hover:-translate-y-0.5 hover:bg-[#923a2b] sm:flex"
+                >
+                  <PenLine className="size-4" />
+                  Share
+                </Link>
+                <UserMenu />
+                <button
+                  onClick={() => setMobileOpen(!mobileOpen)}
+                  className="icon-button grid lg:hidden"
+                  aria-label={mobileOpen ? "Close menu" : "Open menu"}
+                >
+                  {mobileOpen ? (
+                    <X className="size-4" />
+                  ) : (
+                    <Menu className="size-4" />
+                  )}
+                </button>
+              </div>
+            </div>
+            {mobileOpen && (
+              <nav
+                className="border-t border-stone-900/8 bg-[#f7f4ee] px-5 py-4 lg:hidden"
+                aria-label="Mobile navigation"
+              >
+                <div className="mx-auto grid max-w-[1400px] gap-1">
+                  {navigation.map((item) => (
+                    <Link
+                      key={item.href}
+                      href={item.href}
+                      prefetch={true}
+                      onClick={() => setMobileOpen(false)}
+                      className="rounded-xl px-4 py-3 text-sm font-semibold hover:bg-white"
+                    >
+                      {item.label}
+                    </Link>
+                  ))}
+                  <Link
+                    href="/compose"
+                    onClick={() => setMobileOpen(false)}
+                    className="mt-2 rounded-xl bg-[#a74735] px-4 py-3 text-sm font-semibold text-white"
+                  >
+                    Share a story
+                  </Link>
+                </div>
+              </nav>
+            )}
+          </header>
+        );
+      }
+
+  - path: components/UserMenu.tsx
+    content: |
+      "use client";
+
+      import { useRouter } from "next/navigation";
+      import { useEffect, useState } from "react";
+      import { Settings, ShieldCheck, UserRound, Wallet } from "lucide-react";
+      import { Avatar, AvatarFallback, AvatarBadge } from "@/components/ui/avatar";
+      import {
+        DropdownMenu,
+        DropdownMenuContent,
+        DropdownMenuItem,
+        DropdownMenuLabel,
+        DropdownMenuSeparator,
+        DropdownMenuTrigger,
+      } from "@/components/ui/dropdown-menu";
+
+      export default function UserMenu() {
+        const router = useRouter();
+        const [signedIn, setSignedIn] = useState(false);
+        const [isAdmin, setIsAdmin] = useState(false);
+
+        useEffect(() => {
+          const controller = new AbortController();
+          fetch("/api/auth", { cache: "no-store", signal: controller.signal })
+            .then((response) => response.json())
+            .then((session) => {
+              setSignedIn(Boolean(session.user));
+              if (session.user) {
+                fetch("/api/admin", {
+                  cache: "no-store",
+                  signal: controller.signal,
+                })
+                  .then((response) => setIsAdmin(response.ok))
+                  .catch(() => setIsAdmin(false));
+              } else {
+                setIsAdmin(false);
+              }
+            })
+            .catch(() => undefined);
+          return () => controller.abort();
+        }, []);
+
+        return (
+          <DropdownMenu>
+            <DropdownMenuTrigger
+              aria-label="Your account"
+              className="rounded-full outline-none focus-visible:ring-2 focus-visible:ring-[#a74735]/40"
+            >
+              <Avatar className="ring-2 ring-white" size="default">
+                <AvatarFallback className="bg-[#d8b36e] text-[10px] font-bold text-[#342824]">
+                  YO
+                </AvatarFallback>
+                {signedIn && <AvatarBadge className="bg-emerald-500" />}
+              </Avatar>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-56">
+              <DropdownMenuLabel>Your account</DropdownMenuLabel>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem onClick={() => router.push("/settings/profile")}>
+                <UserRound className="size-4" />
+                Profile details
+              </DropdownMenuItem>
+              <DropdownMenuItem onClick={() => router.push("/settings/profile")}>
+                <Settings className="size-4" />
+                Manage profile
+              </DropdownMenuItem>
+              {isAdmin && (
+                <DropdownMenuItem onClick={() => router.push("/admin")}>
+                  <ShieldCheck className="size-4" />
+                  Admin page
+                </DropdownMenuItem>
+              )}
+              <DropdownMenuSeparator />
+              <DropdownMenuItem onClick={() => router.push("/account")}>
+                <Wallet className="size-4" />
+                Account
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        );
+      }
+

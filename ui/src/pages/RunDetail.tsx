@@ -22,6 +22,8 @@ import {
 import { useCan } from "../auth";
 import { ApprovalGate } from "../components/ApprovalGate";
 import { FlowGraph } from "../components/FlowGraph";
+import { RunChainButton } from "../components/RunChain";
+import { TicketGraph } from "../components/TicketGraph";
 import type { Run, RunEvent } from "../types";
 
 /** Statuses that can still produce another event. Anything else is terminal. */
@@ -70,7 +72,18 @@ export function RunDetail() {
           ? `Run stopped. Branch ${result.branch_left_behind} was not deleted — compensation does not run on a terminate, so remove it by hand if you do not want it.`
           : "Run stopped. Nothing had been pushed, so there is no branch to clean up.",
       );
-      setRun(await api.run(run.id));
+      // List and filter, the same way the poll below does. There is no single-run endpoint
+      // and that is deliberate — this line called one that was never built, so the file has
+      // not typechecked since it was written. Refreshed here rather than left to the next
+      // poll tick because the poll stops as soon as it sees a terminal status, and the whole
+      // point of this handler is that the operator sees the new one immediately.
+      // List and filter, the same way the poll below does. There is no single-run endpoint
+      // and that is deliberate — this line called one that was never built, so the file has
+      // not typechecked since it was written. Refreshed here rather than left to the next
+      // poll tick because the poll stops as soon as it sees a terminal status, and the whole
+      // point of this handler is that the operator sees the new one immediately.
+      const runs = await api.listRuns();
+      setRun(runs.find((r) => r.id === run.id) ?? run);
     } catch (e) {
       setMessage(e instanceof ApiError ? e.message : String(e));
     } finally {
@@ -206,12 +219,28 @@ export function RunDetail() {
         <Card
           title="Flow"
           description="Every state here is read off the audit trail below — there is no second source for it, so the picture and the evidence cannot disagree."
+          /* The topology is the same for every run; what each run actually executed is not.
+             The button opens that — the real sequence, with the repeats. */
+          actions={<RunChainButton events={events} runId={id} />}
         >
           {/* The status decides whether a node left mid-flight reads as 'running' or
               'interrupted' — a finished run must never show a live spinner. */}
           <FlowGraph runId={id} events={events} runStatus={run?.status} />
         </Card>
       )}
+
+      <div className="mt-6" />
+
+      {/* Every run for this ticket, not just this one. Four runs for ticket 50 branched from
+          the same base, all edited the same file, none could see the others, and two were
+          merged — the second by hand into a state nothing had verified. Each was individually
+          green; the collision only exists between them, which is why it needs its own view. */}
+      <Card
+        title="This ticket"
+        description="Runs are columns in the order they started, files are rows. A row with more than one mark is a file two runs changed without seeing each other."
+      >
+        <TicketGraph runId={id} />
+      </Card>
 
       <div className="mt-6" />
 

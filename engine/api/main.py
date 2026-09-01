@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import hmac
 import json
+import logging
 import os
+import re
 import uuid
 from typing import Annotated, Any, Literal
 
@@ -53,6 +55,8 @@ from engine.evidence import RunNotFound, assemble
 from engine.state import RiskRules
 
 load_dotenv()
+
+log = logging.getLogger(__name__)
 
 app = FastAPI(
     title="KuWarden Workbench",
@@ -956,7 +960,11 @@ async def azure_devops_hook(
         raise HTTPException(401, "bad or missing X-KuWarden-Token")
 
     if str(payload.get("eventType") or "") != "workitem.updated":
-        return {"started": False, "reason": f"ignoring {payload.get('eventType')!r}"}
+        # Recorded with no work item: at this point the payload has not been read far enough
+        # to name one, and "something arrived that we ignore" is still worth more than silence.
+        return await _delivered(
+            app_id, "", 0, reason=f"ignoring {payload.get('eventType')!r}"
+        )
 
     async with connect() as conn:
         trigger = await conn.fetchrow(
@@ -978,22 +986,11 @@ async def azure_devops_hook(
         )
 
     resource = payload.get("resource") or {}
-    changed = resource.get("fields") or {}
-    state_change = changed.get("System.State") or {}
-    new_state = str(state_change.get("newValue") or "")
-    if not new_state:
-        return {"started": False, "reason": "not a state change"}
-    if new_state.casefold() != str(trigger["ready_state"]).casefold():
-        return {"started": False, "reason": f"moved to {new_state!r}, which does not admit"}
 
-    # Checked here only to avoid starting a run that Triage would refuse a moment later.
-    # Triage re-reads the real work item and enforces label, state and points itself, so this
-    # is a cheap filter and never the authority — a payload shape that changes under us costs
-    # a wasted run, not an ungoverned one.
-    label = str(trigger["label"] or "")
-    if label and label.casefold() not in _tags(resource.get("revision") or {}):
-        return {"started": False, "reason": f"does not carry the {label!r} tag"}
-
+    # Read before the admission checks, not after. They used to come last, so a refused
+    # delivery could not say *what* it refused — and a record of "something arrived and was
+    # turned away" that cannot name the work item is barely a record at all.
+    #
     # `workItemId` first, then `revision.id`, and never `resource.id`. Those are three
     # different numbers in the same payload: `resource.id` identifies the *update record*, so
     # falling back to it starts a run against whichever ticket happens to share that number.
@@ -1003,7 +1000,37 @@ async def azure_devops_hook(
     work_item = resource.get("workItemId") or revision_block.get("id")
     if not work_item:
         raise HTTPException(422, "payload carried neither workItemId nor revision.id")
-    revision = resource.get("rev") or revision_block.get("rev") or 0
+    item, revision = str(work_item), int(resource.get("rev") or revision_block.get("rev") or 0)
+
+    changed = resource.get("fields") or {}
+    state_change = changed.get("System.State") or {}
+    new_state = str(state_change.get("newValue") or "")
+    if not new_state:
+        return await _delivered(app_id, item, revision, reason="not a state change")
+    if new_state.casefold() != str(trigger["ready_state"]).casefold():
+        return await _delivered(
+            app_id, item, revision, reason=f"moved to {new_state!r}, which does not admit"
+        )
+
+    # Checked here only to avoid starting a run that Triage would refuse a moment later.
+    # Triage re-reads the real work item and enforces label, state and points itself, so this
+    # is a cheap filter and never the authority — a payload shape that changes under us costs
+    # a wasted run, not an ungoverned one.
+    label = str(trigger["label"] or "")
+    if label and label.casefold() not in _tags(revision_block):
+        return await _delivered(
+            app_id, item, revision, reason=f"does not carry the {label!r} tag"
+        )
+
+    # Checked before Temporal is dialled: a superseded delivery should cost nothing.
+    superseded = await _superseded_by(app_id, item, revision)
+    if superseded is not None:
+        return await _delivered(
+            app_id,
+            item,
+            revision,
+            reason=f"revision {revision} is not newer than r{superseded}, already run",
+        )
 
     try:
         from temporalio.client import Client
@@ -1021,17 +1048,131 @@ async def azure_devops_hook(
         run_id, workflow_id = await _launch(
             client,
             app_id,
-            str(work_item),
+            item,
             "azure_devops",
-            f"kuwarden-ado-{app_id}-{work_item}-r{revision}",
+            _hook_workflow_id(app_id, item, revision),
             app_name=str(trigger["app_name"]),
             # A redelivery must be a no-op even if the first run has already finished.
             reject_duplicate=True,
         )
     except WorkflowAlreadyStartedError:
-        return {"started": False, "reason": "already started for this revision"}
+        return await _delivered(
+            app_id, item, revision, reason="already started for this revision"
+        )
 
-    return {"started": True, "run_id": str(run_id), "workflow_id": workflow_id}
+    return await _delivered(
+        app_id, item, revision, started=True, run_id=run_id, workflow_id=workflow_id
+    )
+
+
+def _hook_workflow_id(app_id: uuid.UUID, work_item: object, revision: int) -> str:
+    """The id a hook-started run is launched under.
+
+    One function, because `_revision_of` reads the revision back out of it: a format written
+    twice is two formats the day somebody edits one of them.
+    """
+    return f"kuwarden-ado-{app_id}-{work_item}-r{revision}"
+
+
+def _revision_of(workflow_id: str) -> int | None:
+    """The revision a hook-started run was launched for, or `None` for any other id.
+
+    Greedy, and anchored at the end, so the trailing `-r<n>` is found whatever the work item
+    id contains. A manual run (`kuwarden-<uuid>`) returns `None` and is ignored by the guard —
+    pressing the button is an explicit human act, and ADR 0007's replay problem is not one a
+    human creates by hand.
+    """
+    match = re.fullmatch(r"kuwarden-ado-.+-r(\d+)", workflow_id)
+    return int(match.group(1)) if match else None
+
+
+async def _delivered(
+    app_id: uuid.UUID,
+    work_item: str,
+    revision: int,
+    *,
+    started: bool = False,
+    reason: str | None = None,
+    run_id: uuid.UUID | None = None,
+    workflow_id: str | None = None,
+) -> dict[str, Any]:
+    """Record one inbound delivery, and return the body the endpoint answers with.
+
+    **Every exit from the hook goes through here.** `test_every_hook_exit_records_the_delivery`
+    reads this module's source and fails if one does not — because a delivery that returns
+    without a row is the invisible case this table exists to end, and it is exactly what
+    somebody adding a new admission rule would forget.
+
+    Recording never fails the request. Azure DevOps retries any non-2xx, so raising here would
+    turn a bookkeeping problem into a redelivery storm; the warning goes to the worker log
+    instead, where an operator can see it and no permanent record quotes ticket text.
+    """
+    try:
+        async with connect() as conn:
+            await conn.execute(
+                "INSERT INTO trigger_deliveries "
+                "(app_id, provider, work_item, revision, started, reason, run_id) "
+                "VALUES ($1,'azure_devops',$2,$3,$4,$5,$6)",
+                app_id, work_item, revision, started, reason, run_id,
+            )
+    except Exception:  # noqa: BLE001 - a failed record must not fail the delivery
+        log.warning(
+            "could not record a webhook delivery for application %s, work item %r",
+            app_id, work_item, exc_info=True,
+        )
+    body: dict[str, Any] = {"started": started}
+    if reason:
+        body["reason"] = reason
+    if run_id is not None:
+        body["run_id"] = str(run_id)
+    if workflow_id:
+        body["workflow_id"] = workflow_id
+    return body
+
+
+async def _superseded_by(app_id: uuid.UUID, work_item: str, revision: int) -> int | None:
+    """The revision that supersedes this delivery, or `None` if it is genuinely new.
+
+    Azure DevOps replays a backlog when a subscription is recreated — and it does not replay in
+    order. Work item 50 arrived as r6, then r2, then r4. `reject_duplicate` makes a *repeated*
+    revision a no-op and cannot see that a revision is *older* than one already run, so each
+    replayed revision started a whole pipeline against an intent r6 had already superseded:
+    three runs, branching from the same base, unaware of each other, two of them producing a
+    pull request for a state of the ticket that no longer existed.
+
+    A work item's revisions are monotonic, so r2's content is contained in r6's. Equal
+    revisions are refused here too — Temporal would refuse them a moment later, and refusing
+    early saves dialling it.
+
+    **Not a lock.** The `flow_runs` row is written by an activity once the workflow is already
+    running, so two deliveries close enough together can both pass this. What it closes is the
+    replay case, where deliveries are seconds to minutes apart; the same-revision case stays
+    Temporal's job, which is airtight and needs no help.
+    """
+    async with connect() as conn:
+        # `trigger_deliveries` first, and it is the one that matters. The old check read only
+        # `flow_runs`, whose rows are written by an *activity* — so when the worker could not
+        # execute a workflow task, no row was ever written, this returned `None`, and every
+        # replayed revision was admitted. Work item 52 arrived as r2, r4 and r6 during exactly
+        # that outage and all three were started. The hook writes its own record before it
+        # starts anything, so this no longer depends on any downstream component being alive.
+        delivered = await conn.fetchval(
+            "SELECT max(revision) FROM trigger_deliveries "
+            "WHERE app_id = $1 AND work_item = $2 AND started",
+            app_id,
+            work_item,
+        )
+        # And still `flow_runs`, for the runs that predate the table above.
+        rows = await conn.fetch(
+            "SELECT workflow_id FROM flow_runs WHERE app_id = $1 AND ticket_id = $2",
+            app_id,
+            work_item,
+        )
+    seen = [r for r in (_revision_of(row["workflow_id"]) for row in rows) if r is not None]
+    if delivered is not None:
+        seen.append(int(delivered))
+    highest = max(seen, default=None)
+    return highest if highest is not None and highest >= revision else None
 
 
 async def _governing(app_id: uuid.UUID) -> tuple[RiskRules, tuple[str, ...]]:
@@ -1302,6 +1443,154 @@ async def list_runs(_: Viewer, limit: int = 50) -> list[dict[str, Any]]:
         )
     return [
         dict(row) | {"id": str(row["id"]), "app_id": str(row["app_id"])} for row in rows
+    ]
+
+
+@app.get("/api/runs/{run_id}/graph")
+async def run_graph(run_id: uuid.UUID, _: Viewer) -> dict[str, Any]:
+    """One run's evidence graph — ADR 0012.
+
+    Assembled from recorded facts, never inferred. Every node and edge below is a row or a
+    column that already existed: the run tree is `parent_run_id`, the file edges are git's
+    numstat via `run_files`, the sibling runs are the ticket they share.
+
+    Deliberately not paginated and deliberately shallow. A ticket has a handful of runs and a
+    run a handful of files; the events belong to `/events`, which already serves them in full.
+    """
+    async with connect() as conn:
+        run = await conn.fetchrow(
+            "SELECT id, app_id, ticket_system, ticket_id, risk_tier, status, "
+            "parent_run_id, created_at, ended_at FROM flow_runs WHERE id = $1",
+            run_id,
+        )
+        if run is None:
+            raise HTTPException(404, "no such run")
+
+        # Every run for the same ticket, this one included. The collision that cost ticket 50
+        # a broken deployment was four of these, sharing a base and unaware of each other, and
+        # nothing in the product could show them side by side.
+        siblings = await conn.fetch(
+            "SELECT id, workflow_id, status, risk_tier, parent_run_id, created_at, ended_at "
+            "FROM flow_runs WHERE app_id = $1 AND ticket_id = $2 ORDER BY created_at",
+            run["app_id"],
+            run["ticket_id"],
+        )
+        files = await conn.fetch(
+            "SELECT run_id, path, added, removed FROM run_files "
+            "WHERE run_id = ANY($1::uuid[]) ORDER BY path",
+            [r["id"] for r in siblings],
+        )
+        # The base each run branched from, and what it pushed. On the event rather than a
+        # column because a run pushes more than once and the record keeps all of them.
+        pushes = await conn.fetch(
+            "SELECT run_id, payload FROM flow_events "
+            "WHERE run_id = ANY($1::uuid[]) AND kind = 'branch_pushed' ORDER BY seq",
+            [r["id"] for r in siblings],
+        )
+
+    by_run: dict[str, list[dict[str, Any]]] = {}
+    for row in pushes:
+        payload = json.loads(row["payload"] or "{}")
+        by_run.setdefault(str(row["run_id"]), []).append(
+            {
+                "commit": payload.get("commit"),
+                "base": payload.get("base"),
+                "attempt": payload.get("attempt"),
+            }
+        )
+
+    nodes: list[dict[str, Any]] = [
+        {
+            "id": f"ticket:{run['ticket_system']}:{run['ticket_id']}",
+            "kind": "ticket",
+            "label": f"{run['ticket_system']} {run['ticket_id']}",
+        }
+    ]
+    edges: list[dict[str, Any]] = []
+
+    for sibling in siblings:
+        rid = str(sibling["id"])
+        nodes.append(
+            {
+                "id": f"run:{rid}",
+                "kind": "run",
+                "label": rid[:8],
+                "status": sibling["status"],
+                "risk_tier": sibling["risk_tier"],
+                # The revision an Azure DevOps hook launched this for, when it was one. Two
+                # runs for the same work item at different revisions is the replay this
+                # product now refuses, and the graph should show why it once did not.
+                "revision": sibling["workflow_id"].rsplit("-r", 1)[-1]
+                if "-r" in sibling["workflow_id"]
+                else None,
+                "pushes": by_run.get(rid, []),
+                "started_at": sibling["created_at"].isoformat(),
+                "ended_at": sibling["ended_at"].isoformat() if sibling["ended_at"] else None,
+                "self": rid == str(run["id"]),
+            }
+        )
+        edges.append(
+            {
+                "from": f"ticket:{run['ticket_system']}:{run['ticket_id']}",
+                "to": f"run:{rid}",
+                "kind": "asked",
+            }
+        )
+        if sibling["parent_run_id"] is not None:
+            edges.append(
+                {
+                    "from": f"run:{sibling['parent_run_id']}",
+                    "to": f"run:{rid}",
+                    "kind": "spawned",
+                }
+            )
+
+    seen_paths: set[str] = set()
+    for row in files:
+        if row["path"] not in seen_paths:
+            seen_paths.add(row["path"])
+            nodes.append({"id": f"file:{row['path']}", "kind": "file", "label": row["path"]})
+        edges.append(
+            {
+                "from": f"run:{row['run_id']}",
+                "to": f"file:{row['path']}",
+                "kind": "changed",
+                "added": row["added"],
+                "removed": row["removed"],
+            }
+        )
+
+    return {
+        "run_id": str(run["id"]),
+        "nodes": nodes,
+        "edges": edges,
+        "node_count": len(nodes),
+        "edge_count": len(edges),
+    }
+
+
+@app.get("/api/files/{path:path}/runs")
+async def file_runs(path: str, _: Viewer) -> list[dict[str, Any]]:
+    """Every run that changed this file — the reverse question, and the reason for ADR 0012.
+
+    Four runs for ticket 50 edited `components/Header.tsx` from the same base, none aware of
+    the others, and two were merged. Nothing in the product could answer this before, so the
+    collision was found by a broken deployment.
+
+    Newest first, because the question is nearly always "who else has been in here lately".
+    """
+    async with connect() as conn:
+        rows = await conn.fetch(
+            "SELECT f.run_id, f.added, f.removed, r.ticket_system, r.ticket_id, r.status, "
+            "COALESCE(a.name, '(deleted)') AS app_name, r.created_at "
+            "FROM run_files f "
+            "JOIN flow_runs r ON r.id = f.run_id "
+            "LEFT JOIN app_registry a ON a.id = r.app_id "
+            "WHERE f.path = $1 ORDER BY r.created_at DESC",
+            path,
+        )
+    return [
+        dict(row) | {"run_id": str(row["run_id"]), "path": path} for row in rows
     ]
 
 

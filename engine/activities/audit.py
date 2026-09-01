@@ -45,6 +45,27 @@ class EventRecorded:
 
 
 @dataclass
+class ChangedFile:
+    path: str
+    added: int
+    removed: int
+
+
+@dataclass
+class RunFiles:
+    """Which files one push put on the branch, from git's own numstat.
+
+    Not the model's account of what it wrote. The `Diff` this is built from is read from git
+    after the Coder's loop, and an agent's claim about its own change is never an input —
+    invariant 3, applied to the index.
+    """
+
+    run_id: UUID
+    attempt: int
+    files: list[ChangedFile] = field(default_factory=list)
+
+
+@dataclass
 class RunEnded:
     run_id: UUID
     status: str
@@ -118,6 +139,34 @@ async def record_run_status(change: RunStatusChanged) -> None:
             "WHERE id = $1 AND status IN ('running', 'suspended')",
             change.run_id,
             change.status,
+        )
+
+
+@activity.defn
+async def record_run_files(run: RunFiles) -> None:
+    """Index this run's changed files — ADR 0012.
+
+    Idempotent by upsert rather than by insert-and-ignore, because a run pushes more than once
+    and the later attempt is the one on the branch. `ON CONFLICT DO NOTHING` would freeze the
+    first attempt's line counts and quietly describe a change that was superseded.
+
+    An empty diff writes nothing rather than clearing the run's rows: the flow only reaches
+    here after a push, and nothing to record at that point means the push was deduplicated,
+    not that the earlier files were reverted.
+    """
+    if not run.files:
+        return
+    async with connect() as conn:
+        await conn.executemany(
+            """
+            INSERT INTO run_files (run_id, path, added, removed, attempt)
+            VALUES ($1,$2,$3,$4,$5)
+            ON CONFLICT (run_id, path) DO UPDATE
+                SET added = EXCLUDED.added,
+                    removed = EXCLUDED.removed,
+                    attempt = EXCLUDED.attempt
+            """,
+            [(run.run_id, f.path, f.added, f.removed, run.attempt) for f in run.files],
         )
 
 

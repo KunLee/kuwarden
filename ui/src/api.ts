@@ -10,6 +10,7 @@ import type {
   Application,
   CredentialState,
   Evidence,
+  FileRun,
   IntegrationModel,
   ProbeResult,
   Run,
@@ -17,6 +18,7 @@ import type {
   Principal,
   Role,
   SandboxStatus,
+  TicketGraph,
   Trigger,
   User,
 } from "./types";
@@ -245,6 +247,13 @@ export const api = {
   listRuns: () => request<Run[]>("/api/runs"),
 
   listRunEvents: (runId: string) => request<RunEvent[]>(`/api/runs/${runId}/events`),
+
+  /** Every run for this run's ticket, and the files each changed — ADR 0012. */
+  runGraph: (runId: string) => request<TicketGraph>(`/api/runs/${runId}/graph`),
+
+  /** The reverse question: which runs have changed this file. */
+  fileRuns: (path: string) =>
+    request<FileRun[]>(`/api/files/${path.split("/").map(encodeURIComponent).join("/")}/runs`),
 
   /**
    * Per-attempt execution detail from Temporal's history — stack traces included.

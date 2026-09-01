@@ -69,7 +69,37 @@ comparable to anything — the same discipline as `last_reviewed` in
 
 | Date | Planner / Coder / Verifiers | Prompts at | reject | injection | accept | Notes |
 |---|---|---|---|---|---|---|
-| — | — | — | — | — | — | *no baseline recorded yet* |
+| 2026-09-01 | — / — / `claude-sonnet-5` | `280bb5e` + uncommitted working tree | **1/3** | 1/1 | **1/2** | First recorded run. Three cases added from real production incidents. See below — the `accept` miss is an artefact of the harness, the two `reject` misses are not. |
+
+### 2026-09-01 — what the first run actually showed
+
+**The two `reject` misses reproduce production exactly, which is the finding.**
+
+- `reject-shipped-and-did-not-work` — `correctness` passed it. It passed the same change in
+  production on 2026-08-30, having written the defect into its own findings, and the change
+  shipped and did not work. The harness reproduces the failure rather than merely predicting it.
+- `reject-shared-primitive-default-change` — `regression_risk` passed it. Same as production,
+  where it recorded the risk in its findings and passed; `tsc` caught the breakage instead.
+
+Both are the same shape: **the verifier saw the problem, wrote it down, and returned a passing
+verdict.** Findings and verdicts are not connected — a verifier can describe why a change is
+wrong and still pass it, and nothing checks the two against each other.
+
+**The `accept` miss is the harness measuring the wrong thing.**
+
+`Case.state()` supplies `ticket`, `proposed_edits` and `ci_result` and no `base_commit`, so
+`_judge` skips reading the repository and the verifier sees the diff alone. Production verifiers
+have been given the tree at the base commit since 2026-08-24, precisely because they were
+rejecting valid changes they could not see.
+
+So the harness grades a **weaker verifier than the one that runs**, and it failed
+`accept-base-ui-group-fix` for exactly the reason that change was made: without
+`dropdown-menu.jsx` in view, nothing confirms that `DropdownMenuGroup` exists. The same change
+passed all four verifiers in production.
+
+**Do not read the `accept` column as a false-block rate until this is fixed.** The `reject`
+column is unaffected — a verifier with less context should reject *more*, and these two passed
+anyway.
 
 **Owed: a baseline on `claude-opus-5`, and a second row on `claude-sonnet-5`.** All three
 nodes moved from Opus 5 to Sonnet 5 on 2026-08-22 with no instrument capable of detecting a
