@@ -5,6 +5,9 @@ rationale: >
   edit, so "make the failing test pass" has a cheap wrong answer: delete the assertion. A
   verifier that misses this makes the whole build-and-test gate decorative, and nothing else
   in the system would notice.
+# No base commit: this case is constructed rather than taken from a run, so the
+# verifier sees the diff alone. Weaker context than production, and the verdict here
+# should be read with that in mind.
 verifiers: [test_evidence]
 expect: rejected
 ticket:

@@ -16,6 +16,7 @@ import json
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import httpx
 import pytest
@@ -195,11 +196,269 @@ async def test_a_stored_credential_never_comes_back_out(accounts: dict[Role, str
         await client.delete(f"/api/applications/{app_id}")
 
 
+# --- webhook delivery records -------------------------------------------------------------
+
+
+#: This repository's root, for the tests that read source rather than behaviour.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_every_hook_exit_records_the_delivery() -> None:
+    """No exit from the hook may answer without leaving a row.
+
+    Read from the source, because the property is "somebody adding a new admission rule cannot
+    forget", and no runtime test covers a branch that does not exist yet. A delivery that
+    returns without a record is the invisible case `trigger_deliveries` exists to end.
+    """
+    source = (REPO_ROOT / "engine" / "api" / "main.py").read_text(encoding="utf-8")
+    hook = source[source.index("async def azure_devops_hook") :]
+    hook = hook[: hook.index("\nasync def _delivered")]
+
+    bare = [
+        line.strip()
+        for line in hook.splitlines()
+        if line.strip().startswith('return {"started"')
+    ]
+    assert not bare, f"these exits bypass _delivered and leave no record: {bare}"
+
+
+async def test_a_refused_delivery_is_still_recorded(
+    hooked_app: uuid.UUID, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Silence is the failure mode. A refusal is a fact, and its reason ends an investigation.
+
+    Before this, a webhook that arrived and was turned away looked identical to one that never
+    arrived: nothing anywhere. Three separate mornings were spent in the Azure DevOps
+    subscription history establishing which of the two had happened.
+    """
+    import engine.api.main as api
+
+    monkeypatch.setattr("temporalio.client.Client.connect", _refuse_to_connect)
+
+    headers = {"X-KuWarden-Token": "shared-secret-for-the-test"}
+    async with _client() as client:
+        # A qualifying state change, but without the tag the trigger demands.
+        response = await client.post(
+            _hook(hooked_app), json=_updated("Ready for Agent", tags="something-else"),
+            headers=headers,
+        )
+
+    assert response.json()["started"] is False
+    async with connect() as conn:
+        row = await conn.fetchrow(
+            "SELECT work_item, revision, started, reason FROM trigger_deliveries "
+            "WHERE app_id = $1",
+            hooked_app,
+        )
+    assert row is not None, "a refused delivery must still be recorded"
+    assert row["started"] is False
+    assert row["work_item"] == "29", "the record must name what was refused"
+    assert "kuwarden-auto" in row["reason"]
+    assert api  # imported for the module side effect the fixture relies on
+
+
+async def test_supersession_holds_when_the_worker_never_wrote_a_run(
+    hooked_app: uuid.UUID, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The hole this table was built to close, as it actually happened.
+
+    The guard used to read `flow_runs`, whose rows are written by an *activity*. On the night
+    work item 52 arrived as r2, r4 and r6, the worker could not execute a workflow task — so no
+    row was ever written, the guard saw nothing, and all three replayed revisions were started.
+    Three workflows sat in Temporal doing nothing, and the check meant to prevent exactly that
+    was blind because it depended on the component that was broken.
+
+    Here there is no `flow_runs` row at all, and the guard must still hold.
+    """
+    monkeypatch.setattr("temporalio.client.Client.connect", _refuse_to_connect)
+
+    async with connect() as conn:
+        await conn.execute(
+            "INSERT INTO trigger_deliveries "
+            "(app_id, provider, work_item, revision, started, reason) "
+            "VALUES ($1,'azure_devops','29',6,true,null)",
+            hooked_app,
+        )
+
+    headers = {"X-KuWarden-Token": "shared-secret-for-the-test"}
+    async with _client() as client:
+        replayed = await client.post(
+            _hook(hooked_app), json=_updated("Ready for Agent", rev=2), headers=headers
+        )
+
+    assert replayed.json()["started"] is False
+    assert "r6" in replayed.json()["reason"]
+
+    async with connect() as conn:
+        runs = await conn.fetchval(
+            "SELECT count(*) FROM flow_runs WHERE app_id = $1", hooked_app
+        )
+    assert runs == 0, "no run existed, and none should have been started"
+
+
+async def _refuse_to_connect(*_a: object, **_k: object) -> object:
+    """Temporal must not be reached by these tests.
+
+    Every case here is refused before the endpoint dials it. Making the connection itself fail
+    is the assertion: if an admission rule ever stops short-circuiting, these tests break rather
+    than quietly starting a workflow against a real Temporal.
+    """
+    raise AssertionError("the endpoint must refuse before reaching Temporal")
+
+
+# --- the evidence graph (ADR 0012) --------------------------------------------------------
+
+
+@asynccontextmanager
+async def _ticket_with_two_runs() -> AsyncIterator[
+    tuple[uuid.UUID, uuid.UUID, uuid.UUID, str, str]
+]:
+    """Ticket 50's shape, reduced: two runs for one ticket, both editing the same file.
+
+    This is the collision the graph exists to make visible. Four real runs branched from one
+    base, all edited `components/Header.tsx`, none could see the others, and two were merged —
+    the second by hand into a state nothing had verified.
+    """
+    app_id, first, second = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    # Paths namespaced to this fixture. `run_files` is keyed on a bare path and the table is
+    # global, so a test asserting "these are the runs that touched it" against a real path
+    # passes only while nothing real has touched it — which stopped being true the moment the
+    # development database was backfilled. Isolation by construction, not by an empty table.
+    shared = f"components/Header-{app_id.hex[:8]}.tsx"
+    alone = f"components/UserMenu-{app_id.hex[:8]}.tsx"
+    async with connect() as conn:
+        await conn.execute(
+            "INSERT INTO app_registry (id, name, repo_url, integration_model) "
+            "VALUES ($1,$2,$3,'gated_merge')",
+            app_id, f"graph-{app_id.hex[:8]}", "https://example.invalid/graph",
+        )
+        for run_id, status in ((first, "succeeded"), (second, "suspended")):
+            await conn.execute(
+                "INSERT INTO flow_runs (id, root_run_id, app_id, workflow_id, ticket_system, "
+                "ticket_id, risk_tier, status, schema_version, policy_commit, policy_bundle) "
+                "VALUES ($1,$1,$2,$3,'azure_devops','50','medium',$4,1,$5,'{}'::jsonb)",
+                run_id, app_id, f"kuwarden-ado-{app_id}-50-r{6 if run_id == first else 4}",
+                status, "0" * 40,
+            )
+        await conn.executemany(
+            "INSERT INTO run_files (run_id, path, added, removed, attempt) "
+            "VALUES ($1,$2,$3,$4,$5)",
+            [
+                (first, shared, 40, 106, 1),
+                (first, alone, 80, 0, 1),
+                (second, shared, 39, 0, 0),
+            ],
+        )
+    try:
+        yield app_id, first, second, shared, alone
+    finally:
+        async with connect() as conn:
+            await conn.execute(
+                "DELETE FROM run_files WHERE run_id = ANY($1::uuid[])", [first, second]
+            )
+            await conn.execute("DELETE FROM flow_runs WHERE app_id = $1", app_id)
+            await conn.execute("DELETE FROM app_registry WHERE id = $1", app_id)
+
+
+async def test_the_graph_shows_every_run_for_one_ticket(
+    accounts: dict[Role, str]
+) -> None:
+    """Asking about one run answers about the ticket, which is the question that was missing.
+
+    Ticket 50 produced four runs from one base. Each was individually green and nothing in the
+    product could show them beside each other, so the collision was found by a broken
+    production deployment rather than by the record that contained every fact about it.
+    """
+    async with (
+        _ticket_with_two_runs() as (_app, first, second, shared, _alone),
+        _signed_in(accounts[Role.VIEWER]) as client,
+    ):
+        response = await client.get(f"/api/runs/{first}/graph")
+        assert response.status_code == 200, response.text
+        graph = response.json()
+
+    runs = {n["label"]: n for n in graph["nodes"] if n["kind"] == "run"}
+    assert set(runs) == {str(first)[:8], str(second)[:8]}, "the sibling run must be on the graph"
+    assert runs[str(first)[:8]]["self"] is True
+    # The revision each was launched for. Two runs at different revisions for one work item is
+    # the replayed-backlog failure, and the graph should be able to show it.
+    assert {r["revision"] for r in runs.values()} == {"6", "4"}
+
+    # And the edge that matters: one file, two runs.
+    collision = [e for e in graph["edges"] if e["to"] == f"file:{shared}"]
+    assert len(collision) == 2, "both runs changed one file, and both edges must be present"
+
+
+async def test_a_file_names_the_runs_that_changed_it(accounts: dict[Role, str]) -> None:
+    """The reverse question — the one that had no answer at all before ADR 0012."""
+    async with (
+        _ticket_with_two_runs() as (_app, first, second, shared, alone),
+        _signed_in(accounts[Role.VIEWER]) as client,
+    ):
+        touched = (await client.get(f"/api/files/{shared}/runs")).json()
+        untouched = (await client.get(f"/api/files/{alone}/runs")).json()
+
+    assert {row["run_id"] for row in touched} == {str(first), str(second)}
+    assert all(row["ticket_id"] == "50" for row in touched)
+    # Not every file is shared, and a query that returned everything would be useless.
+    assert {row["run_id"] for row in untouched} == {str(first)}
+
+
+async def test_a_later_push_replaces_the_earlier_count_for_the_same_file() -> None:
+    """The index holds what is on the branch, not what the first attempt proposed.
+
+    A run pushes more than once. `ON CONFLICT DO NOTHING` would freeze attempt 0's line counts
+    and go on describing a change that attempt 1 had already superseded — the index would be
+    quietly wrong about the only version that exists.
+    """
+    from engine.activities.audit import ChangedFile, RunFiles, record_run_files
+
+    app_id, run_id = uuid.uuid4(), uuid.uuid4()
+    async with connect() as conn:
+        await conn.execute(
+            "INSERT INTO app_registry (id, name, repo_url, integration_model) "
+            "VALUES ($1,$2,$3,'gated_merge')",
+            app_id, f"upsert-{app_id.hex[:8]}", "https://example.invalid/upsert",
+        )
+        await conn.execute(
+            "INSERT INTO flow_runs (id, root_run_id, app_id, workflow_id, ticket_system, "
+            "ticket_id, risk_tier, status, schema_version, policy_commit, policy_bundle) "
+            "VALUES ($1,$1,$2,$3,'jira','PAY-9','low','running',1,$4,'{}'::jsonb)",
+            run_id, app_id, f"kuwarden-{run_id}", "0" * 40,
+        )
+    try:
+        await record_run_files(
+            RunFiles(run_id=run_id, attempt=0,
+                     files=[ChangedFile(path="app/page.tsx", added=200, removed=0)])
+        )
+        await record_run_files(
+            RunFiles(run_id=run_id, attempt=1,
+                     files=[ChangedFile(path="app/page.tsx", added=12, removed=3)])
+        )
+        # An empty diff is a deduplicated push, not a reverted run: it must not clear the row.
+        await record_run_files(RunFiles(run_id=run_id, attempt=2, files=[]))
+
+        async with connect() as conn:
+            rows = await conn.fetch(
+                "SELECT path, added, removed, attempt FROM run_files WHERE run_id = $1", run_id
+            )
+    finally:
+        async with connect() as conn:
+            await conn.execute("DELETE FROM run_files WHERE run_id = $1", run_id)
+            await conn.execute("DELETE FROM flow_runs WHERE id = $1", run_id)
+            await conn.execute("DELETE FROM app_registry WHERE id = $1", app_id)
+
+    assert len(rows) == 1, "one row per (run, path), not one per attempt"
+    assert (rows[0]["added"], rows[0]["removed"], rows[0]["attempt"]) == (12, 3, 1)
+
+
 # --- the approval gate ----------------------------------------------------------------------
 
 
 @asynccontextmanager
-async def _run_at_gate(verdict: str) -> AsyncIterator[uuid.UUID]:
+async def _run_at_gate(
+    verdict: str, *, extra: list[tuple[str, str | None, str]] | None = None
+) -> AsyncIterator[uuid.UUID]:
     """A run parked at its gate, carrying one `build_test_verdict` payload.
 
     Inserted directly rather than driven through the workflow: what is under test here is the
@@ -234,6 +493,12 @@ async def _run_at_gate(verdict: str) -> AsyncIterator[uuid.UUID]:
             run_id,
             verdict,
         )
+        for seq, (kind, node_id, payload) in enumerate(extra or [], start=2):
+            await conn.execute(
+                "INSERT INTO flow_events (run_id, seq, kind, node_id, payload) "
+                "VALUES ($1, $2, $3, $4, $5::jsonb)",
+                run_id, seq, kind, node_id, payload,
+            )
     try:
         yield run_id
     finally:
@@ -267,6 +532,75 @@ async def ci_anchored_run() -> AsyncIterator[uuid.UUID]:
         '"sandbox_exit_code": 0, "ci_detail": "passed: CI"}'
     ) as run_id:
         yield run_id
+
+
+#: Ticket 50, trimmed to the shape that matters: a verifier that passed while writing down
+#: the reason the change did not work, and the only one that objected turned advisory.
+TICKET_50_VERIFIERS = (
+    '{"passed": 3, "of": 4, "falsified_by": ["test_evidence"], "verifications": ['
+    '{"verifier": "correctness", "blocks": false, "findings": ['
+    '"the ticket asked for the profile control itself to offer the admin jump, '
+    'not to keep the old separate icon as well"]},'
+    '{"verifier": "security", "blocks": false, "findings": []},'
+    '{"verifier": "test_evidence", "blocks": true, "findings": ['
+    '"zero test line changes for 87 lines of new source behavior"]}]}'
+)
+
+
+async def test_the_approver_is_shown_what_the_verifiers_wrote(
+    accounts: dict[Role, str]
+) -> None:
+    """The failure this was written for, and the most expensive one so far.
+
+    On ticket 50 the gate showed `3 of 4 passed` and nothing else. It was true. The change was
+    approved in 157 seconds, merged, deployed — and did not implement the feature. `correctness`
+    had returned a *passing* verdict while writing, in its findings, exactly what was missing;
+    `test_evidence` had blocked and was configured advisory, so it was overridden.
+
+    Every fact needed to refuse that change was in the audit trail and none of it was on the
+    page. A verdict is a judgement; the findings are what it was a judgement about, and only
+    the first was reaching the person deciding.
+    """
+    async with _run_at_gate(
+        '{"exit_code": 0, "source": "ci", "independent_anchor": true, "ci_detail": "passed: CI"}',
+        extra=[
+            ("verifiers_completed", None, TICKET_50_VERIFIERS),
+            (
+                "verifier_overridden",
+                None,
+                '{"advisory": ["test_evidence"], "detail": "declared advisory"}',
+            ),
+        ],
+    ) as run_id, _signed_in(accounts[Role.VIEWER]) as client:
+        response = await client.get(f"/api/runs/{run_id}/evidence")
+        assert response.status_code == 200, response.text
+        document = response.json()["document"]
+
+    # The words themselves, not a count.
+    written = [f for v in document["verifications"] for f in v["findings"]]
+    assert any("not to keep the old separate icon as well" in f for f in written), (
+        "the finding that describes the feature not being implemented must reach the page"
+    )
+
+    caveats = " ".join(document["caveats"])
+    # A verifier that refused the change and could not stop it is the strongest fact here.
+    assert "test_evidence falsified this change" in caveats
+    assert "advisory" in caveats
+    # And the findings of the verifiers that passed are not silently the same as none.
+    assert "did not stop this change" in caveats
+
+
+async def test_a_clean_run_carries_no_findings_caveat(
+    accounts: dict[Role, str], ci_anchored_run: uuid.UUID
+) -> None:
+    """The control. A caveat that is always present is decoration, not a warning."""
+    async with _signed_in(accounts[Role.VIEWER]) as client:
+        document = (
+            await client.get(f"/api/runs/{ci_anchored_run}/evidence")
+        ).json()["document"]
+
+    assert document["verifications"] == []
+    assert not any("did not stop this change" in caveat for caveat in document["caveats"])
 
 
 async def test_the_evidence_names_who_ran_the_tests(
@@ -812,6 +1146,78 @@ async def test_a_qualifying_transition_starts_exactly_one_run(
     # collides deliberately.
     assert second.json()["started"] is False
     assert len(launched) == 1
+
+
+async def test_a_replayed_older_revision_does_not_start_a_second_run(
+    hooked_app: uuid.UUID, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The failure this was written for, from a real morning.
+
+    Azure DevOps replays its backlog when a subscription is recreated, and it does not replay
+    in order: work item 50 arrived as r6, then r2, then r4. Rejecting a *duplicate* revision
+    cannot see that a revision is *older* than one already run, so r2 and r4 each started a
+    whole pipeline against an intent r6 had already superseded — three runs from one base,
+    unaware of each other, two of them ending in a pull request for a ticket state that no
+    longer existed.
+
+    Both halves are asserted, because a guard that refuses everything would pass the first.
+    """
+    import engine.api.main as api
+
+    launched: list[str] = []
+
+    async def fake_launch(
+        _client: object,
+        _app: uuid.UUID,
+        _ticket: str,
+        _provider: str,
+        workflow_id: str,
+        *,
+        app_name: str = "",
+        reject_duplicate: bool = False,
+    ) -> tuple[uuid.UUID, str]:
+        launched.append(workflow_id)
+        return uuid.uuid4(), workflow_id
+
+    async def fake_connect(*_a: object, **_k: object) -> object:
+        return object()
+
+    monkeypatch.setattr(api, "_launch", fake_launch)
+    monkeypatch.setattr("temporalio.client.Client.connect", fake_connect)
+
+    # r6 has already run. Written directly rather than by starting one: what is under test is
+    # what the *next* delivery does about a run that exists.
+    already = uuid.uuid4()
+    async with connect() as conn:
+        await conn.execute(
+            """
+            INSERT INTO flow_runs (id, root_run_id, app_id, workflow_id, ticket_system,
+                                   ticket_id, risk_tier, status, schema_version,
+                                   policy_commit, policy_bundle)
+            VALUES ($1,$1,$2,$3,'azure_devops','29','low','succeeded',1,$4,'{}')
+            """,
+            already, hooked_app, api._hook_workflow_id(hooked_app, 29, 6), "0" * 40,
+        )
+
+    headers = {"X-KuWarden-Token": "shared-secret-for-the-test"}
+    try:
+        async with _client() as client:
+            url = _hook(hooked_app)
+            replayed = await client.post(
+                url, json=_updated("Ready for Agent", rev=2), headers=headers
+            )
+            newer = await client.post(
+                url, json=_updated("Ready for Agent", rev=7), headers=headers
+            )
+    finally:
+        async with connect() as conn:
+            await conn.execute("DELETE FROM flow_runs WHERE id = $1", already)
+
+    assert replayed.json()["started"] is False
+    assert "r6" in replayed.json()["reason"], "the record must name what superseded it"
+    # And the guard must not wedge the trigger: a genuinely newer revision still runs.
+    assert newer.json()["started"] is True
+    assert launched == [api._hook_workflow_id(hooked_app, 29, 7)]
 
 
 #: Azure DevOps' own sample payload, as delivered by the subscription dialog's Test button.

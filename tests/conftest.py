@@ -61,7 +61,7 @@ def track_application(app_id: uuid.UUID) -> uuid.UUID:
     return app_id
 
 
-async def _purge() -> None:
+async def _purge() -> int:
     """Delete test applications and everything hanging off them.
 
     Two sources, deliberately. `_REGISTERED` is what the suite declared; the fixture sweep
@@ -69,10 +69,17 @@ async def _purge() -> None:
     wrong at least once, and nothing about writing a new test makes it obvious that it must be
     kept right.
 
-    Ordered by foreign key: events, then runs, then the application's own rows. `flow_events`
-    carries the append-only trigger from invariant 9, so it is disabled for exactly this
-    statement and re-enabled in a `finally` — a teardown that left the audit table unprotected
-    would be a worse bug than the one it is cleaning up after.
+    Ordered by foreign key: `run_files`, events, runs, then the application's own rows.
+
+    **Two tables are append-only by trigger, and both must be disabled here** — `flow_events`
+    and `app_changes`. This cost 102 abandoned applications before it was found: `app_changes`
+    cascades from `app_registry`, a cascade still fires row triggers, the trigger raised, the
+    whole transaction rolled back, and the only symptom was a warning printed under `-q` where
+    nobody reads it. Every test app the suite had ever created was still in the operator's
+    database, and the Workbench was fetching triggers for all of them.
+
+    They are re-enabled in a `finally`: a teardown that left the audit tables unprotected would
+    be a worse bug than the one it is cleaning up after.
     """
     from engine.db import connect
 
@@ -88,20 +95,32 @@ async def _purge() -> None:
         ]
         ids = list({*declared, *swept})
         if not ids:
-            return
-        await conn.execute("ALTER TABLE flow_events DISABLE TRIGGER flow_events_no_update")
+            return 0
+        await conn.execute("ALTER TABLE flow_events DISABLE TRIGGER USER")
+        await conn.execute("ALTER TABLE app_changes DISABLE TRIGGER USER")
         try:
+            # Before `flow_runs`: `run_files` references it with no cascade, so leaving these
+            # behind makes the next statement fail and takes the whole purge with it.
+            await conn.execute(
+                "DELETE FROM run_files WHERE run_id IN "
+                "(SELECT id FROM flow_runs WHERE app_id = ANY($1::uuid[]))",
+                ids,
+            )
             await conn.execute(
                 "DELETE FROM flow_events WHERE run_id IN "
                 "(SELECT id FROM flow_runs WHERE app_id = ANY($1::uuid[]))",
                 ids,
             )
             await conn.execute("DELETE FROM flow_runs WHERE app_id = ANY($1::uuid[])", ids)
+            await conn.execute("DELETE FROM app_credentials WHERE app_id = ANY($1::uuid[])", ids)
+            await conn.execute("DELETE FROM app_triggers WHERE app_id = ANY($1::uuid[])", ids)
+            await conn.execute("DELETE FROM app_config WHERE app_id = ANY($1::uuid[])", ids)
+            await conn.execute("DELETE FROM app_changes WHERE app_id = ANY($1::uuid[])", ids)
+            await conn.execute("DELETE FROM app_registry WHERE id = ANY($1::uuid[])", ids)
         finally:
-            await conn.execute("ALTER TABLE flow_events ENABLE TRIGGER flow_events_no_update")
-        await conn.execute("DELETE FROM app_credentials WHERE app_id = ANY($1::uuid[])", ids)
-        await conn.execute("DELETE FROM app_triggers WHERE app_id = ANY($1::uuid[])", ids)
-        await conn.execute("DELETE FROM app_registry WHERE id = ANY($1::uuid[])", ids)
+            await conn.execute("ALTER TABLE flow_events ENABLE TRIGGER USER")
+            await conn.execute("ALTER TABLE app_changes ENABLE TRIGGER USER")
+    return len(ids)
 
 
 @pytest.fixture(autouse=True)
@@ -125,9 +144,19 @@ def _clean_up_registered_applications():  # type: ignore[no-untyped-def]
     error. `asyncio.run` at teardown has neither problem."""
     yield
     try:
-        asyncio.run(_purge())
+        removed = asyncio.run(_purge())
     except Exception as exc:  # noqa: BLE001 — a suite must not fail because cleanup could not run
-        print(f"\n[warn] could not purge test applications: {exc}")
+        # Loud, and on its own lines. The previous version printed one quiet warning, `-q`
+        # swallowed it, and the suite went on abandoning applications in the operator's
+        # database for weeks. A cleanup that fails silently is worse than one that does not
+        # run, because nobody goes looking.
+        print("\n" + "!" * 78)
+        print(f"[FAILED] test data was NOT purged: {type(exc).__name__}: {exc}")
+        print("Rows are left in the database this suite runs against. Fix before re-running.")
+        print("!" * 78)
+        return
+    if removed:
+        print(f"\n[cleanup] removed {removed} test application(s) and their rows.")
 
 KUWARDEN_YAML = """
 version: 1
@@ -425,8 +454,20 @@ class FakePlatform:
         if "independent reviewers of a proposed software change" in system:
             # The verdict shape, so the verifier's own parsing is exercised rather than
             # accidentally satisfied by the Planner's payload.
+            # The current verdict shape: findings graded individually, and no `blocks` field
+            # — the verdict is computed from the severities. A fake that still returned a
+            # boolean would keep passing while the real schema had moved, which is precisely
+            # the mismatch this branch exists to catch.
             payload = json.dumps(
-                {"findings": self.verifier_findings, "blocks": self.verifier_blocks}
+                {
+                    "findings": [
+                        {
+                            "detail": detail,
+                            "severity": "blocking" if self.verifier_blocks else "advisory",
+                        }
+                        for detail in self.verifier_findings
+                    ]
+                }
             )
             return httpx.Response(200, json={
                 "id": "msg_verdict", "type": "message", "role": "assistant",

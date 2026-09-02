@@ -26,14 +26,70 @@ import type { SandboxStatus } from "./types";
 /**
  * Warns, on every page, that runs execute under weakened sandbox isolation.
  *
- * Not dismissible, and not confined to the Dashboard. During the testing phase
- * `sandbox.require_full_isolation` is false, which means model-written code runs without a
- * cap on total memory or CPU — an acceptable trade on a development machine and an
- * unacceptable one in production. That distinction is exactly what gets forgotten when the
- * only warning is a log line.
+ * **Says what is not enforced, why, and what it means for a run.** It used to say
+ * "isolation is degraded" and stop, which tells an operator that something is wrong and
+ * nothing they can act on. The cause is almost always the same and worth naming: rootless
+ * podman on a host whose cgroup v2 delegation is unavailable accepts `--memory`, `--cpus` and
+ * `--pids-limit` and **silently ignores them**. Requested and applied are different facts, and
+ * only the second one is a control.
+ *
+ * **Dismissible per browser tab, and no further.** The original was deliberately not
+ * dismissible — a degradation nobody sees is a degradation nobody fixes. A banner that cannot
+ * be closed is also one that gets read past by the second day, so it closes for this tab and
+ * comes back on the next load. It cannot be silenced permanently, which is the property that
+ * mattered.
  */
+/**
+ * Warns when this API is running code older than the repository.
+ *
+ * A process that has drifted from the tree is invisible from outside: it connects, it serves,
+ * and every answer comes from code somebody has since changed. A worker in exactly that state
+ * failed every workflow task it accepted for three hours on 2026-08-31, and nothing reported
+ * it — the files on disk were consistent, and only the running process was not.
+ *
+ * Development-time by nature: in a deployment nobody edits the tree under a running process,
+ * so this stays silent. It is loud precisely where the failure happens.
+ */
+function BuildDriftBanner() {
+  const [drift, setDrift] = useState<{ api_build: string; tree_build: string } | null>(null);
+
+  useEffect(() => {
+    void api
+      .buildStatus()
+      .then((b) => setDrift(b.stale ? b : null))
+      .catch(() => setDrift(null));
+  }, []);
+
+  if (!drift) return null;
+
+  return (
+    <div className="border-b border-orange-500/30 bg-orange-500/10">
+      <div className="px-8 py-2.5 text-[13px] leading-relaxed">
+        <span className="font-semibold text-orange-900 dark:text-orange-300">
+          This API is running code older than the repository.
+        </span>{" "}
+        <span className="text-orange-900/85 dark:text-orange-200/85">
+          Started with <code>{drift.api_build}</code>; the tree is now{" "}
+          <code>{drift.tree_build}</code>. Restart it before trusting anything on these pages —
+          and restart the worker too, which reports its own build to its log and can drift the
+          same way without any symptom except failing every task it takes.
+        </span>
+      </div>
+    </div>
+  );
+}
+
 function IsolationBanner() {
   const [status, setStatus] = useState<SandboxStatus | null>(null);
+  const [dismissed, setDismissed] = useState(() => {
+    // Wrapped: a browser with site data blocked throws on access rather than returning null,
+    // and a warning banner must not be the thing that breaks the page.
+    try {
+      return sessionStorage.getItem("kuwarden.isolation-dismissed") === "1";
+    } catch {
+      return false;
+    }
+  });
 
   useEffect(() => {
     void api
@@ -42,23 +98,73 @@ function IsolationBanner() {
       .catch(() => setStatus(null));
   }, []);
 
-  if (!status || status.fully_enforced) return null;
+  if (!status || status.fully_enforced || dismissed) return null;
+
+  function close() {
+    setDismissed(true);
+    try {
+      sessionStorage.setItem("kuwarden.isolation-dismissed", "1");
+    } catch {
+      // Dismissal is a convenience. Losing it costs a banner, not correctness.
+    }
+  }
+
+  // `?? "unknown"` was not enough: the probe returns an empty string as readily as null, and
+  // the banner rendered as "The sandbox host is unreachable: ." — a sentence with a hole in it.
+  const reason = (status.reason ?? "").trim();
 
   return (
     <div className="border-b border-amber-500/25 bg-amber-500/8">
-      <div className="px-8 py-2.5 text-[13px] leading-relaxed">
-        <span className="font-semibold text-amber-800 dark:text-amber-300">
-          Sandbox isolation is degraded.
-        </span>{" "}
-        <span className="text-amber-800/85 dark:text-amber-200/85">
-          {status.available
-            ? `Not enforced on this host: ${status.gaps.join("; ")}. The wall clock, egress block, per-process memory and disk quota still hold — acceptable for testing, not for production.`
-            : `The sandbox host is unreachable: ${status.reason ?? "unknown"}.`}
-        </span>
+      <div className="flex items-start gap-4 px-8 py-2.5 text-[13px] leading-relaxed">
+        <div className="min-w-0 flex-1">
+          {status.available ? (
+            <>
+              <span className="font-semibold text-amber-800 dark:text-amber-300">
+                Sandbox resource limits are not being applied.
+              </span>{" "}
+              <span className="text-amber-800/85 dark:text-amber-200/85">
+                Rootless podman without cgroup delegation accepts these flags and ignores them,
+                so the limits this deployment asks for are requested but not enforced:{" "}
+                <strong className="font-medium">{status.gaps.join("; ")}</strong>. Model-written
+                code can therefore exhaust this host&rsquo;s memory or CPU. Still enforced: no
+                network egress, the wall clock, per-process memory, and the disk quota — an
+                acceptable trade on a development machine and not one for production.
+              </span>
+            </>
+          ) : (
+            <>
+              <span className="font-semibold text-amber-800 dark:text-amber-300">
+                The sandbox host could not be probed
+                {reason ? <> — {reason}</> : <>, and it gave no reason</>}.
+              </span>{" "}
+              <span className="text-amber-800/85 dark:text-amber-200/85">
+                Usually podman is not running or not on this process&rsquo;s PATH.{" "}
+                <strong className="font-medium">Runs will not stop.</strong> With no sandbox
+                configured, Build &amp; Test records <code>exit 0, source sandbox</code> and
+                labels it &ldquo;no tests ran; this is not evidence that any test passed&rdquo;
+                — so a change can reach the gate having been executed by nothing. The approval
+                page carries the caveat; this banner is the earlier warning.
+              </span>
+            </>
+          )}
+        </div>
+        <button
+          type="button"
+          onClick={close}
+          aria-label="Dismiss until this tab is reloaded"
+          title="Dismiss until this tab is reloaded"
+          className="-mr-1 shrink-0 rounded-md p-1 text-amber-800/60 transition hover:bg-amber-500/15 hover:text-amber-900 dark:text-amber-200/60 dark:hover:text-amber-100"
+        >
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor"
+               strokeWidth="1.7" strokeLinecap="round" aria-hidden="true">
+            <path d="M3.5 3.5l7 7M10.5 3.5l-7 7" />
+          </svg>
+        </button>
       </div>
     </div>
   );
 }
+
 
 /** Inline paths. An icon set is another dependency for six glyphs. */
 function NavIcon({ name }: { name: string }) {
@@ -325,6 +431,7 @@ export default function App() {
       <Sidebar collapsed={collapsed} onToggle={() => setCollapsed(!collapsed)} />
 
       <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
+        <BuildDriftBanner />
         <IsolationBanner />
         <main className="flex-1 overflow-y-auto px-8 py-10">
         <div className="mx-auto max-w-5xl">

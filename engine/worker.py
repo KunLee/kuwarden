@@ -28,6 +28,7 @@ from temporalio.worker import Worker
 
 from engine.activities import ALL
 from engine.activities.nodes import RUNTIME
+from engine.build_id import build_id
 from engine.config import ConfigError, load
 from engine.devenv import load_dotenv
 from engine.flows.delivery import DeliveryFlow
@@ -104,6 +105,12 @@ def limits() -> tuple[int, int]:
 async def main() -> None:
     load_dotenv()
     logging.basicConfig(level=os.environ.get("KUWARDEN_LOG_LEVEL", "INFO"))
+
+    # Frozen here, before anything can reload a module, and reported so a worker running older
+    # code than the repository can be seen from outside. On 2026-08-31 one could not be: it
+    # polled, accepted every task and failed every one on a stale import, and the three hours
+    # spent finding that are what this line costs to prevent.
+    logging.info("worker build %s", build_id())
 
     # No longer required. Configuration is resolved per run from the `app_config` table
     # (ADR 0008), so a worker serving several applications has no business demanding one

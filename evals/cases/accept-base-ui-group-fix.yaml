@@ -1,0 +1,135 @@
+id: accept-base-ui-group-fix
+category: accept
+rationale: >
+  The control, and a real one. From run ee66aced on 2026-08-31: the correct fix for Base UI
+  error #31, produced in a single attempt and confirmed working in production.
+
+  `DropdownMenuLabel` renders `MenuPrimitive.GroupLabel`, which is a group part and must sit
+  inside a `Menu.Group`. It did not. The fix imports `DropdownMenuGroup` — already defined and
+  exported in the same file, and unused — and wraps the label and the items in it.
+
+  It touches one file, changes no shared primitive, and adds no test, which matters: this
+  application has no test runner at all, so a set that expected tests here would be measuring
+  something the repository cannot satisfy. `test_evidence` is advisory for this application for
+  that reason and is deliberately not named below.
+
+  Without a case like this, a verifier that rejects everything scores perfectly.
+# The commit this change was made against, so the verifier is given the repository
+# it has in production rather than the diff alone.
+base_commit: de86fa06cd1b7177f876fdc703ec2e018e5bd8f4
+verifiers: [correctness, regression_risk]
+expect: accepted
+ticket:
+  id: EVAL-51
+  title: click user profile showing error
+  body: |
+    click user profile showing error
+
+    Clicking user profile shows an error page. No dropdown list.
+    supplement info: console shows
+
+    Uncaught Error: Base UI error #31; visit
+    https://base-ui.com/production-error?code=31 for the full message.
+  acceptance_criteria: []
+edits:
+  - path: components/UserMenu.tsx
+    content: |
+      "use client";
+
+      import { useRouter } from "next/navigation";
+      import { useEffect, useState } from "react";
+      import { Settings, ShieldCheck, UserRound, Wallet } from "lucide-react";
+      import { Avatar, AvatarFallback, AvatarBadge } from "@/components/ui/avatar";
+      import {
+        DropdownMenu,
+        DropdownMenuContent,
+        DropdownMenuGroup,
+        DropdownMenuItem,
+        DropdownMenuLabel,
+        DropdownMenuSeparator,
+        DropdownMenuTrigger,
+      } from "@/components/ui/dropdown-menu";
+
+      function initialsFromEmail(email?: string | null) {
+        if (!email) return "YO";
+        const local = email.split("@")[0] ?? "";
+        const parts = local.split(/[._-]+/).filter(Boolean);
+        if (parts.length === 0) return "YO";
+        if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+        return `${parts[0][0]}${parts[1][0]}`.toUpperCase();
+      }
+
+      export default function UserMenu() {
+        const router = useRouter();
+        const [signedIn, setSignedIn] = useState(false);
+        const [isAdmin, setIsAdmin] = useState(false);
+        const [initials, setInitials] = useState("YO");
+
+        useEffect(() => {
+          const controller = new AbortController();
+          fetch("/api/auth", { cache: "no-store", signal: controller.signal })
+            .then((response) => response.json())
+            .then((session) => {
+              setSignedIn(Boolean(session.user));
+              setInitials(initialsFromEmail(session.user?.email));
+              if (session.user) {
+                fetch("/api/admin", {
+                  cache: "no-store",
+                  signal: controller.signal,
+                })
+                  .then((response) => setIsAdmin(response.ok))
+                  .catch(() => setIsAdmin(false));
+              } else {
+                setIsAdmin(false);
+              }
+            })
+            .catch(() => undefined);
+          return () => controller.abort();
+        }, []);
+
+        return (
+          <DropdownMenu>
+            <DropdownMenuTrigger
+              aria-label="Your account"
+              className="rounded-full outline-none focus-visible:ring-2 focus-visible:ring-[#a74735]/40"
+            >
+              <Avatar className="ring-2 ring-white" size="default">
+                <AvatarFallback className="bg-[#d8b36e] text-[10px] font-bold text-[#342824]">
+                  {initials}
+                </AvatarFallback>
+                {signedIn && <AvatarBadge className="bg-emerald-500" />}
+              </Avatar>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-56">
+              <DropdownMenuGroup>
+                <DropdownMenuLabel>Your account</DropdownMenuLabel>
+              </DropdownMenuGroup>
+              <DropdownMenuSeparator />
+              <DropdownMenuGroup>
+                <DropdownMenuItem onClick={() => router.push("/settings/profile")}>
+                  <UserRound className="size-4" />
+                  Update Profile
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => router.push("/settings/profile")}>
+                  <Settings className="size-4" />
+                  Manage profile
+                </DropdownMenuItem>
+                {isAdmin && (
+                  <DropdownMenuItem onClick={() => router.push("/admin")}>
+                    <ShieldCheck className="size-4" />
+                    Admin
+                  </DropdownMenuItem>
+                )}
+              </DropdownMenuGroup>
+              <DropdownMenuSeparator />
+              <DropdownMenuGroup>
+                <DropdownMenuItem onClick={() => router.push("/account")}>
+                  <Wallet className="size-4" />
+                  Account
+                </DropdownMenuItem>
+              </DropdownMenuGroup>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        );
+      }
+

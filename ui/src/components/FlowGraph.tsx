@@ -576,7 +576,7 @@ export function FlowGraph({
  * — the record is self-describing so that a five-year-old row still renders, which also means
  * a row written by an older engine may have no `sections` at all.
  */
-function readNotes(event: RunEvent): Notes | null {
+export function readNotes(event: RunEvent): Notes | null {
   const summary = event.payload.summary;
   const sections = event.payload.sections;
   if (typeof summary !== "string" || !Array.isArray(sections)) return null;
@@ -686,7 +686,7 @@ function Section({ section }: { section: NoteSection }) {
 
 /** One execution's notes. A node that ran more than once — the Coder loop — gets one of these
  *  per attempt, in sequence order, rather than only its last. */
-function Execution({ notes, seq, at }: { notes: Notes; seq: number; at: string }) {
+export function Execution({ notes, seq, at }: { notes: Notes; seq: number; at: string }) {
   return (
     <div className="rounded-lg border border-line bg-canvas/50 p-3">
       <div className="flex flex-wrap items-baseline justify-between gap-2">

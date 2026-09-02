@@ -48,6 +48,8 @@ class Case:
     expect: str
     ticket: Ticket
     edits: tuple[ProposedEdit, ...]
+    #: The commit the change was made against. Optional, and it should not be: see `state`.
+    base_commit: str = ""
 
     def state(self) -> FlowState:
         """The `FlowState` a verifier would receive for this case.
@@ -55,8 +57,20 @@ class Case:
         `ci_result` is a passing external anchor on purpose. It removes "the tests were graded
         by our own sandbox" as an available reason to reject, so a rejection can only have come
         from reading the change itself.
+
+        **`base_commit` is what makes this the same verifier that runs in production.** Since
+        2026-08-24 a verifier is given the repository at the base commit — precisely because,
+        without it, two of them rejected a valid change for referring to a file they could not
+        open. This harness supplied no base commit until 2026-09-02, so it was grading a
+        verifier that had strictly less context than the one under test, and it failed a case
+        for exactly the reason that change was made. A set that measures a weaker verifier than
+        the one that ships is measuring the wrong thing in the flattering direction.
+
+        A case without one still runs, and its result means less: state it in the case's
+        `rationale` rather than leaving a reader to infer it from an absent field.
         """
         return FlowState(
+            base_commit=self.base_commit,
             run_id=uuid.uuid4(),
             root_run_id=uuid.uuid4(),
             ticket=self.ticket,
@@ -123,6 +137,7 @@ def load(directory: Path = CASES) -> list[Case]:
                     ProposedEdit(path=str(e["path"]), content=str(e["content"]))
                     for e in raw["edits"]
                 ),
+                base_commit=str(raw.get("base_commit", "")),
             )
         )
     return cases

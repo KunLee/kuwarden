@@ -12,6 +12,7 @@ repository in a process that holds a credential.
 from __future__ import annotations
 
 import base64
+import logging
 from typing import Any
 
 import httpx
@@ -40,6 +41,8 @@ from engine.adapters.scm.tree import (
 )
 from engine.adapters.scm.tree_cache import cached
 from engine.errors import AdapterError, NotFound, PermissionDenied
+
+log = logging.getLogger(__name__)
 
 API_VERSION = "2022-11-28"
 
@@ -401,6 +404,38 @@ class GitHubScm:
         """The message on `commit`. Read to decide whether a push has already landed."""
         payload: Any = await client.get(f"{self._repo(ref)}/git/commits/{commit}")
         return str(payload.get("message", "")) if isinstance(payload, dict) else ""
+
+    async def preview_url(self, ref: RepoRef, commit: str) -> str | None:
+        """The deployment a platform published for this commit, via GitHub's Deployments API.
+
+        Keyed on the **sha**, not on the branch. Querying by `ref=<branch>` returns nothing for
+        a Vercel-style integration, which registers its deployment against the commit — an hour
+        was spent concluding the API had no answer when the question was wrong.
+
+        `environment_url` rather than `target_url`: the first is where the deployment can be
+        opened, the second is usually the platform's own dashboard, which is not the thing an
+        approver needs. Failures are swallowed to `None` — an approval page must not fall over
+        because a deployment API was slow, and the caveat for a missing preview is the same
+        whether the platform published none or would not say.
+        """
+        try:
+            async with await self._client(ref, CredentialKind.SCM_READ) as client:
+                deployments: Any = await client.get(
+                    f"{self._repo(ref)}/deployments", params={"sha": commit, "per_page": "1"}
+                )
+                rows = deployments if isinstance(deployments, list) else []
+                if not rows:
+                    return None
+                statuses: Any = await client.get(
+                    f"{self._repo(ref)}/deployments/{rows[0]['id']}/statuses",
+                    params={"per_page": "10"},
+                )
+                for status in statuses if isinstance(statuses, list) else []:
+                    if status.get("state") == "success" and status.get("environment_url"):
+                        return str(status["environment_url"])
+        except Exception:  # noqa: BLE001 - a missing preview is a caveat, never a failure
+            log.warning("could not read a deployment for %s", commit[:12], exc_info=True)
+        return None
 
     async def delete_branch(self, ref: RepoRef, branch: str) -> bool:
         """`DELETE /git/refs/heads/{branch}`. A 404 means it is already gone."""

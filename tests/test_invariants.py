@@ -392,3 +392,51 @@ def test_a_verifier_sees_the_repository_but_still_not_the_coders_reasoning() -> 
     # The line that must not move.
     assert "SECRET PLAN" not in prompt
     assert "do not leak me" not in prompt
+
+
+def test_a_verifier_cannot_write_a_blocking_finding_and_pass_it() -> None:
+    """The failure this replaced, as a rule.
+
+    `correctness` recorded *"the ticket asked for the profile control itself to offer the admin
+    jump, not to keep the old separate icon as well"* and returned `blocks: false`. The change
+    shipped and did not implement the feature. Three changes in one week had that shape: the
+    verifier saw the defect, wrote it down, and aggregated its own reasons into a pass.
+
+    The verdict is no longer the model's to state. It is computed from the severities, so a
+    finding graded blocking blocks the change whatever else the response contains.
+    """
+    from engine.nodes.verifiers import VERDICT_SCHEMA, _grade
+
+    assert "blocks" not in VERDICT_SCHEMA["properties"], (
+        "the response must not carry a verdict — it is derived from the findings"
+    )
+
+    graded = _grade(
+        [
+            {"detail": "the ticket's core ask is unmet", "severity": "blocking"},
+            {"detail": "a nit", "severity": "note"},
+        ]
+    )
+    assert any(f["severity"] == "blocking" for f in graded)
+
+
+def test_an_ungraded_finding_is_advisory_rather_than_blocking() -> None:
+    """The safe direction, and it is the arguable one, so it gets a test.
+
+    A missing or unrecognised severity could default either way. It defaults to advisory
+    because a wrong block stops a good change and teaches people to override the gate, which
+    costs more than one missed finding — and because the evaluation set's `reject` cases are
+    what tell us whether the model grades honestly. A default cannot.
+    """
+    from engine.nodes.verifiers import _grade
+
+    graded = _grade(
+        [
+            {"detail": "no severity given"},
+            {"detail": "nonsense severity", "severity": "catastrophic"},
+            "a bare string from a model that ignored the schema",
+            {"detail": "   "},
+        ]
+    )
+    assert [f["severity"] for f in graded] == ["advisory", "advisory", "advisory"]
+    assert all(f["detail"].strip() for f in graded), "an empty finding is not a finding"

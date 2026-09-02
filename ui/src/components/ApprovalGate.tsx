@@ -9,6 +9,13 @@
  * is rendered before the approver can reach a control. A qualification placed below the fold
  * is a qualification written for the record rather than for the reader.
  *
+ * **So do the verifier findings, including the ones from verifiers that passed.** This page
+ * used to show a count — "3 of 4 passed" — and nothing else. On ticket 50 that count was
+ * true, the change shipped, and it did not implement the feature: `correctness` had returned
+ * a passing verdict while writing, in its findings, exactly what was missing. A verdict is a
+ * judgement; the findings are what it was a judgement about, and only one of the two was
+ * reaching the person deciding.
+ *
  * **The digest is submitted with the decision.** It binds the approval to the exact document
  * rendered here; the API recomputes it and refuses if the run has moved on. That turns
  * "approved run X" into "approved these facts about run X" — ADR 0003 §6.
@@ -90,6 +97,88 @@ export function ApprovalGate({ runId, status }: { runId: string; status: string 
                   ))}
                 </ul>
               </Banner>
+            )}
+
+            {/* The one thing on this page that is not a document. Every check above verifies
+                form; opening the change and using it is the only way to see whether it does
+                what was asked, and ticket 50 passed every gate and shipped a feature that did
+                not work. Thirty seconds here is the cheapest control this product has. */}
+            {doc.preview_url && (
+              <a
+                href={doc.preview_url}
+                target="_blank"
+                rel="noreferrer"
+                className="flex items-center justify-between gap-4 rounded-xl border border-accent/30 bg-accent/5 px-4 py-3 transition hover:bg-accent/10"
+              >
+                <span className="min-w-0">
+                  <span className="block text-[13px] font-semibold">Open this change, running</span>
+                  <span className="mt-0.5 block truncate text-[12px] text-muted">
+                    {doc.preview_url}
+                  </span>
+                </span>
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                     strokeWidth="1.6" className="shrink-0" aria-hidden="true">
+                  <path d="M6 3h7v7M13 3L6.5 9.5" />
+                  <path d="M11 9v4H3V5h4" />
+                </svg>
+              </a>
+            )}
+
+            {/* Above the controls, with the caveats, and never collapsed. A finding the
+                approver has to expand is a finding they will not read. */}
+            {doc.verifications?.some((v) => v.findings.length > 0) && (
+              <Card title="What the verifiers wrote">
+                <ul className="grid gap-4">
+                  {doc.verifications
+                    .filter((v) => v.findings.length > 0)
+                    /* Blocking first: the review that refused this change is the one to
+                       read before the ones that did not. */
+                    .sort((a, b) => Number(b.blocks) - Number(a.blocks))
+                    .map((v) => (
+                      <li key={v.verifier} className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="text-[13px] font-semibold">{v.verifier}</span>
+                          <span
+                            className={`inline-flex rounded-lg px-2.5 py-1 text-[12px] font-medium ${
+                              v.blocks
+                                ? "bg-red-500/12 text-red-700 dark:text-red-300"
+                                : "bg-slate-500/10 text-slate-600 dark:text-slate-300"
+                            }`}
+                          >
+                            {v.blocks ? "blocks" : "passes"}
+                          </span>
+                        </div>
+                        <ul className="mt-2 grid gap-2 text-[13px] leading-relaxed text-slate-600 dark:text-slate-300">
+                          {/* Blocking first, and labelled. The verdict is computed from these
+                              severities, so showing them lets an approver check the derivation
+                              instead of taking it — and lets them overrule an "advisory" that
+                              reads to them like a reason not to ship. */}
+                          {(v.graded ?? v.findings.map((detail) => ({ detail, severity: "note" as const })))
+                            .slice()
+                            .sort((a, b) =>
+                              Number(b.severity === "blocking") - Number(a.severity === "blocking"),
+                            )
+                            .map((f) => (
+                              <li key={f.detail} className="flex gap-2">
+                                <span
+                                  className={`mt-0.5 shrink-0 rounded px-1.5 py-0.5 text-[10.5px] font-medium uppercase tracking-wide ${
+                                    f.severity === "blocking"
+                                      ? "bg-red-500/12 text-red-700 dark:text-red-300"
+                                      : f.severity === "advisory"
+                                        ? "bg-amber-500/12 text-amber-800 dark:text-amber-300"
+                                        : "bg-slate-500/10 text-slate-500 dark:text-slate-400"
+                                  }`}
+                                >
+                                  {f.severity}
+                                </span>
+                                <span className="min-w-0">{f.detail}</span>
+                              </li>
+                            ))}
+                        </ul>
+                      </li>
+                    ))}
+                </ul>
+              </Card>
             )}
 
             <dl className="grid min-w-0 gap-x-8 gap-y-3 text-[13px] sm:grid-cols-2 [&>*]:min-w-0">
