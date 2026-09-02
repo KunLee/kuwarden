@@ -17,6 +17,9 @@ rationale: >
   `components/ui/dropdown-menu.jsx` was also changed in the real commit and is omitted here:
   the judgement turns on the ticket's intent, not on the primitive, and that change has its own
   case.
+# The commit this change was made against, so the verifier is given the repository
+# it has in production rather than the diff alone.
+base_commit: 64aa9636b8b5c02fe6df4dadaa0da092666cff31
 verifiers: [correctness]
 expect: rejected
 ticket:

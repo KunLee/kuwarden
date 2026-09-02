@@ -138,7 +138,9 @@ function chain(events: RunEvent[]): Chain {
     if (event.kind === "verifier_verdict" && node) {
       const id = `${node}#${event.seq}`;
       const notes = readNotes(event);
-      const blocked = (notes?.summary ?? "").includes("blocks");
+      // The summary reads "<angle>: blocks with N finding(s)" or "…: passes with …". Anchored
+      // on the colon so a finding whose text happens to contain the word cannot flip a box red.
+      const blocked = (notes?.summary ?? "").includes(": blocks");
       add(id, node.replace("verifier.", ""), event.seq, event.occurred_at,
           blocked ? "failed" : "ok");
       steps[steps.length - 1] = { ...steps[steps.length - 1], notes };

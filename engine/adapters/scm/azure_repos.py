@@ -330,6 +330,21 @@ class AzureReposScm:
             if isinstance(e, dict) and not e.get("isFolder")
         }
 
+    async def preview_url(self, ref: RepoRef, commit: str) -> str | None:
+        """No preview from Azure Repos, and that is a fact rather than an omission.
+
+        Azure DevOps has no equivalent of GitHub's Deployments API on the repository: an
+        environment belongs to a Pipelines run, and resolving one back to a commit means
+        knowing which pipeline and which environment an operator meant. That is configuration
+        this application does not have, and guessing it would produce a link to the wrong
+        deployment — worse than no link, because an approver who opens it believes they have
+        checked something.
+
+        **Revisit** when `kuwarden.yaml` can declare an environment for an application; then
+        this becomes a lookup rather than a guess.
+        """
+        return None
+
     async def delete_branch(self, ref: RepoRef, branch: str) -> bool:
         """Azure deletes a ref by updating it to the empty object id."""
         tip = await self._branch_tip(ref, branch)

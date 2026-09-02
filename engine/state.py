@@ -179,9 +179,20 @@ class SASTResult:
 
 @dataclass(frozen=True)
 class Verification:
+    """One verifier's verdict, and the findings the verdict was computed from.
+
+    `passed` is derived: a finding graded `blocking` fails the change. The model no longer
+    returns a verdict of its own, because for three changes in one week it wrote down the
+    reason a change should not ship and passed it anyway.
+    """
+
     verifier: str
     passed: bool
+    #: Human-readable, each prefixed with its severity. What the notes and the ticket show.
     findings: list[str] = field(default_factory=list)
+    #: The same findings structured — `{detail, severity}`. What the evidence document reads,
+    #: so an approver is shown which findings were blocking and which were not.
+    graded: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

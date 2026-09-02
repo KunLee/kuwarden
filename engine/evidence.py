@@ -34,7 +34,8 @@ from engine.errors import KuWardenError
 #: so a format change cannot make an old digest accidentally match a new document.
 #:
 #: 2 — verifier findings and the advisory override. See `_caveats`.
-EVIDENCE_SCHEMA = 2
+#: 3 — the preview deployment, and the caveat when there is none.
+EVIDENCE_SCHEMA = 3
 
 
 class RunNotFound(KuWardenError):
@@ -109,6 +110,9 @@ async def assemble(run_id: UUID) -> Evidence:
     # summary that cannot be acted on: three verifiers can pass while recording, between
     # them, the reason the change does not work.
     verifications = payload_of("verifiers_completed").get("verifications") or []
+    # A running deployment of the exact commit, when the platform published one. A link,
+    # never a verdict — see `preview_url` on the SCM protocol.
+    preview = payload_of("preview_published").get("url") or ""
     overridden = payload_of("verifier_overridden")
 
     # The tier from the trail, falling back to the column only when final tiering has not run.
@@ -147,8 +151,9 @@ async def assemble(run_id: UUID) -> Evidence:
         # Every finding, named by the verifier that wrote it and by whether it blocked. A
         # passing verdict is not an empty one, and the difference is the approver's to weigh.
         "verifications": verifications,
+        "preview_url": preview,
         "caveats": _caveats(
-            run["policy_commit"], verdict, isolation, verifications, overridden
+            run["policy_commit"], verdict, isolation, verifications, overridden, preview
         ),
         "events": rows,
     }
@@ -161,6 +166,7 @@ def _caveats(
     isolation: dict[str, Any],
     verifications: list[dict[str, Any]] | None = None,
     overridden: dict[str, Any] | None = None,
+    preview: str = "",
 ) -> list[str]:
     """Everything about this evidence that is weaker than it looks.
 
@@ -184,11 +190,25 @@ def _caveats(
     # through: `correctness` returned a passing verdict and wrote, in the same breath, that
     # the change did not do what the ticket asked. A verdict is a judgement; the findings are
     # what it was a judgement about, and only one of the two reached the approver.
-    quiet = sum(len(v.get("findings") or []) for v in (verifications or []) if not v.get("blocks"))
+    # One caveat, not two. An earlier version counted "findings on verifiers that did not
+    # block" and "findings graded advisory" separately, which are largely the same findings
+    # arriving at the reader as two different numbers — noise on the one page that must not
+    # have any.
+    #
+    # Counted across verifiers that passed, because those are the findings nothing acted on:
+    # a blocking verifier's advisories travel with a verdict that already stopped the change.
+    quiet = [
+        f
+        for v in (verifications or [])
+        if not v.get("blocks")
+        for f in (v.get("graded") or [{"detail": d} for d in (v.get("findings") or [])])
+    ]
     if quiet:
         caveats.append(
-            f"{quiet} finding(s) were recorded by verifiers that did NOT block this change. "
-            "A passing verdict is not an empty one — read them before approving."
+            f"{len(quiet)} finding(s) were recorded by verifiers that did not stop this change "
+            "— each judged, by the verifier that wrote it, not serious enough to block. A "
+            "passing verdict is not an empty one, that judgement is theirs, and this page is "
+            "where it can be overruled."
         )
 
     if verdict and verdict.get("source") != "ci":
@@ -210,6 +230,16 @@ def _caveats(
             f"The sandbox ran under weakened isolation ({gaps}). Resource limits the "
             "configuration asked for were not applied by the host."
         )
+    # Last, and phrased as a limit rather than a warning. Every other caveat here says a
+    # control was weaker than it looks; this one says a whole dimension has no control at all.
+    if not preview:
+        caveats.append(
+            "No running deployment of this commit was found, so nothing on this page shows "
+            "the change working. Every check above verifies form — lint, types, the build, and "
+            "four models reading a diff — and none of them can tell whether the change does "
+            "what the ticket asked."
+        )
+
     if policy_commit.startswith("unpinned:"):
         caveats.append(
             "No policy bundle was pinned for this run, so there is no recorded statement of "

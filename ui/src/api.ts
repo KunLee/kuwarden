@@ -244,6 +244,10 @@ export const api = {
 
   // --- runs -------------------------------------------------------------------------------
 
+  /** What code the API started with, and whether the tree has moved since. */
+  buildStatus: () =>
+    request<{ api_build: string; tree_build: string; stale: boolean }>("/api/build"),
+
   listRuns: () => request<Run[]>("/api/runs"),
 
   listRunEvents: (runId: string) => request<RunEvent[]>(`/api/runs/${runId}/events`),

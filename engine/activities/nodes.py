@@ -184,6 +184,41 @@ log = logging.getLogger(__name__)
 RUNTIME = NodeRuntime()
 
 
+@dataclass
+class PreviewLookup:
+    app_id: UUID
+    commit: str
+
+
+@activity.defn
+async def read_preview_url(params: PreviewLookup) -> str:
+    """Ask the platform whether it published a running deployment of this commit.
+
+    Read at the gate rather than at the push, because a preview takes a minute or so to build
+    and the answer at push time is almost always "not yet". Recorded as an event so the
+    evidence document reads it from the audit trail like everything else — `assemble` reads
+    `flow_events` and nothing else, and an approval page that made its own network call would
+    be slower and, worse, could show a different answer than the record.
+
+    Never fails. An empty string means no preview, which is the ordinary case for a repository
+    with no preview environment and indistinguishable, deliberately, from a platform that
+    would not answer. Neither is a reason to hold up an approval.
+    """
+    from engine.adapters.factory import scm_adapter
+
+    try:
+        config = await config_store.resolve(
+            params.app_id, fallback=RUNTIME.configured_config
+        )
+        ctx = RUNTIME.context(params.app_id, config=config)
+        repo = config.primary
+        scm = scm_adapter(repo, ctx.broker, transport=ctx.transport)
+        return await scm.preview_url(repo.ref(), params.commit) or ""
+    except Exception:  # noqa: BLE001 - a missing preview is a caveat, never a failure
+        log.warning("could not read a preview deployment for %s", params.commit[:12])
+        return ""
+
+
 @activity.defn
 async def run_node(params: NodeInput) -> FlowState:
     """Execute one node, and say so.

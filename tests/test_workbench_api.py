@@ -587,7 +587,7 @@ async def test_the_approver_is_shown_what_the_verifiers_wrote(
     assert "test_evidence falsified this change" in caveats
     assert "advisory" in caveats
     # And the findings of the verifiers that passed are not silently the same as none.
-    assert "did NOT block" in caveats
+    assert "did not stop this change" in caveats
 
 
 async def test_a_clean_run_carries_no_findings_caveat(
@@ -600,7 +600,7 @@ async def test_a_clean_run_carries_no_findings_caveat(
         ).json()["document"]
 
     assert document["verifications"] == []
-    assert not any("did NOT block" in caveat for caveat in document["caveats"])
+    assert not any("did not stop this change" in caveat for caveat in document["caveats"])
 
 
 async def test_the_evidence_names_who_ran_the_tests(

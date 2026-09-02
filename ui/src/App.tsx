@@ -39,6 +39,46 @@ import type { SandboxStatus } from "./types";
  * comes back on the next load. It cannot be silenced permanently, which is the property that
  * mattered.
  */
+/**
+ * Warns when this API is running code older than the repository.
+ *
+ * A process that has drifted from the tree is invisible from outside: it connects, it serves,
+ * and every answer comes from code somebody has since changed. A worker in exactly that state
+ * failed every workflow task it accepted for three hours on 2026-08-31, and nothing reported
+ * it — the files on disk were consistent, and only the running process was not.
+ *
+ * Development-time by nature: in a deployment nobody edits the tree under a running process,
+ * so this stays silent. It is loud precisely where the failure happens.
+ */
+function BuildDriftBanner() {
+  const [drift, setDrift] = useState<{ api_build: string; tree_build: string } | null>(null);
+
+  useEffect(() => {
+    void api
+      .buildStatus()
+      .then((b) => setDrift(b.stale ? b : null))
+      .catch(() => setDrift(null));
+  }, []);
+
+  if (!drift) return null;
+
+  return (
+    <div className="border-b border-orange-500/30 bg-orange-500/10">
+      <div className="px-8 py-2.5 text-[13px] leading-relaxed">
+        <span className="font-semibold text-orange-900 dark:text-orange-300">
+          This API is running code older than the repository.
+        </span>{" "}
+        <span className="text-orange-900/85 dark:text-orange-200/85">
+          Started with <code>{drift.api_build}</code>; the tree is now{" "}
+          <code>{drift.tree_build}</code>. Restart it before trusting anything on these pages —
+          and restart the worker too, which reports its own build to its log and can drift the
+          same way without any symptom except failing every task it takes.
+        </span>
+      </div>
+    </div>
+  );
+}
+
 function IsolationBanner() {
   const [status, setStatus] = useState<SandboxStatus | null>(null);
   const [dismissed, setDismissed] = useState(() => {
@@ -391,6 +431,7 @@ export default function App() {
       <Sidebar collapsed={collapsed} onToggle={() => setCollapsed(!collapsed)} />
 
       <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
+        <BuildDriftBanner />
         <IsolationBanner />
         <main className="flex-1 overflow-y-auto px-8 py-10">
         <div className="mx-auto max-w-5xl">

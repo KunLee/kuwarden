@@ -35,7 +35,12 @@ with workflow.unsafe.imports_passed_through():
         record_run_started,
         record_run_status,
     )
-    from engine.activities.nodes import NodeInput, run_node
+    from engine.activities.nodes import (
+        NodeInput,
+        PreviewLookup,
+        read_preview_url,
+        run_node,
+    )
     from engine.activities.notify import GateNotice, notify_gate_reached
     from engine.config import ALL_VERIFIERS as _ALL_VERIFIER_NAMES
     from engine.policy.pricing import LAST_REVIEWED as PRICING_REVIEWED
@@ -560,6 +565,10 @@ class DeliveryFlow:
                         "verifier": v.verifier,
                         "blocks": not v.passed,
                         "findings": list(v.findings),
+                        # Structured, so the approval page can show which findings were
+                        # blocking and which were not. `blocks` above is derived from exactly
+                        # these — a reader can check the derivation rather than take it.
+                        "graded": list(v.graded),
                     }
                     for v in state.verifications
                 ],
@@ -587,6 +596,28 @@ class DeliveryFlow:
         relieve.
         """
         needed = required_approvals(state.risk_tier)
+
+        # Asked here rather than at the push: a preview takes a minute to build, and at push
+        # time the answer is almost always "not yet". Recorded as an event so the evidence
+        # document reads it from the audit trail like every other fact.
+        #
+        # It is a link, never a verdict. Nothing in this system anchors whether a change does
+        # what was asked — every gate checks form — and ticket 50 passed all of them and
+        # shipped a feature that did not work. Thirty seconds with the running page is the
+        # cheapest thing that would have caught it, and this is what makes those thirty
+        # seconds available at the moment somebody decides.
+        if state.head_commit:
+            preview = await workflow.execute_activity(
+                read_preview_url,
+                PreviewLookup(app_id=params.app_id, commit=state.head_commit),
+                start_to_close_timeout=AUDIT_TIMEOUT,
+            )
+            if preview:
+                await self._emit(
+                    "preview_published",
+                    payload={"url": preview, "commit": state.head_commit},
+                )
+
         await self._emit("gate_reached", payload={"tier": state.risk_tier, "needed": needed})
 
         if needed == 0:

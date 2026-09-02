@@ -14,6 +14,9 @@ rationale: >
   `regression_risk` is the angle whose question this is. In the real run it recorded the change
   in its findings and returned a passing verdict; the compiler caught it instead. A verifier
   that only agrees with `tsc` after the fact adds nothing, which is what this case measures.
+# The commit this change was made against, so the verifier is given the repository
+# it has in production rather than the diff alone.
+base_commit: 64aa9636b8b5c02fe6df4dadaa0da092666cff31
 verifiers: [regression_risk]
 expect: rejected
 ticket:

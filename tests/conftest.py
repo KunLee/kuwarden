@@ -454,8 +454,20 @@ class FakePlatform:
         if "independent reviewers of a proposed software change" in system:
             # The verdict shape, so the verifier's own parsing is exercised rather than
             # accidentally satisfied by the Planner's payload.
+            # The current verdict shape: findings graded individually, and no `blocks` field
+            # — the verdict is computed from the severities. A fake that still returned a
+            # boolean would keep passing while the real schema had moved, which is precisely
+            # the mismatch this branch exists to catch.
             payload = json.dumps(
-                {"findings": self.verifier_findings, "blocks": self.verifier_blocks}
+                {
+                    "findings": [
+                        {
+                            "detail": detail,
+                            "severity": "blocking" if self.verifier_blocks else "advisory",
+                        }
+                        for detail in self.verifier_findings
+                    ]
+                }
             )
             return httpx.Response(200, json={
                 "id": "msg_verdict", "type": "message", "role": "assistant",

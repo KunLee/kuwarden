@@ -14,6 +14,9 @@ rationale: >
   that reason and is deliberately not named below.
 
   Without a case like this, a verifier that rejects everything scores perfectly.
+# The commit this change was made against, so the verifier is given the repository
+# it has in production rather than the diff alone.
+base_commit: de86fa06cd1b7177f876fdc703ec2e018e5bd8f4
 verifiers: [correctness, regression_risk]
 expect: accepted
 ticket:

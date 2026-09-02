@@ -47,6 +47,7 @@ from engine.api.auth import (
     session_signing_key,
     user_count,
 )
+from engine.build_id import build_id, current
 from engine.config import ConfigError, RepoConfig, TriggerConfig, load, parse
 from engine.db import connect
 from engine.devenv import load_dotenv
@@ -1874,6 +1875,27 @@ async def terminate_run(run_id: uuid.UUID, principal: Admin) -> dict[str, Any]:
 
 
 @app.get("/api/sandbox")
+@app.get("/api/build")
+async def build_status(_: Viewer) -> dict[str, Any]:
+    """What code this API started with, and what the repository says now.
+
+    A process running older code than the tree is undetectable from outside — it connects, it
+    serves, it answers, and every answer comes from code somebody has since changed. That is
+    what happened to a worker on 2026-08-31, and it took three hours to find because nothing
+    reported it.
+
+    This covers the API only. The worker is a separate process and reports its own id to its
+    log; making it visible here needs it to write the value somewhere shared, which is the next
+    step and deliberately not guessed at by inferring it from a task-queue poller identity.
+    """
+    started, tree = build_id(), current()
+    return {
+        "api_build": started,
+        "tree_build": tree,
+        "stale": started != tree,
+    }
+
+
 async def sandbox_status(_: Viewer) -> dict[str, Any]:
     """What the sandbox host actually enforces.
 

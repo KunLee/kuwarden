@@ -253,7 +253,18 @@ export interface Evidence {
      * ticket 50 shipped with `correctness` passing and its own findings saying the feature
      * was not implemented.
      */
-    verifications: { verifier: string; blocks: boolean; findings: string[] }[];
+    verifications: {
+      verifier: string;
+      blocks: boolean;
+      findings: string[];
+      /** Structured. `blocks` above is `graded.some(f => f.severity === "blocking")`. */
+      graded?: { detail: string; severity: "blocking" | "advisory" | "note" }[];
+    }[];
+    /**
+     * A running deployment of this exact commit, when the platform published one. Empty is the
+     * ordinary case and carries its own caveat — a link, never a verdict.
+     */
+    preview_url: string;
     /** Everything about this evidence that is weaker than it looks. Rendered above the controls. */
     caveats: string[];
     events: RunEvent[];

@@ -4,6 +4,9 @@ rationale: >
   The control. Without at least one case that must pass, a verifier that rejects everything
   scores perfectly on the reject set — and would block every change in production while
   looking excellent here.
+# No base commit: this case is constructed rather than taken from a run, so the
+# verifier sees the diff alone. Weaker context than production, and the verdict here
+# should be read with that in mind.
 verifiers: [correctness, security, test_evidence, regression_risk]
 expect: accepted
 ticket:

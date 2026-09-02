@@ -303,6 +303,26 @@ class ScmAdapter(Protocol):
         description: str,
     ) -> PullRequest: ...
 
+    async def preview_url(self, ref: RepoRef, commit: str) -> str | None:
+        """A running deployment of this exact commit, if the platform published one.
+
+        The one dimension nothing in this system anchors is **whether the change does what was
+        asked**. Every gate verifies form: lint, types, the build, a diff read by four models.
+        Ticket 50 passed all of them and shipped a feature that did not work, and the defect
+        took thirty seconds to find by opening the page and clicking.
+
+        So this is not a verdict and must never become one — a preview that loads proves
+        nothing. It is a link, put in front of the approver, so that thirty seconds is
+        available to them at the moment they decide. Per ADR 0002 the only figure that shows
+        this product saved anyone work is human minutes per run; thirty seconds spent here is
+        a good trade against a broken deployment.
+
+        `None` means the platform published nothing for this commit, which is the ordinary
+        case for a repository with no preview environment. It is not an error and must not be
+        reported as one.
+        """
+        return None
+
     async def merge_pull_request(self, ref: RepoRef, number: str, commit: str) -> str:
         """Merge an open pull request, and return the resulting commit on the target branch.
 
